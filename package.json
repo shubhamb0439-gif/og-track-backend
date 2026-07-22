@@ -1,0 +1,25 @@
+{
+  "name": "ogtrack-server",
+  "version": "2.0.0",
+  "description": "OGTrack backend — Express + Socket.io + Azure SQL (multi-tenant, DB-per-company)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "@azure/storage-blob": "^12.24.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "knex": "^3.1.0",
+    "mssql": "^11.0.1",
+    "multer": "^2.2.0",
+    "socket.io": "^4.7.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
