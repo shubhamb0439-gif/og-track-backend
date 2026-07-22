@@ -76,8 +76,8 @@ app.use('/api/:slug/conversations', resolveTenant, requireModule('messages'), me
 // Accounting suite (clients, time-entries, eod-reports, eod-routes) — the
 // router defines those sub-paths, gated as a whole by the acc_clients module.
 app.use('/api/:slug/acc', resolveTenant, requireModule('acc_clients'), accountingRoutes);
-// HR suite (jobs, candidates, interviews) — gated by hr_jobs.
-app.use('/api/:slug/hr', resolveTenant, requireModule('hr_jobs'), hrRoutes);
+// HR suite (jobs, candidates, interviews) — any HR-related module checkbox unlocks it.
+app.use('/api/:slug/hr', resolveTenant, requireModule(['hr_dashboard','hr_jobs','hr_candidates','hr_interviews']), hrRoutes);
 // Sales / CRM funnel (leads, prospects, customers, sales log) — gated by crm.
 app.use('/api/:slug/crm', resolveTenant, requireModule('crm'), crmRoutes);
 // Inventory (vendors, items, purchases) — gated by inventory.

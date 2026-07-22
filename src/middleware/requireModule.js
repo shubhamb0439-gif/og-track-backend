@@ -7,16 +7,18 @@
  *
  * Usage:
  *   app.use('/api/:slug/attendance', resolveTenant, requireModule('attendance'), attendanceRoutes);
+ *   app.use('/api/:slug/hr', resolveTenant, requireModule(['hr_dashboard','hr_jobs']), hrRoutes); // any one is enough
  */
-function requireModule(moduleKey) {
+function requireModule(moduleKeyOrKeys) {
+  const acceptable = Array.isArray(moduleKeyOrKeys) ? moduleKeyOrKeys : [moduleKeyOrKeys];
   return (req, res, next) => {
     const enabled = req.company && Array.isArray(req.company.enabled_modules)
       ? req.company.enabled_modules
       : [];
-    if (!enabled.includes(moduleKey)) {
+    if (!acceptable.some(k => enabled.includes(k))) {
       return res.status(403).json({
-        error: `Module "${moduleKey}" is not enabled for this company.`,
-        module: moduleKey,
+        error: `Module "${acceptable.join('" or "')}" is not enabled for this company.`,
+        module: acceptable[0],
       });
     }
     next();
