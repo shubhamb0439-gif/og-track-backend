@@ -4,6 +4,36 @@ const { invalidateCompanyCache } = require('../db/tenantConnections');
 
 const router = express.Router();
 
+// GET /api/companies/public-list — PUBLIC list of active companies, used by
+// the root-URL "choose your workspace" picker page. Only safe branding
+// fields — same restraint as by-slug below, never db_name or anything else.
+router.get('/public-list', async (req, res) => {
+  try {
+    const rows = await coreDb('companies').where({ status: 'active' }).orderBy('name', 'asc');
+    res.json(rows.map(c => ({
+      slug: c.slug,
+      name: c.name,
+      logo: c.logo_url || null,
+      primaryColor: c.primary_color || null,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/companies/directory — PUBLIC list of every active company's safe
+// branding fields, for the landing page shown at the bare root (no slug in
+// the URL) so people can pick which company's login to go to.
+router.get('/directory', async (req, res) => {
+  try {
+    const companies = await coreDb('companies').where({ status: 'active' }).orderBy('name', 'asc');
+    res.json(companies.map(c => ({
+      slug: c.slug,
+      name: c.name,
+      logo: c.logo_url || null,
+      primaryColor: c.primary_color || null,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/companies/by-slug/:slug — PUBLIC branding lookup used by the
 // tenant frontend before login (splash screen, login card, hexagon colors).
 // Only returns safe, non-sensitive branding fields — never db_name, status
