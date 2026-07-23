@@ -154,16 +154,12 @@ async function provisionTenant(company, enabledModules, adminInfo = null) {
     // (running dedicated vCores 24/7 — roughly $400+/month each). Every
     // tenant here is small and low-traffic, so match the Serverless tier
     // used for manually-created databases instead: auto-pauses when idle,
-    // bills per-second while active.
+    // bills per-second while active. Serverless databases default to a
+    // 1-hour auto-pause delay automatically — no extra statement needed.
     await masterPool.request().query(
       `IF DB_ID(N'${db_name}') IS NULL
        CREATE DATABASE [${db_name}]
        (EDITION = 'GeneralPurpose', SERVICE_OBJECTIVE = 'GP_S_Gen5_1', MAXSIZE = 32GB)`
-    );
-    // Auto-pause after 1 hour of inactivity — same as the manual setup.
-    await masterPool.request().query(
-      `IF DB_ID(N'${db_name}') IS NOT NULL
-       ALTER DATABASE [${db_name}] SET AUTO_PAUSE_DELAY = 60`
     );
     await log(companyId, 'create_database', 'success', `Database [${db_name}] ready`);
     console.log(`[provisioning] ${db_name} database created/verified`);
