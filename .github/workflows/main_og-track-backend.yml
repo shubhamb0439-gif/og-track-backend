@@ -52,4 +52,4 @@ jobs:
           app-name: 'og-track-backend'
           slot-name: 'Production'
           package: .
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_C547CC50B0AD4630AD9281C02F6822A2 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_0C1D2C90133E42048ECE8F47A0F7A4FF }}
