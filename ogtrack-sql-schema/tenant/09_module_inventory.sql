@@ -83,6 +83,7 @@ CREATE TABLE dbo.inv_purchases (
     order_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
     expected_date   DATE           NULL,
     received_date   DATE           NULL,
+    invoice_number  NVARCHAR(100)  NULL,                        -- vendor's invoice — filled in at receiving, not creation
     notes           NVARCHAR(MAX)  NULL,
     created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
@@ -105,7 +106,9 @@ CREATE TABLE dbo.inv_purchase_items (
     item_id              NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
     quantity_ordered     DECIMAL(14,2)  NOT NULL,
     quantity_received    DECIMAL(14,2)  NOT NULL DEFAULT 0,
-    unit_cost            DECIMAL(14,2)  NOT NULL DEFAULT 0
+    unit_cost            DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    freight_cost         DECIMAL(14,2)  NOT NULL DEFAULT 0,     -- delivery charges for this line
+    import_charges       DECIMAL(14,2)  NOT NULL DEFAULT 0      -- import duty for this line
 );
 GO
 CREATE INDEX IX_inv_purchase_items_purchase ON dbo.inv_purchase_items(purchase_id);
