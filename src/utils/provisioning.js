@@ -65,12 +65,21 @@ function generateTempPassword() {
   return crypto.randomBytes(9).toString('base64').replace(/[^A-Za-z0-9]/g, '').slice(0, 12) + '!1';
 }
 
-// True if the error is SQL Server's "already exists" complaint (e.g. running
-// a CREATE TABLE/INDEX a second time) — safe to skip rather than treat as a
-// real failure, which is what makes re-running scripts on an existing tenant
-// DB safe instead of destructive.
+// True if the error is SQL Server's "already exists" complaint — safe to
+// skip rather than treat as a real failure, which is what makes re-running
+// scripts on an existing tenant DB safe instead of destructive. SQL Server
+// uses genuinely DIFFERENT wording depending on the object type:
+//   - duplicate TABLE/VIEW/etc: "There is already an object named 'X' ..."
+//   - duplicate INDEX/statistics:  "... already exists on table 'X'."
+// Missing the second pattern was the actual bug — CREATE TABLE statements
+// were being skipped correctly, but CREATE INDEX statements for indexes
+// that already existed (from an earlier successful run) were being counted
+// as genuine failures instead.
 function isAlreadyExistsError(e) {
-  return /there is already an object named/i.test(e.message || '');
+  const msg = e.message || '';
+  return /there is already an object named/i.test(msg)
+      || /already exists on table/i.test(msg)
+      || /already exists/i.test(msg); // broad catch-all for any other "already exists" phrasing
 }
 
 /**
@@ -107,17 +116,19 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
     const sqlText = fs.readFileSync(scriptPath, 'utf8');
     const batches = sqlText.split(/^\s*GO\s*$/im).map(b => b.trim()).filter(Boolean);
     let skipped = 0, failed = 0;
+    const failureMessages = [];
     for (const batch of batches) {
       try {
         await tenantPool.request().query(batch);
       } catch (e) {
         if (isAlreadyExistsError(e)) { skipped++; continue; } // already there — fine
         failed++;
+        failureMessages.push(e.message);
         console.error(`[provisioning] ${slug}: ${scriptFile} statement failed:`, e.message);
       }
     }
     if (failed > 0) {
-      await log(companyId, step, 'failed', `${failed} statement(s) failed, ${skipped} already existed — check logs`);
+      await log(companyId, step, 'failed', `${failed} statement(s) failed, ${skipped} already existed — ${failureMessages.join(' | ')}`);
     } else if (skipped === batches.length) {
       await log(companyId, step, 'success', 'Already up to date — nothing new to create');
     } else {
@@ -129,17 +140,19 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
 
 async function provisionTenant(company, enabledModules, adminInfo = null) {
   const { id: companyId, db_name, slug } = company;
-  console.log(`[provisioning] starting for ${slug} → ${db_name}`);
+  const regionKey = company.sql_region || 'default';
+  const region = config.sql.regions[regionKey] || config.sql.regions.default;
+  console.log(`[provisioning] starting for ${slug} → ${db_name} (region: ${region.key})`);
 
   // ── 1. CREATE DATABASE ────────────────────────────────────────────────────
   await log(companyId, 'create_database', 'pending');
   let masterPool;
   try {
     masterPool = await sql.connect({
-      server: config.sql.server,
+      server: region.server,
       port: config.sql.port,
-      user: config.sql.user,
-      password: config.sql.password,
+      user: region.user,
+      password: region.password,
       database: 'master',           // connect to master to CREATE DATABASE
       requestTimeout: 120000,       // 2 min — CREATE DATABASE on Azure SQL can take ~60s
       connectionTimeout: 30000,
@@ -161,8 +174,8 @@ async function provisionTenant(company, enabledModules, adminInfo = null) {
        CREATE DATABASE [${db_name}]
        (EDITION = 'GeneralPurpose', SERVICE_OBJECTIVE = 'GP_S_Gen5_1', MAXSIZE = 32GB)`
     );
-    await log(companyId, 'create_database', 'success', `Database [${db_name}] ready`);
-    console.log(`[provisioning] ${db_name} database created/verified`);
+    await log(companyId, 'create_database', 'success', `Database [${db_name}] ready on ${region.label} (${region.server})`);
+    console.log(`[provisioning] ${db_name} database created/verified on ${region.server}`);
   } catch (e) {
     await log(companyId, 'create_database', 'failed', e.message);
     console.error(`[provisioning] create_database failed:`, e.message);
@@ -175,10 +188,10 @@ async function provisionTenant(company, enabledModules, adminInfo = null) {
   let tenantPool;
   try {
     tenantPool = await sql.connect({
-      server: config.sql.server,
+      server: region.server,
       port: config.sql.port,
-      user: config.sql.user,
-      password: config.sql.password,
+      user: region.user,
+      password: region.password,
       database: db_name,
       requestTimeout: 60000,        // 60s per schema script batch
       connectionTimeout: 30000,
@@ -241,13 +254,15 @@ async function provisionTenant(company, enabledModules, adminInfo = null) {
  */
 async function provisionModulesForExistingCompany(company, moduleKeys) {
   const { id: companyId, db_name, slug } = company;
+  const regionKey = company.sql_region || 'default';
+  const region = config.sql.regions[regionKey] || config.sql.regions.default;
   let tenantPool;
   try {
     tenantPool = await sql.connect({
-      server: config.sql.server,
+      server: region.server,
       port: config.sql.port,
-      user: config.sql.user,
-      password: config.sql.password,
+      user: region.user,
+      password: region.password,
       database: db_name,
       requestTimeout: 60000,
       connectionTimeout: 30000,
