@@ -42,6 +42,7 @@ const mapPurchase = (r) => r && ({
   orderDate: r.order_date,
   expectedDate: r.expected_date,
   receivedDate: r.received_date,
+  invoiceNumber: r.invoice_number,
   notes: r.notes,
   createdBy: r.created_by,
   createdAt: r.created_at, updatedAt: r.updated_at,
@@ -54,6 +55,14 @@ const mapPurchaseItem = (r) => r && ({
   quantityOrdered: Number(r.quantity_ordered),
   quantityReceived: Number(r.quantity_received || 0),
   unitCost: Number(r.unit_cost || 0),
+  freightCost: Number(r.freight_cost || 0),
+  importCharges: Number(r.import_charges || 0),
+  // What this line actually costs per unit once landed — this is what
+  // feeds into the item's average cost, matching the real Receipts sheet's
+  // Cost -> Import duty/freight -> Total -> Per-unit-cost flow.
+  effectiveUnitCost: Number(r.quantity_ordered) > 0
+    ? (Number(r.unit_cost || 0) * Number(r.quantity_ordered) + Number(r.freight_cost || 0) + Number(r.import_charges || 0)) / Number(r.quantity_ordered)
+    : Number(r.unit_cost || 0),
 });
 
 // ── Vendors ───────────────────────────────────────────────────────────────────
@@ -254,6 +263,8 @@ router.post('/purchases', async (req, res) => {
         item_id: line.itemId,
         quantity_ordered: line.quantityOrdered,
         unit_cost: line.unitCost || 0,
+        freight_cost: line.freightCost || 0,
+        import_charges: line.importCharges || 0,
       });
     }
     const saved = await req.db('inv_purchases').where({ id }).first();
@@ -271,6 +282,7 @@ router.patch('/purchases/:id', async (req, res) => {
     if (b.status !== undefined) updates.status = b.status;
     if (b.notes !== undefined) updates.notes = b.notes;
     if (b.expectedDate !== undefined) updates.expected_date = b.expectedDate;
+    if (b.invoiceNumber !== undefined) updates.invoice_number = b.invoiceNumber;
     await req.db('inv_purchases').where({ id: req.params.id }).update(updates);
     const saved = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Purchase not found' });
@@ -288,6 +300,7 @@ router.patch('/purchases/:id', async (req, res) => {
 // receiving would be a natural follow-up enhancement.
 router.post('/purchases/:id/receive', async (req, res) => {
   try {
+    const { invoiceNumber } = req.body;
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
     if (purchase.status === 'received') return res.status(400).json({ error: 'This purchase is already marked received.' });
@@ -302,14 +315,18 @@ router.post('/purchases/:id/receive', async (req, res) => {
         const item = await req.db('inv_items').where({ id: line.item_id }).first();
         const newStock = Number(item.stock || 0) + outstanding;
 
-        // Weighted-average cost across every received line for this item ever.
+        // Weighted-average LANDED cost across every received line for this
+        // item ever — landed cost = unit cost + this line's freight/import
+        // charges spread across its quantity, matching the real Receipts
+        // sheet's Cost -> Import duty/freight -> Total -> Per-unit-cost flow.
         const receivedLines = await req.db('inv_purchase_items')
           .where({ item_id: line.item_id }).andWhere('quantity_received', '>', 0);
         let totalQty = 0, totalValue = 0;
         receivedLines.forEach(l => {
           const qty = l.id === line.id ? Number(line.quantity_ordered) : Number(l.quantity_received);
+          const landedValue = qty * Number(l.unit_cost || 0) + Number(l.freight_cost || 0) + Number(l.import_charges || 0);
           totalQty += qty;
-          totalValue += qty * Number(l.unit_cost || 0);
+          totalValue += landedValue;
         });
         const avgCost = totalQty > 0 ? totalValue / totalQty : item.avg_cost;
 
@@ -323,6 +340,7 @@ router.post('/purchases/:id/receive', async (req, res) => {
 
     await req.db('inv_purchases').where({ id: req.params.id }).update({
       status: 'received', received_date: new Date(), updated_at: new Date(),
+      ...(invoiceNumber !== undefined ? { invoice_number: invoiceNumber } : {}),
     });
     const saved = await req.db('inv_purchases').where({ id: req.params.id }).first();
     req.io.to(req.company.slug).emit('inv:purchase_updated', mapPurchase(saved));
