@@ -115,3 +115,70 @@ CREATE INDEX IX_inv_purchase_items_purchase ON dbo.inv_purchase_items(purchase_i
 GO
 CREATE INDEX IX_inv_purchase_items_item ON dbo.inv_purchase_items(item_id);
 GO
+
+/* ---------------------------------------------------------------------------
+   inv_stock_lots — the real source of truth for stock. Every unit on hand
+   belongs to exactly one lot, and a lot keeps its OWN landed cost forever —
+   never blended into an average, matching how the business has actually
+   been tracking this in spreadsheets (each Ref like "23NOV0001" is its own
+   batch, issued down specifically, not pooled with any other batch's cost).
+
+   dbo.inv_items.avg_cost is still maintained as a convenience DISPLAY
+   number (weighted average across a item's currently-remaining lots) —
+   but it is no longer the source of truth. dbo.inv_items.stock is the sum
+   of this item's lots' quantity_remaining.
+   --------------------------------------------------------------------------- */
+CREATE TABLE dbo.inv_stock_lots (
+    id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    item_id             NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
+    lot_ref             NVARCHAR(100)  NULL,                     -- human-readable batch code, e.g. "23NOV0001"
+    vendor_id           NVARCHAR(64)   NULL REFERENCES dbo.inv_vendors(id),
+    purchase_item_id    NVARCHAR(64)   NULL REFERENCES dbo.inv_purchase_items(id),  -- NULL for opening-stock/manual/imported lots
+    quantity_received   DECIMAL(14,2)  NOT NULL,                 -- original quantity this lot started with
+    quantity_remaining  DECIMAL(14,2)  NOT NULL,                 -- decreases as it's consumed
+    unit_cost           DECIMAL(14,2)  NOT NULL,                 -- landed cost per unit — fixed for this lot's lifetime
+    received_date       DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
+    source              NVARCHAR(20)   NOT NULL DEFAULT 'purchase', -- purchase | opening_stock | manual | import
+    notes               NVARCHAR(500)  NULL,
+    created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT CK_inv_stock_lots_source CHECK (source IN ('purchase','opening_stock','manual','import','assembly'))
+);
+GO
+CREATE INDEX IX_inv_stock_lots_item ON dbo.inv_stock_lots(item_id);
+GO
+CREATE INDEX IX_inv_stock_lots_received_date ON dbo.inv_stock_lots(received_date);
+GO
+
+/* ---------------------------------------------------------------------------
+   inv_stock_issues — general stock consumption that ISN'T a manufacturing
+   assembly (sales, scrap, samples, whatever). Manufacturing's own assembly
+   consumption is logged separately in mfg_assembly_lines — this table is
+   for everything else, matching the real "Issues" sheet which includes
+   things sent to customers/production/write-offs, not just BOM builds.
+   Each row can span multiple lots if one issue draws from more than one
+   batch (see inv_stock_issue_lots).
+   --------------------------------------------------------------------------- */
+CREATE TABLE dbo.inv_stock_issues (
+    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    item_id         NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
+    quantity        DECIMAL(14,2)  NOT NULL,
+    issue_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
+    details         NVARCHAR(500)  NULL,                        -- e.g. "Invoice 117/Cajo OY/Bluebird"
+    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+CREATE INDEX IX_inv_stock_issues_item ON dbo.inv_stock_issues(item_id);
+GO
+
+/* Which specific lots (and how much of each) a stock issue actually drew from. */
+CREATE TABLE dbo.inv_stock_issue_lots (
+    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    issue_id        NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_stock_issues(id),
+    lot_id          NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_stock_lots(id),
+    quantity        DECIMAL(14,2)  NOT NULL
+);
+GO
+CREATE INDEX IX_inv_stock_issue_lots_issue ON dbo.inv_stock_issue_lots(issue_id);
+GO

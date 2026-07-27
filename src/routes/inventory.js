@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { recomputeItemStock, consumeStockFIFO, createLot } = require('../utils/stockLots');
 
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapVendor = (r) => r && ({
@@ -175,16 +176,32 @@ router.patch('/items/:id', async (req, res) => {
 });
 
 // POST /api/:slug/inventory/items/:id/adjust-stock — manual correction
-// (physical count, damage, write-off). Every change to stock that isn't a
-// purchase receipt goes through here and is logged in inv_stock_adjustments.
+// (physical count, damage, write-off, or entering historical opening stock).
+// Positive delta creates a new lot (you supply its cost); negative delta
+// consumes existing lots FIFO. Every adjustment is still logged in
+// inv_stock_adjustments regardless of direction, for the same audit reason
+// as before — this just also keeps the underlying lots consistent now.
 router.post('/items/:id/adjust-stock', async (req, res) => {
   try {
-    const { delta, reason } = req.body;
+    const { delta, reason, unitCost, lotRef } = req.body;
     if (delta == null || isNaN(Number(delta)) || Number(delta) === 0) {
       return res.status(400).json({ error: 'delta is required and must be a non-zero number' });
     }
     const item = await req.db('inv_items').where({ id: req.params.id }).first();
     if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    if (Number(delta) > 0) {
+      await createLot(req.db, {
+        itemId: req.params.id,
+        lotRef: lotRef || null,
+        quantity: Number(delta),
+        unitCost: unitCost != null ? Number(unitCost) : (item.avg_cost || 0),
+        source: 'manual',
+        notes: reason || null,
+      });
+    } else {
+      await consumeStockFIFO(req.db, req.params.id, Math.abs(Number(delta)));
+    }
 
     await req.db('inv_stock_adjustments').insert({
       id: 'adj' + Date.now(),
@@ -193,20 +210,79 @@ router.post('/items/:id/adjust-stock', async (req, res) => {
       reason: reason || null,
       created_by: req.user?.userId || null,
     });
-    await req.db('inv_items').where({ id: req.params.id }).update({
-      stock: Number(item.stock || 0) + Number(delta),
-      updated_at: new Date(),
-    });
+    await recomputeItemStock(req.db, req.params.id);
     const saved = await req.db('inv_items').where({ id: req.params.id }).first();
     req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
     res.json(mapItem(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/:slug/inventory/items/:id/lots — every lot for this item, oldest
+// first, so the UI can show exactly what's on hand and at what cost.
+router.get('/items/:id/lots', async (req, res) => {
+  try {
+    const rows = await req.db('inv_stock_lots').where({ item_id: req.params.id }).orderBy('received_date', 'asc').orderBy('created_at', 'asc');
+    res.json(rows.map(l => ({
+      id: l.id,
+      lotRef: l.lot_ref,
+      vendorId: l.vendor_id,
+      purchaseItemId: l.purchase_item_id,
+      quantityReceived: Number(l.quantity_received),
+      quantityRemaining: Number(l.quantity_remaining),
+      unitCost: Number(l.unit_cost),
+      receivedDate: l.received_date,
+      source: l.source,
+      notes: l.notes,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/inventory/items/:id/issue — general stock consumption
+// that ISN'T a manufacturing build (sales, scrap, samples, whatever) —
+// matches the real Issues sheet, which includes things sent to customers,
+// not just BOM builds. Draws FIFO across lots, same as manufacturing does.
+router.post('/items/:id/issue', async (req, res) => {
+  try {
+    const { quantity, details, issueDate } = req.body;
+    if (quantity == null || Number(quantity) <= 0) {
+      return res.status(400).json({ error: 'quantity is required and must be positive' });
+    }
+    const item = await req.db('inv_items').where({ id: req.params.id }).first();
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    const consumed = await consumeStockFIFO(req.db, req.params.id, Number(quantity));
+
+    const issueId = 'iss' + Date.now();
+    await req.db('inv_stock_issues').insert({
+      id: issueId,
+      item_id: req.params.id,
+      quantity,
+      issue_date: issueDate || new Date(),
+      details: details || null,
+      created_by: req.user?.userId || null,
+    });
+    for (const c of consumed) {
+      await req.db('inv_stock_issue_lots').insert({
+        id: 'isl' + Date.now() + Math.random().toString(36).slice(2, 6),
+        issue_id: issueId,
+        lot_id: c.lotId,
+        quantity: c.quantityConsumed,
+      });
+    }
+
+    await recomputeItemStock(req.db, req.params.id);
+    const saved = await req.db('inv_items').where({ id: req.params.id }).first();
+    req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+    res.json({ issueId, consumed, item: mapItem(saved) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 router.delete('/items/:id', async (req, res) => {
   try {
     const inUse = await req.db('inv_purchase_items').where({ item_id: req.params.id }).first();
     if (inUse) return res.status(400).json({ error: 'This item appears on a purchase order and cannot be deleted.' });
+    const hasLots = await req.db('inv_stock_lots').where({ item_id: req.params.id }).first();
+    if (hasLots) return res.status(400).json({ error: 'This item has stock lot history and cannot be deleted.' });
     await req.db('inv_stock_adjustments').where({ item_id: req.params.id }).delete();
     await req.db('inv_items').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('inv:item_deleted', { id: req.params.id });
@@ -300,42 +376,44 @@ router.patch('/purchases/:id', async (req, res) => {
 // receiving would be a natural follow-up enhancement.
 router.post('/purchases/:id/receive', async (req, res) => {
   try {
-    const { invoiceNumber } = req.body;
+    const { invoiceNumber, lotRefs } = req.body; // lotRefs: optional { [purchaseItemId]: "23NOV0001" }
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
     if (purchase.status === 'received') return res.status(400).json({ error: 'This purchase is already marked received.' });
     if (purchase.status === 'cancelled') return res.status(400).json({ error: 'This purchase was cancelled.' });
 
     const lines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
+    const touchedItemIds = new Set();
+
     for (const line of lines) {
       const outstanding = Number(line.quantity_ordered) - Number(line.quantity_received || 0);
       if (outstanding > 0) {
         await req.db('inv_purchase_items').where({ id: line.id }).update({ quantity_received: line.quantity_ordered });
 
-        const item = await req.db('inv_items').where({ id: line.item_id }).first();
-        const newStock = Number(item.stock || 0) + outstanding;
+        // Landed cost per unit for THIS line only — freight/import spread
+        // across its own quantity. This becomes the lot's fixed cost,
+        // never blended with any other lot's cost.
+        const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
+          + Number(line.freight_cost || 0) + Number(line.import_charges || 0)) / Number(line.quantity_ordered);
 
-        // Weighted-average LANDED cost across every received line for this
-        // item ever — landed cost = unit cost + this line's freight/import
-        // charges spread across its quantity, matching the real Receipts
-        // sheet's Cost -> Import duty/freight -> Total -> Per-unit-cost flow.
-        const receivedLines = await req.db('inv_purchase_items')
-          .where({ item_id: line.item_id }).andWhere('quantity_received', '>', 0);
-        let totalQty = 0, totalValue = 0;
-        receivedLines.forEach(l => {
-          const qty = l.id === line.id ? Number(line.quantity_ordered) : Number(l.quantity_received);
-          const landedValue = qty * Number(l.unit_cost || 0) + Number(l.freight_cost || 0) + Number(l.import_charges || 0);
-          totalQty += qty;
-          totalValue += landedValue;
+        await createLot(req.db, {
+          itemId: line.item_id,
+          lotRef: (lotRefs && lotRefs[line.id]) || `${purchase.po_number}-${line.id.slice(-6)}`,
+          vendorId: purchase.vendor_id,
+          purchaseItemId: line.id,
+          quantity: outstanding,
+          unitCost: landedUnitCost,
+          receivedDate: new Date(),
+          source: 'purchase',
         });
-        const avgCost = totalQty > 0 ? totalValue / totalQty : item.avg_cost;
-
-        await req.db('inv_items').where({ id: line.item_id }).update({
-          stock: newStock, avg_cost: avgCost, updated_at: new Date(),
-        });
-        const savedItem = await req.db('inv_items').where({ id: line.item_id }).first();
-        req.io.to(req.company.slug).emit('inv:item_updated', mapItem(savedItem));
+        touchedItemIds.add(line.item_id);
       }
+    }
+
+    for (const itemId of touchedItemIds) {
+      await recomputeItemStock(req.db, itemId);
+      const savedItem = await req.db('inv_items').where({ id: itemId }).first();
+      req.io.to(req.company.slug).emit('inv:item_updated', mapItem(savedItem));
     }
 
     await req.db('inv_purchases').where({ id: req.params.id }).update({

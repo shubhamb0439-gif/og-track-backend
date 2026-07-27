@@ -80,3 +80,16 @@ CREATE TABLE dbo.mfg_assembly_lines (
 GO
 CREATE INDEX IX_mfg_assembly_lines_assembly ON dbo.mfg_assembly_lines(assembly_id);
 GO
+
+/* Which specific stock lot(s) an assembly line's consumption actually came
+   from — a build might draw from more than one batch of the same component
+   if one lot alone didn't have enough remaining. */
+CREATE TABLE dbo.mfg_assembly_line_lots (
+    id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    assembly_line_id    NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_assembly_lines(id),
+    lot_id              NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_stock_lots(id),
+    quantity            DECIMAL(14,2)  NOT NULL
+);
+GO
+CREATE INDEX IX_mfg_assembly_line_lots_line ON dbo.mfg_assembly_line_lots(assembly_line_id);
+GO

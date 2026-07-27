@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { recomputeItemStock, consumeStockFIFO, createLot } = require('../utils/stockLots');
 
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapBom = (r) => r && ({
@@ -198,24 +199,48 @@ router.post('/assemblies', async (req, res) => {
         notes: notes || null,
         created_by: req.user?.userId || null,
       });
+
+      let totalComponentCost = 0;
+
       for (const { item, required } of requirements) {
+        // Consume FIFO across this component's actual lots — records exactly
+        // which lot(s) this build drew from, same as a general stock issue.
+        const consumed = await consumeStockFIFO(trx, item.id, required);
+
+        const lineId = 'asml' + Date.now() + Math.random().toString(36).slice(2, 6);
         await trx('mfg_assembly_lines').insert({
-          id: 'asml' + Date.now() + Math.random().toString(36).slice(2, 6),
+          id: lineId,
           assembly_id: assemblyId,
           component_item_id: item.id,
           quantity_consumed: required,
         });
-        await trx('inv_items').where({ id: item.id }).update({
-          stock: Number(item.stock || 0) - required,
-          updated_at: new Date(),
-        });
+        for (const c of consumed) {
+          await trx('mfg_assembly_line_lots').insert({
+            id: 'asll' + Date.now() + Math.random().toString(36).slice(2, 6),
+            assembly_line_id: lineId,
+            lot_id: c.lotId,
+            quantity: c.quantityConsumed,
+          });
+          totalComponentCost += c.quantityConsumed * c.unitCost;
+        }
+
+        await recomputeItemStock(trx, item.id);
         updatedItemIds.push(item.id);
       }
-      const product = await trx('inv_items').where({ id: bom.product_item_id }).first();
-      await trx('inv_items').where({ id: bom.product_item_id }).update({
-        stock: Number(product.stock || 0) + Number(quantityBuilt),
-        updated_at: new Date(),
+
+      // The finished product becomes its own new lot, costed from what was
+      // actually consumed to build it — a real cost-of-goods-manufactured
+      // number, not a manual stock bump with no cost attached.
+      const productUnitCost = Number(quantityBuilt) > 0 ? totalComponentCost / Number(quantityBuilt) : 0;
+      await createLot(trx, {
+        itemId: bom.product_item_id,
+        lotRef: `ASM-${assemblyId.slice(-8)}`,
+        quantity: quantityBuilt,
+        unitCost: productUnitCost,
+        source: 'assembly',
+        notes: `Built via BOM "${bom.name}"`,
       });
+      await recomputeItemStock(trx, bom.product_item_id);
       updatedItemIds.push(bom.product_item_id);
     });
 
