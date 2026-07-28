@@ -94,6 +94,7 @@ router.patch('/contacts/:id', async (req, res) => {
     if (b.assignedTo !== undefined) updates.assigned_to = b.assignedTo;
     if (b.estimatedValue !== undefined) updates.estimated_value = b.estimatedValue;
     if (b.customerStatus !== undefined) updates.customer_status = b.customerStatus;
+    if (b.kanbanStatus !== undefined) updates.kanban_status = b.kanbanStatus;
     if (b.notes !== undefined) updates.notes = b.notes;
 
     await req.db('crm_contacts').where({ id: req.params.id }).update(updates);
