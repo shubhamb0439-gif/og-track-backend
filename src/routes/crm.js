@@ -1,194 +1,262 @@
 const express = require('express');
+const crypto = require('crypto');
+const config = require('../config');
 const router = express.Router();
 
-// ── Row mapper ────────────────────────────────────────────────────────────────
-// Frontend reads: id, name, companyName, email, phone, source, assignedTo,
-//   stage, kanbanStatus, estimatedValue, lifetimeValue, customerStatus,
-//   notes, lostReason, createdAt, updatedAt
-const mapContact = (r) => r && ({
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+// ── Row mappers: DB (snake_case, SQL DATE/DATETIME2/DECIMAL) → API shape the
+//    frontend expects (camelCase, 'YYYY-MM-DD' date strings, ISO datetimes,
+//    numeric hours). This is the fix for the "calendar shows all absent /
+//    hours blank / regularize not reflecting" class of bug: the data was
+//    written fine, the frontend just couldn't read snake_case / Date objects.
+const dOnly = (v) => {           // SQL DATE (JS Date @ UTC midnight, or string) → 'YYYY-MM-DD'
+  if (v == null) return null;
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  return String(v).slice(0, 10);
+};
+const dTime = (v) => {           // SQL DATETIME2 → ISO string (or null)
+  if (v == null) return null;
+  return (v instanceof Date) ? v.toISOString() : new Date(v).toISOString();
+};
+const num = (v) => (v == null ? null : Number(v));  // DECIMAL may arrive as string
+
+const mapAtt = (r) => r && ({
   id: r.id,
-  name: r.name,
-  companyName: r.company_name,
-  email: r.email,
-  phone: r.phone,
-  source: r.source,
-  assignedTo: r.assigned_to,
-  stage: r.stage,
-  kanbanStatus: r.kanban_status,
-  estimatedValue: r.estimated_value != null ? Number(r.estimated_value) : null,
-  lifetimeValue: Number(r.lifetime_value || 0),
-  customerStatus: r.customer_status,
-  notes: r.notes,
-  lostReason: r.lost_reason,
-  createdAt: r.created_at,
-  updatedAt: r.updated_at,
+  userId: r.user_id,
+  userName: r.user_name,
+  date: dOnly(r.date),
+  clockIn: dTime(r.clock_in),
+  clockOut: dTime(r.clock_out),
+  totalHours: num(r.total_hours),
+  status: r.status,
+  mode: r.mode || null,
+  autoClockout: !!r.auto_clockout,
 });
 
-const mapSale = (r) => r && ({
+const mapReg = (r) => r && ({
   id: r.id,
-  contactId: r.contact_id,
-  amount: Number(r.amount),
-  saleDate: r.sale_date,
-  notes: r.notes,
-  createdBy: r.created_by,
-  createdAt: r.created_at,
+  userId: r.user_id,
+  userName: r.user_name,
+  date: dOnly(r.date),
+  reason: r.reason,
+  requestedIn: dTime(r.requested_in),
+  requestedOut: dTime(r.requested_out),
+  status: r.status,
+  approvedBy: r.approved_by,
 });
 
-// GET /api/:slug/crm/contacts?stage=lead|prospect|customer|lost
-router.get('/contacts', async (req, res) => {
-  try {
-    let q = req.db('crm_contacts');
-    if (req.query.stage) q = q.where({ stage: req.query.stage });
-    const rows = await q.orderBy('updated_at', 'desc');
-    res.json(rows.map(mapContact));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+const mapLeave = (r) => r && ({
+  id: r.id,
+  userId: r.user_id,
+  userName: r.user_name,
+  from: dOnly(r.from_date),
+  to: dOnly(r.to_date),
+  reason: r.reason,
+  leaveType: r.leave_type,
+  status: r.status,
+  approvedBy: r.approved_by,
 });
 
-// GET /api/:slug/crm/contacts/:id
-router.get('/contacts/:id', async (req, res) => {
+// ── Clock in ────────────────────────────────────────────────────────────────
+router.post('/clockin', async (req, res) => {
   try {
-    const row = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!row) return res.status(404).json({ error: 'Contact not found' });
-    res.json(mapContact(row));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+    const { userId, userName } = req.body;
+    const date = todayStr();
+    const id = `${userId}_${date}`;
+    const existing = await req.db('attendance').where({ id }).first();
+    if (existing && existing.clock_in) return res.status(400).json({ error: 'Already clocked in today' });
 
-// POST /api/:slug/crm/contacts — create a new lead
-router.post('/contacts', async (req, res) => {
-  try {
-    const { name, companyName, email, phone, source, assignedTo, estimatedValue, notes } = req.body;
-    if (!name) return res.status(400).json({ error: 'name is required' });
-    const id = 'lead' + Date.now();
-    const row = {
-      id, name,
-      company_name: companyName || null,
-      email: email || null,
-      phone: phone || null,
-      source: source || null,
-      assigned_to: assignedTo || null,
-      stage: 'lead',
-      kanban_status: 'new',
-      estimated_value: estimatedValue != null ? estimatedValue : null,
-      notes: notes || null,
-    };
-    await req.db('crm_contacts').insert(row);
-    const saved = await req.db('crm_contacts').where({ id }).first();
-    req.io.to(req.company.slug).emit('crm:contact_created', mapContact(saved));
-    res.json(mapContact(saved));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// PATCH /api/:slug/crm/contacts/:id — general field edits (name, notes, estimatedValue, etc.)
-router.patch('/contacts/:id', async (req, res) => {
-  try {
-    const existing = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!existing) return res.status(404).json({ error: 'Contact not found' });
-
-    const b = req.body;
-    const updates = { updated_at: new Date() };
-    if (b.name !== undefined) updates.name = b.name;
-    if (b.companyName !== undefined) updates.company_name = b.companyName;
-    if (b.email !== undefined) updates.email = b.email;
-    if (b.phone !== undefined) updates.phone = b.phone;
-    if (b.source !== undefined) updates.source = b.source;
-    if (b.assignedTo !== undefined) updates.assigned_to = b.assignedTo;
-    if (b.estimatedValue !== undefined) updates.estimated_value = b.estimatedValue;
-    if (b.customerStatus !== undefined) updates.customer_status = b.customerStatus;
-    if (b.kanbanStatus !== undefined) updates.kanban_status = b.kanbanStatus;
-    if (b.notes !== undefined) updates.notes = b.notes;
-
-    await req.db('crm_contacts').where({ id: req.params.id }).update(updates);
-    const saved = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    req.io.to(req.company.slug).emit('crm:contact_updated', mapContact(saved));
-    res.json(mapContact(saved));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// PATCH /api/:slug/crm/contacts/:id/stage — move through the funnel
-// Body: { stage: 'lead'|'prospect'|'customer'|'lost', kanbanStatus?, lostReason? }
-router.patch('/contacts/:id/stage', async (req, res) => {
-  try {
-    const { stage, kanbanStatus, lostReason } = req.body;
-    if (!['lead', 'prospect', 'customer', 'lost'].includes(stage)) {
-      return res.status(400).json({ error: "stage must be 'lead', 'prospect', 'customer', or 'lost'" });
+    const now = new Date();
+    if (existing) {
+      await req.db('attendance').where({ id }).update({ clock_in: now, status: 'present' });
+    } else {
+      await req.db('attendance').insert({ id, user_id: userId, user_name: userName, date, clock_in: now, status: 'present' });
     }
-    const existing = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!existing) return res.status(404).json({ error: 'Contact not found' });
-
-    const updates = { stage, updated_at: new Date() };
-    if (kanbanStatus) updates.kanban_status = kanbanStatus;
-    if (stage === 'lost') updates.lost_reason = lostReason || null;
-    // Moving into 'customer' for the first time — default a health status
-    // if one hasn't been set yet.
-    if (stage === 'customer' && !existing.customer_status) updates.customer_status = 'active';
-
-    await req.db('crm_contacts').where({ id: req.params.id }).update(updates);
-    const saved = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    req.io.to(req.company.slug).emit('crm:contact_updated', mapContact(saved));
-    res.json(mapContact(saved));
+    req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockIn: now.toISOString() });
+    res.json({ success: true, clockIn: now.toISOString() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/:slug/crm/contacts/:id
-router.delete('/contacts/:id', async (req, res) => {
+// ── Clock out ───────────────────────────────────────────────────────────────
+router.post('/clockout', async (req, res) => {
   try {
-    await req.db('crm_sales').where({ contact_id: req.params.id }).delete();
-    await req.db('crm_contacts').where({ id: req.params.id }).delete();
-    req.io.to(req.company.slug).emit('crm:contact_deleted', { id: req.params.id });
+    const { userId } = req.body;
+    const date = todayStr();
+    const id = `${userId}_${date}`;
+    const rec = await req.db('attendance').where({ id }).first();
+    if (!rec || !rec.clock_in) return res.status(400).json({ error: 'Not clocked in today' });
+    if (rec.clock_out) return res.status(400).json({ error: 'Already clocked out' });
+
+    const now = new Date();
+    const hrs = Number(((now - new Date(rec.clock_in)) / 3600000).toFixed(2));
+    await req.db('attendance').where({ id }).update({ clock_out: now, total_hours: hrs });
+    req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockOut: now.toISOString(), totalHours: hrs });
+    res.json({ success: true, clockOut: now.toISOString(), totalHours: hrs });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Today's record for a user ────────────────────────────────────────────────
+router.get('/today/:userId', async (req, res) => {
+  try {
+    const rec = await req.db('attendance').where({ id: `${req.params.userId}_${todayStr()}` }).first();
+    res.json(mapAtt(rec) || null);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Last 60 days for a user ──────────────────────────────────────────────────
+router.get('/user/:userId', async (req, res) => {
+  try {
+    const rows = await req.db('attendance').where({ user_id: req.params.userId }).orderBy('date', 'desc').limit(60);
+    res.json(rows.map(mapAtt));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Org-wide (last 300) ──────────────────────────────────────────────────────
+router.get('/all', async (req, res) => {
+  try {
+    const rows = await req.db('attendance').orderBy('date', 'desc').limit(300);
+    res.json(rows.map(mapAtt));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Regularization requests ──────────────────────────────────────────────────
+router.post('/regularize', async (req, res) => {
+  try {
+    const { userId, userName, date, reason, requestedIn, requestedOut } = req.body;
+    const id = 'reg' + Date.now();
+    const data = { id, user_id: userId, user_name: userName, date, reason, requested_in: requestedIn || null, requested_out: requestedOut || null, status: 'pending' };
+    await req.db('regularize_requests').insert(data);
+    req.io.to(req.company.slug).emit('regularize:new', mapReg(data));
+    res.json({ success: true, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/regularize', async (req, res) => {
+  try {
+    let q = req.db('regularize_requests').orderBy('created_at', 'desc');
+    if (req.query.userId) q = q.where('user_id', req.query.userId);
+    res.json((await q).map(mapReg));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.patch('/regularize/:id', async (req, res) => {
+  try {
+    const { status, approvedBy } = req.body;
+    await req.db('regularize_requests').where({ id: req.params.id }).update({ status, approved_by: approvedBy, resolved_at: new Date() });
+    if (status === 'approved') {
+      const r = await req.db('regularize_requests').where({ id: req.params.id }).first();
+      const attId = `${r.user_id}_${dOnly(r.date)}`;
+      let totalHours = null;
+      if (r.requested_in && r.requested_out) totalHours = Number(((new Date(r.requested_out) - new Date(r.requested_in)) / 3600000).toFixed(2));
+      const existing = await req.db('attendance').where({ id: attId }).first();
+      const payload = { user_id: r.user_id, user_name: r.user_name, date: dOnly(r.date), clock_in: r.requested_in, clock_out: r.requested_out, total_hours: totalHours, status: 'regularized' };
+      if (existing) await req.db('attendance').where({ id: attId }).update(payload);
+      else await req.db('attendance').insert({ id: attId, ...payload });
+    }
+    req.io.to(req.company.slug).emit('regularize:updated', { id: req.params.id, status });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Sales ─────────────────────────────────────────────────────────────────────
-
-// GET /api/:slug/crm/contacts/:id/sales — a customer's sale history
-router.get('/contacts/:id/sales', async (req, res) => {
+// ── Leave requests ───────────────────────────────────────────────────────────
+router.post('/leave', async (req, res) => {
   try {
-    const rows = await req.db('crm_sales').where({ contact_id: req.params.id }).orderBy('sale_date', 'desc');
-    res.json(rows.map(mapSale));
+    const { userId, userName, from, to, reason, leaveType } = req.body;
+    const id = 'lv' + Date.now();
+    const data = { id, user_id: userId, user_name: userName, from_date: from, to_date: to, reason, leave_type: leaveType || 'Casual', status: 'pending' };
+    await req.db('leave_requests').insert(data);
+    req.io.to(req.company.slug).emit('leave:new', mapLeave(data));
+    res.json({ success: true, id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/:slug/crm/contacts/:id/sales — record a completed sale.
-// This is the ONLY way lifetime_value changes — it's recomputed as the sum
-// of this contact's sales rows, never taken directly from client input, so
-// the number always matches the audit trail underneath it. Also promotes
-// the contact to stage='customer' if it wasn't already (matches the Cajo
-// behavior where recording a sale is what makes someone a Customer).
-router.post('/contacts/:id/sales', async (req, res) => {
+router.get('/leave', async (req, res) => {
   try {
-    const { amount, saleDate, notes } = req.body;
-    if (amount == null || isNaN(Number(amount))) {
-      return res.status(400).json({ error: 'amount is required and must be a number' });
+    let q = req.db('leave_requests').orderBy('created_at', 'desc');
+    if (req.query.userId) q = q.where('user_id', req.query.userId);
+    res.json((await q).map(mapLeave));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.patch('/leave/:id', async (req, res) => {
+  try {
+    const { status, approvedBy } = req.body;
+    await req.db('leave_requests').where({ id: req.params.id }).update({ status, approved_by: approvedBy, resolved_at: new Date() });
+    req.io.to(req.company.slug).emit('leave:updated', { id: req.params.id, status });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── QR attendance ─────────────────────────────────────────────────────────────
+// Design: a screen/tablet at the office door displays a QR code that rotates
+// every 30 seconds (a signed token — company slug + time bucket + HMAC using
+// QR_SECRET). Employees scan it with their own phone camera. This means the
+// QR image itself is useless if photographed and reused later — it only
+// validates within its ~30s window (plus one bucket of tolerance either side
+// for clock skew / slow scans).
+const QR_BUCKET_SECONDS = 30;
+
+function signQrBucket(slug, bucket) {
+  return crypto.createHmac('sha256', config.app.qrSecret).update(`${slug}:${bucket}`).digest('hex');
+}
+
+// GET /api/:slug/attendance/qr-token — for the display screen to show/refresh
+router.get('/qr-token', async (req, res) => {
+  try {
+    const bucket = Math.floor(Date.now() / 1000 / QR_BUCKET_SECONDS);
+    const sig = signQrBucket(req.company.slug, bucket);
+    const token = Buffer.from(`${req.company.slug}.${bucket}.${sig}`).toString('base64');
+    res.json({ token, expiresInSeconds: QR_BUCKET_SECONDS });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/attendance/qr-scan — an employee's phone scans the
+// displayed code; toggles clock-in/clock-out for whichever hasn't happened
+// yet today.
+router.post('/qr-scan', async (req, res) => {
+  try {
+    const { token, userId } = req.body;
+    if (!token || !userId) return res.status(400).json({ error: 'Missing token or userId' });
+
+    let decoded;
+    try { decoded = Buffer.from(token, 'base64').toString('utf8'); }
+    catch { return res.status(400).json({ error: 'Malformed QR code' }); }
+    const [slug, bucketStr, sig] = decoded.split('.');
+    const bucket = Number(bucketStr);
+    if (slug !== req.company.slug || !bucket || !sig) {
+      return res.status(400).json({ error: 'This QR code is not for this company' });
     }
-    const contact = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+    const nowBucket = Math.floor(Date.now() / 1000 / QR_BUCKET_SECONDS);
+    // Accept the current bucket or one bucket of slack either side.
+    const validBuckets = [nowBucket - 1, nowBucket, nowBucket + 1];
+    const isValid = validBuckets.some(b => signQrBucket(slug, b) === sig && b === bucket);
+    if (!isValid) return res.status(400).json({ error: 'QR code expired — please scan the current code' });
 
-    const saleId = 'sale' + Date.now();
-    await req.db('crm_sales').insert({
-      id: saleId,
-      contact_id: req.params.id,
-      amount,
-      sale_date: saleDate || new Date(),
-      notes: notes || null,
-      created_by: req.user?.userId || null,
-    });
+    const user = await req.db('users').where({ id: userId }).first();
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const { sum } = await req.db('crm_sales').where({ contact_id: req.params.id }).sum('amount as sum').first();
-    const contactUpdates = {
-      lifetime_value: sum || 0,
-      updated_at: new Date(),
-    };
-    if (contact.stage !== 'customer') {
-      contactUpdates.stage = 'customer';
-      contactUpdates.customer_status = contact.customer_status || 'active';
+    const date = todayStr();
+    const id = `${userId}_${date}`;
+    const existing = await req.db('attendance').where({ id }).first();
+    const now = new Date();
+
+    if (!existing || !existing.clock_in) {
+      if (existing) {
+        await req.db('attendance').where({ id }).update({ clock_in: now, status: 'present', mode: 'qr' });
+      } else {
+        await req.db('attendance').insert({ id, user_id: userId, user_name: user.name, date, clock_in: now, status: 'present', mode: 'qr' });
+      }
+      req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockIn: now.toISOString() });
+      return res.json({ success: true, action: 'clockin', time: now.toISOString() });
     }
-    await req.db('crm_contacts').where({ id: req.params.id }).update(contactUpdates);
-
-    const savedContact = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    const savedSale = await req.db('crm_sales').where({ id: saleId }).first();
-    req.io.to(req.company.slug).emit('crm:contact_updated', mapContact(savedContact));
-    res.json({ sale: mapSale(savedSale), contact: mapContact(savedContact) });
+    if (!existing.clock_out) {
+      const hrs = Number(((now - new Date(existing.clock_in)) / 3600000).toFixed(2));
+      await req.db('attendance').where({ id }).update({ clock_out: now, total_hours: hrs });
+      req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockOut: now.toISOString(), totalHours: hrs });
+      return res.json({ success: true, action: 'clockout', time: now.toISOString(), totalHours: hrs });
+    }
+    return res.status(400).json({ error: 'Already clocked in and out for today' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

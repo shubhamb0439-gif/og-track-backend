@@ -1,4 +1,6 @@
 const express = require('express');
+const crypto = require('crypto');
+const config = require('../config');
 const router = express.Router();
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
@@ -183,6 +185,78 @@ router.patch('/leave/:id', async (req, res) => {
     await req.db('leave_requests').where({ id: req.params.id }).update({ status, approved_by: approvedBy, resolved_at: new Date() });
     req.io.to(req.company.slug).emit('leave:updated', { id: req.params.id, status });
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── QR attendance ─────────────────────────────────────────────────────────────
+// Design: a screen/tablet at the office door displays a QR code that rotates
+// every 30 seconds (a signed token — company slug + time bucket + HMAC using
+// QR_SECRET). Employees scan it with their own phone camera. This means the
+// QR image itself is useless if photographed and reused later — it only
+// validates within its ~30s window (plus one bucket of tolerance either side
+// for clock skew / slow scans).
+const QR_BUCKET_SECONDS = 30;
+
+function signQrBucket(slug, bucket) {
+  return crypto.createHmac('sha256', config.app.qrSecret).update(`${slug}:${bucket}`).digest('hex');
+}
+
+// GET /api/:slug/attendance/qr-token — for the display screen to show/refresh
+router.get('/qr-token', async (req, res) => {
+  try {
+    const bucket = Math.floor(Date.now() / 1000 / QR_BUCKET_SECONDS);
+    const sig = signQrBucket(req.company.slug, bucket);
+    const token = Buffer.from(`${req.company.slug}.${bucket}.${sig}`).toString('base64');
+    res.json({ token, expiresInSeconds: QR_BUCKET_SECONDS });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/attendance/qr-scan — an employee's phone scans the
+// displayed code; toggles clock-in/clock-out for whichever hasn't happened
+// yet today.
+router.post('/qr-scan', async (req, res) => {
+  try {
+    const { token, userId } = req.body;
+    if (!token || !userId) return res.status(400).json({ error: 'Missing token or userId' });
+
+    let decoded;
+    try { decoded = Buffer.from(token, 'base64').toString('utf8'); }
+    catch { return res.status(400).json({ error: 'Malformed QR code' }); }
+    const [slug, bucketStr, sig] = decoded.split('.');
+    const bucket = Number(bucketStr);
+    if (slug !== req.company.slug || !bucket || !sig) {
+      return res.status(400).json({ error: 'This QR code is not for this company' });
+    }
+    const nowBucket = Math.floor(Date.now() / 1000 / QR_BUCKET_SECONDS);
+    // Accept the current bucket or one bucket of slack either side.
+    const validBuckets = [nowBucket - 1, nowBucket, nowBucket + 1];
+    const isValid = validBuckets.some(b => signQrBucket(slug, b) === sig && b === bucket);
+    if (!isValid) return res.status(400).json({ error: 'QR code expired — please scan the current code' });
+
+    const user = await req.db('users').where({ id: userId }).first();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const date = todayStr();
+    const id = `${userId}_${date}`;
+    const existing = await req.db('attendance').where({ id }).first();
+    const now = new Date();
+
+    if (!existing || !existing.clock_in) {
+      if (existing) {
+        await req.db('attendance').where({ id }).update({ clock_in: now, status: 'present', mode: 'qr' });
+      } else {
+        await req.db('attendance').insert({ id, user_id: userId, user_name: user.name, date, clock_in: now, status: 'present', mode: 'qr' });
+      }
+      req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockIn: now.toISOString() });
+      return res.json({ success: true, action: 'clockin', time: now.toISOString() });
+    }
+    if (!existing.clock_out) {
+      const hrs = Number(((now - new Date(existing.clock_in)) / 3600000).toFixed(2));
+      await req.db('attendance').where({ id }).update({ clock_out: now, total_hours: hrs });
+      req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockOut: now.toISOString(), totalHours: hrs });
+      return res.json({ success: true, action: 'clockout', time: now.toISOString(), totalHours: hrs });
+    }
+    return res.status(400).json({ error: 'Already clocked in and out for today' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
