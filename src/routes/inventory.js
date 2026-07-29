@@ -4,65 +4,66 @@ const { recomputeItemStock, consumeStockFIFO, createLot } = require('../utils/st
 
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapVendor = (r) => r && ({
-  id: r.id, name: r.name, email: r.email, phone: r.phone,
-  address: r.address, notes: r.notes, createdAt: r.created_at, updatedAt: r.updated_at,
+  id: r.id, vendorCode: r.vendor_code, name: r.name, legalName: r.legal_name,
+  vendorGroup: r.vendor_group, contactName: r.contact_name,
+  email: r.email, phone: r.phone, address: r.address, currency: r.currency,
+  ratingPrice: r.rating_price != null ? Number(r.rating_price) : null,
+  ratingQuality: r.rating_quality != null ? Number(r.rating_quality) : null,
+  ratingLeadTime: r.rating_lead_time != null ? Number(r.rating_lead_time) : null,
+  ratingAverage: [r.rating_price, r.rating_quality, r.rating_lead_time]
+    .filter(v => v != null).length
+    ? [r.rating_price, r.rating_quality, r.rating_lead_time]
+        .filter(v => v != null)
+        .reduce((a, b) => a + Number(b), 0) /
+      [r.rating_price, r.rating_quality, r.rating_lead_time].filter(v => v != null).length
+    : null,
+  notes: r.notes, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
-function stockWarning(item) {
+function stockAlert(item) {
   const stock = Number(item.stock || 0);
-  if (item.max_stock != null && stock > Number(item.max_stock)) return 'overstocked';
-  if (item.min_stock != null && stock < Number(item.min_stock)) return 'low';
-  if (item.reorder_point != null && stock <= Number(item.reorder_point)) return 'reorder';
+  const min = Number(item.stock_min || 0);
+  const reorder = Number(item.stock_reorder || 0);
+  if (min > 0 && stock < min) return 'critical';
+  if (reorder > 0 && stock <= reorder) return 'reorder';
   return null;
 }
 
 const mapItem = (r) => r && ({
-  id: r.id,
-  name: r.name,
-  itemCode: r.item_code,
-  group: r.item_group,
-  class: r.item_class,
-  unit: r.unit,
-  stock: Number(r.stock || 0),
-  sold: Number(r.sold || 0),
+  id: r.id, itemCode: r.item_code, name: r.name, displayName: r.display_name,
+  unit: r.unit, itemGroup: r.item_group, itemClass: r.item_class,
+  stock: Number(r.stock || 0), stockSold: Number(r.stock_sold || 0),
+  stockMin: Number(r.stock_min || 0), stockMax: Number(r.stock_max || 0),
+  stockReorder: Number(r.stock_reorder || 0),
   avgCost: r.avg_cost != null ? Number(r.avg_cost) : null,
-  avgLeadTimeDays: r.avg_lead_time_days,
-  minStock: r.min_stock != null ? Number(r.min_stock) : null,
-  maxStock: r.max_stock != null ? Number(r.max_stock) : null,
-  reorderPoint: r.reorder_point != null ? Number(r.reorder_point) : null,
-  warning: stockWarning(r),
-  notes: r.notes,
-  createdAt: r.created_at, updatedAt: r.updated_at,
+  costMin: r.cost_min != null ? Number(r.cost_min) : null,
+  costMax: r.cost_max != null ? Number(r.cost_max) : null,
+  serialTracked: !!r.serial_tracked,
+  alert: stockAlert(r),
+  notes: r.notes, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
 const mapPurchase = (r) => r && ({
-  id: r.id,
-  poNumber: r.po_number,
-  vendorId: r.vendor_id,
-  status: r.status,
-  orderDate: r.order_date,
-  expectedDate: r.expected_date,
-  receivedDate: r.received_date,
-  invoiceNumber: r.invoice_number,
-  notes: r.notes,
-  createdBy: r.created_by,
+  id: r.id, poNumber: r.po_number, vendorId: r.vendor_id, status: r.status,
+  orderDate: r.order_date, expectedDate: r.expected_date,
+  receivedDate: r.received_date, invoiceNumber: r.invoice_number,
+  notes: r.notes, createdBy: r.created_by,
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
 const mapPurchaseItem = (r) => r && ({
-  id: r.id,
-  purchaseId: r.purchase_id,
-  itemId: r.item_id,
+  id: r.id, purchaseId: r.purchase_id, itemId: r.item_id,
+  vendorItemCode: r.vendor_item_code,
   quantityOrdered: Number(r.quantity_ordered),
   quantityReceived: Number(r.quantity_received || 0),
   unitCost: Number(r.unit_cost || 0),
   freightCost: Number(r.freight_cost || 0),
   importCharges: Number(r.import_charges || 0),
-  // What this line actually costs per unit once landed — this is what
-  // feeds into the item's average cost, matching the real Receipts sheet's
-  // Cost -> Import duty/freight -> Total -> Per-unit-cost flow.
+  leadTimeDays: r.lead_time_days != null ? Number(r.lead_time_days) : null,
   effectiveUnitCost: Number(r.quantity_ordered) > 0
-    ? (Number(r.unit_cost || 0) * Number(r.quantity_ordered) + Number(r.freight_cost || 0) + Number(r.import_charges || 0)) / Number(r.quantity_ordered)
+    ? (Number(r.unit_cost || 0) * Number(r.quantity_ordered)
+        + Number(r.freight_cost || 0) + Number(r.import_charges || 0))
+      / Number(r.quantity_ordered)
     : Number(r.unit_cost || 0),
 });
 
@@ -77,10 +78,20 @@ router.get('/vendors', async (req, res) => {
 
 router.post('/vendors', async (req, res) => {
   try {
-    const { name, email, phone, address, notes } = req.body;
+    const { vendorCode, name, legalName, vendorGroup, contactName, email, phone,
+      address, currency, ratingPrice, ratingQuality, ratingLeadTime, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
-    const id = 'ven' + Date.now();
-    await req.db('inv_vendors').insert({ id, name, email: email || null, phone: phone || null, address: address || null, notes: notes || null });
+    const id = 'ven_' + Date.now();
+    await req.db('inv_vendors').insert({
+      id, vendor_code: vendorCode || null, name, legal_name: legalName || null,
+      vendor_group: vendorGroup || null, contact_name: contactName || null,
+      email: email || null, phone: phone || null, address: address || null,
+      currency: currency || 'INR',
+      rating_price: ratingPrice != null ? ratingPrice : null,
+      rating_quality: ratingQuality != null ? ratingQuality : null,
+      rating_lead_time: ratingLeadTime != null ? ratingLeadTime : null,
+      notes: notes || null, created_by: req.user?.userId || null,
+    });
     const saved = await req.db('inv_vendors').where({ id }).first();
     req.io.to(req.company.slug).emit('inv:vendor_created', mapVendor(saved));
     res.json(mapVendor(saved));
@@ -89,13 +100,21 @@ router.post('/vendors', async (req, res) => {
 
 router.patch('/vendors/:id', async (req, res) => {
   try {
-    const { name, email, phone, address, notes } = req.body;
+    const b = req.body;
     const updates = { updated_at: new Date() };
-    if (name !== undefined) updates.name = name;
-    if (email !== undefined) updates.email = email;
-    if (phone !== undefined) updates.phone = phone;
-    if (address !== undefined) updates.address = address;
-    if (notes !== undefined) updates.notes = notes;
+    if (b.vendorCode !== undefined) updates.vendor_code = b.vendorCode;
+    if (b.name !== undefined) updates.name = b.name;
+    if (b.legalName !== undefined) updates.legal_name = b.legalName;
+    if (b.vendorGroup !== undefined) updates.vendor_group = b.vendorGroup;
+    if (b.contactName !== undefined) updates.contact_name = b.contactName;
+    if (b.email !== undefined) updates.email = b.email;
+    if (b.phone !== undefined) updates.phone = b.phone;
+    if (b.address !== undefined) updates.address = b.address;
+    if (b.currency !== undefined) updates.currency = b.currency;
+    if (b.ratingPrice !== undefined) updates.rating_price = b.ratingPrice;
+    if (b.ratingQuality !== undefined) updates.rating_quality = b.ratingQuality;
+    if (b.ratingLeadTime !== undefined) updates.rating_lead_time = b.ratingLeadTime;
+    if (b.notes !== undefined) updates.notes = b.notes;
     await req.db('inv_vendors').where({ id: req.params.id }).update(updates);
     const saved = await req.db('inv_vendors').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Vendor not found' });
@@ -107,7 +126,7 @@ router.patch('/vendors/:id', async (req, res) => {
 router.delete('/vendors/:id', async (req, res) => {
   try {
     const inUse = await req.db('inv_purchases').where({ vendor_id: req.params.id }).first();
-    if (inUse) return res.status(400).json({ error: 'This vendor has purchase orders on record and cannot be deleted.' });
+    if (inUse) return res.status(400).json({ error: 'This vendor has purchase orders and cannot be deleted.' });
     await req.db('inv_vendors').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('inv:vendor_deleted', { id: req.params.id });
     res.json({ success: true });
@@ -120,29 +139,37 @@ router.get('/items', async (req, res) => {
   try {
     let q = req.db('inv_items');
     if (req.query.group) q = q.where({ item_group: req.query.group });
+    if (req.query.alerts === 'true') {
+      // Only return items that are below min or at reorder level
+      q = q.whereRaw('(stock_min > 0 AND stock < stock_min) OR (stock_reorder > 0 AND stock <= stock_reorder)');
+    }
     const rows = await q.orderBy('name', 'asc');
     res.json(rows.map(mapItem));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+router.get('/items/:id', async (req, res) => {
+  try {
+    const row = await req.db('inv_items').where({ id: req.params.id }).first();
+    if (!row) return res.status(404).json({ error: 'Item not found' });
+    res.json(mapItem(row));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.post('/items', async (req, res) => {
   try {
-    const { name, itemCode, group, itemClass, unit, minStock, maxStock, reorderPoint, notes } = req.body;
+    const { itemCode, name, displayName, unit, itemGroup, itemClass,
+      stockMin, stockMax, stockReorder, serialTracked, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
-    if (group && !['part', 'component', 'product'].includes(group)) {
-      return res.status(400).json({ error: "group must be 'part', 'component', or 'product'" });
-    }
-    const id = 'item' + Date.now();
+    const id = 'item_' + Date.now();
     await req.db('inv_items').insert({
-      id, name,
-      item_code: itemCode || null,
-      item_group: group || 'part',
-      item_class: itemClass || null,
-      unit: unit || 'pcs',
-      min_stock: minStock != null ? minStock : null,
-      max_stock: maxStock != null ? maxStock : null,
-      reorder_point: reorderPoint != null ? reorderPoint : null,
-      notes: notes || null,
+      id, item_code: itemCode || null, name, display_name: displayName || null,
+      unit: unit || 'pcs', item_group: itemGroup || null, item_class: itemClass || null,
+      stock_min: stockMin != null ? stockMin : 0,
+      stock_max: stockMax != null ? stockMax : 0,
+      stock_reorder: stockReorder != null ? stockReorder : 0,
+      serial_tracked: serialTracked ? 1 : 0,
+      notes: notes || null, created_by: req.user?.userId || null,
     });
     const saved = await req.db('inv_items').where({ id }).first();
     req.io.to(req.company.slug).emit('inv:item_created', mapItem(saved));
@@ -154,19 +181,17 @@ router.patch('/items/:id', async (req, res) => {
   try {
     const b = req.body;
     const updates = { updated_at: new Date() };
-    if (b.name !== undefined) updates.name = b.name;
     if (b.itemCode !== undefined) updates.item_code = b.itemCode;
-    if (b.group !== undefined) updates.item_group = b.group;
-    if (b.itemClass !== undefined) updates.item_class = b.itemClass;
+    if (b.name !== undefined) updates.name = b.name;
+    if (b.displayName !== undefined) updates.display_name = b.displayName;
     if (b.unit !== undefined) updates.unit = b.unit;
-    if (b.minStock !== undefined) updates.min_stock = b.minStock;
-    if (b.maxStock !== undefined) updates.max_stock = b.maxStock;
-    if (b.reorderPoint !== undefined) updates.reorder_point = b.reorderPoint;
+    if (b.itemGroup !== undefined) updates.item_group = b.itemGroup;
+    if (b.itemClass !== undefined) updates.item_class = b.itemClass;
+    if (b.stockMin !== undefined) updates.stock_min = b.stockMin;
+    if (b.stockMax !== undefined) updates.stock_max = b.stockMax;
+    if (b.stockReorder !== undefined) updates.stock_reorder = b.stockReorder;
+    if (b.serialTracked !== undefined) updates.serial_tracked = b.serialTracked ? 1 : 0;
     if (b.notes !== undefined) updates.notes = b.notes;
-    // Deliberately NOT allowing `stock` to be set directly here — matches
-    // the real system's behavior (no "type over the stock count" field).
-    // Use POST /items/:id/adjust-stock for manual corrections instead.
-
     await req.db('inv_items').where({ id: req.params.id }).update(updates);
     const saved = await req.db('inv_items').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Item not found' });
@@ -175,12 +200,35 @@ router.patch('/items/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/:slug/inventory/items/:id/adjust-stock — manual correction
-// (physical count, damage, write-off, or entering historical opening stock).
-// Positive delta creates a new lot (you supply its cost); negative delta
-// consumes existing lots FIFO. Every adjustment is still logged in
-// inv_stock_adjustments regardless of direction, for the same audit reason
-// as before — this just also keeps the underlying lots consistent now.
+router.delete('/items/:id', async (req, res) => {
+  try {
+    const inUse = await req.db('inv_purchase_items').where({ item_id: req.params.id }).first();
+    if (inUse) return res.status(400).json({ error: 'This item appears on a purchase and cannot be deleted.' });
+    const hasLots = await req.db('inv_stock_lots').where({ item_id: req.params.id }).first();
+    if (hasLots) return res.status(400).json({ error: 'This item has stock lot history and cannot be deleted.' });
+    await req.db('inv_stock_adjustments').where({ item_id: req.params.id }).delete();
+    await req.db('inv_items').where({ id: req.params.id }).delete();
+    req.io.to(req.company.slug).emit('inv:item_deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/items/:id/lots', async (req, res) => {
+  try {
+    const rows = await req.db('inv_stock_lots')
+      .where({ item_id: req.params.id })
+      .orderBy('received_date', 'asc').orderBy('created_at', 'asc');
+    res.json(rows.map(l => ({
+      id: l.id, lotRef: l.lot_ref, vendorId: l.vendor_id,
+      purchaseItemId: l.purchase_item_id,
+      quantityReceived: Number(l.quantity_received),
+      quantityRemaining: Number(l.quantity_remaining),
+      unitCost: Number(l.unit_cost),
+      receivedDate: l.received_date, source: l.source, notes: l.notes,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.post('/items/:id/adjust-stock', async (req, res) => {
   try {
     const { delta, reason, unitCost, lotRef } = req.body;
@@ -192,23 +240,16 @@ router.post('/items/:id/adjust-stock', async (req, res) => {
 
     if (Number(delta) > 0) {
       await createLot(req.db, {
-        itemId: req.params.id,
-        lotRef: lotRef || null,
-        quantity: Number(delta),
+        itemId: req.params.id, lotRef: lotRef || null, quantity: Number(delta),
         unitCost: unitCost != null ? Number(unitCost) : (item.avg_cost || 0),
-        source: 'manual',
-        notes: reason || null,
+        source: 'manual', notes: reason || null,
       });
     } else {
       await consumeStockFIFO(req.db, req.params.id, Math.abs(Number(delta)));
     }
-
     await req.db('inv_stock_adjustments').insert({
-      id: 'adj' + Date.now(),
-      item_id: req.params.id,
-      delta,
-      reason: reason || null,
-      created_by: req.user?.userId || null,
+      id: 'adj_' + Date.now(), item_id: req.params.id,
+      delta, reason: reason || null, created_by: req.user?.userId || null,
     });
     await recomputeItemStock(req.db, req.params.id);
     const saved = await req.db('inv_items').where({ id: req.params.id }).first();
@@ -217,30 +258,6 @@ router.post('/items/:id/adjust-stock', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/:slug/inventory/items/:id/lots — every lot for this item, oldest
-// first, so the UI can show exactly what's on hand and at what cost.
-router.get('/items/:id/lots', async (req, res) => {
-  try {
-    const rows = await req.db('inv_stock_lots').where({ item_id: req.params.id }).orderBy('received_date', 'asc').orderBy('created_at', 'asc');
-    res.json(rows.map(l => ({
-      id: l.id,
-      lotRef: l.lot_ref,
-      vendorId: l.vendor_id,
-      purchaseItemId: l.purchase_item_id,
-      quantityReceived: Number(l.quantity_received),
-      quantityRemaining: Number(l.quantity_remaining),
-      unitCost: Number(l.unit_cost),
-      receivedDate: l.received_date,
-      source: l.source,
-      notes: l.notes,
-    })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// POST /api/:slug/inventory/items/:id/issue — general stock consumption
-// that ISN'T a manufacturing build (sales, scrap, samples, whatever) —
-// matches the real Issues sheet, which includes things sent to customers,
-// not just BOM builds. Draws FIFO across lots, same as manufacturing does.
 router.post('/items/:id/issue', async (req, res) => {
   try {
     const { quantity, details, issueDate } = req.body;
@@ -249,45 +266,24 @@ router.post('/items/:id/issue', async (req, res) => {
     }
     const item = await req.db('inv_items').where({ id: req.params.id }).first();
     if (!item) return res.status(404).json({ error: 'Item not found' });
-
     const consumed = await consumeStockFIFO(req.db, req.params.id, Number(quantity));
-
-    const issueId = 'iss' + Date.now();
+    const issueId = 'iss_' + Date.now();
     await req.db('inv_stock_issues').insert({
-      id: issueId,
-      item_id: req.params.id,
-      quantity,
-      issue_date: issueDate || new Date(),
-      details: details || null,
+      id: issueId, item_id: req.params.id, quantity,
+      issue_date: issueDate || new Date(), details: details || null,
       created_by: req.user?.userId || null,
     });
     for (const c of consumed) {
       await req.db('inv_stock_issue_lots').insert({
-        id: 'isl' + Date.now() + Math.random().toString(36).slice(2, 6),
-        issue_id: issueId,
-        lot_id: c.lotId,
-        quantity: c.quantityConsumed,
+        id: 'isl_' + Date.now() + Math.random().toString(36).slice(2, 6),
+        issue_id: issueId, lot_id: c.lotId, quantity: c.quantityConsumed,
       });
     }
-
     await recomputeItemStock(req.db, req.params.id);
     const saved = await req.db('inv_items').where({ id: req.params.id }).first();
     req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
     res.json({ issueId, consumed, item: mapItem(saved) });
   } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-router.delete('/items/:id', async (req, res) => {
-  try {
-    const inUse = await req.db('inv_purchase_items').where({ item_id: req.params.id }).first();
-    if (inUse) return res.status(400).json({ error: 'This item appears on a purchase order and cannot be deleted.' });
-    const hasLots = await req.db('inv_stock_lots').where({ item_id: req.params.id }).first();
-    if (hasLots) return res.status(400).json({ error: 'This item has stock lot history and cannot be deleted.' });
-    await req.db('inv_stock_adjustments').where({ item_id: req.params.id }).delete();
-    await req.db('inv_items').where({ id: req.params.id }).delete();
-    req.io.to(req.company.slug).emit('inv:item_deleted', { id: req.params.id });
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Purchases ─────────────────────────────────────────────────────────────────
@@ -296,12 +292,12 @@ router.get('/purchases', async (req, res) => {
   try {
     let q = req.db('inv_purchases');
     if (req.query.status) q = q.where({ status: req.query.status });
+    if (req.query.vendorId) q = q.where({ vendor_id: req.query.vendorId });
     const rows = await q.orderBy('order_date', 'desc');
     res.json(rows.map(mapPurchase));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/:slug/inventory/purchases/:id — includes line items
 router.get('/purchases/:id', async (req, res) => {
   try {
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
@@ -311,36 +307,32 @@ router.get('/purchases/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/:slug/inventory/purchases — create a PO with line items.
-// Body: { poNumber, vendorId, orderDate, expectedDate, notes, lines: [{itemId, quantityOrdered, unitCost}] }
 router.post('/purchases', async (req, res) => {
   try {
-    const { poNumber, vendorId, orderDate, expectedDate, notes, lines } = req.body;
+    const { poNumber, vendorId, orderDate, expectedDate, invoiceNumber, notes, lines } = req.body;
     if (!poNumber || !vendorId) return res.status(400).json({ error: 'poNumber and vendorId are required' });
     if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'At least one line item is required' });
-
     const vendor = await req.db('inv_vendors').where({ id: vendorId }).first();
     if (!vendor) return res.status(400).json({ error: 'Vendor not found' });
 
-    const id = 'po' + Date.now();
+    const id = 'po_' + Date.now();
     await req.db('inv_purchases').insert({
-      id, po_number: poNumber, vendor_id: vendorId,
-      status: 'pending',
-      order_date: orderDate || new Date(),
-      expected_date: expectedDate || null,
-      notes: notes || null,
-      created_by: req.user?.userId || null,
+      id, po_number: poNumber, vendor_id: vendorId, status: 'pending',
+      order_date: orderDate || new Date(), expected_date: expectedDate || null,
+      invoice_number: invoiceNumber || null,
+      notes: notes || null, created_by: req.user?.userId || null,
     });
     for (const line of lines) {
       if (!line.itemId || !line.quantityOrdered) continue;
       await req.db('inv_purchase_items').insert({
-        id: 'poi' + Date.now() + Math.random().toString(36).slice(2, 6),
-        purchase_id: id,
-        item_id: line.itemId,
+        id: 'poi_' + Date.now() + Math.random().toString(36).slice(2, 6),
+        purchase_id: id, item_id: line.itemId,
+        vendor_item_code: line.vendorItemCode || null,
         quantity_ordered: line.quantityOrdered,
         unit_cost: line.unitCost || 0,
         freight_cost: line.freightCost || 0,
         import_charges: line.importCharges || 0,
+        lead_time_days: line.leadTimeDays || null,
       });
     }
     const saved = await req.db('inv_purchases').where({ id }).first();
@@ -350,7 +342,6 @@ router.post('/purchases', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PATCH /api/:slug/inventory/purchases/:id — edit status/notes/dates (not line items)
 router.patch('/purchases/:id', async (req, res) => {
   try {
     const b = req.body;
@@ -367,55 +358,38 @@ router.patch('/purchases/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/:slug/inventory/purchases/:id/receive — mark the whole PO as
-// received: for every line, whatever's still outstanding (ordered - already
-// received) gets added to that item's stock, quantity_received is set to
-// quantity_ordered, and the item's avg_cost is recomputed from ALL of its
-// received purchase lines (weighted average), not just this one. This is
-// Phase 2's receiving model — full-PO receipt only; partial per-line
-// receiving would be a natural follow-up enhancement.
 router.post('/purchases/:id/receive', async (req, res) => {
   try {
-    const { invoiceNumber, lotRefs } = req.body; // lotRefs: optional { [purchaseItemId]: "23NOV0001" }
+    const { invoiceNumber, lotRefs } = req.body;
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
-    if (purchase.status === 'received') return res.status(400).json({ error: 'This purchase is already marked received.' });
-    if (purchase.status === 'cancelled') return res.status(400).json({ error: 'This purchase was cancelled.' });
+    if (purchase.status === 'received') return res.status(400).json({ error: 'Already received.' });
+    if (purchase.status === 'cancelled') return res.status(400).json({ error: 'Purchase was cancelled.' });
 
     const lines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
     const touchedItemIds = new Set();
-
     for (const line of lines) {
       const outstanding = Number(line.quantity_ordered) - Number(line.quantity_received || 0);
       if (outstanding > 0) {
         await req.db('inv_purchase_items').where({ id: line.id }).update({ quantity_received: line.quantity_ordered });
-
-        // Landed cost per unit for THIS line only — freight/import spread
-        // across its own quantity. This becomes the lot's fixed cost,
-        // never blended with any other lot's cost.
         const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
-          + Number(line.freight_cost || 0) + Number(line.import_charges || 0)) / Number(line.quantity_ordered);
-
+          + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
+          / Number(line.quantity_ordered);
         await createLot(req.db, {
           itemId: line.item_id,
           lotRef: (lotRefs && lotRefs[line.id]) || `${purchase.po_number}-${line.id.slice(-6)}`,
-          vendorId: purchase.vendor_id,
-          purchaseItemId: line.id,
-          quantity: outstanding,
-          unitCost: landedUnitCost,
-          receivedDate: new Date(),
-          source: 'purchase',
+          vendorId: purchase.vendor_id, purchaseItemId: line.id,
+          quantity: outstanding, unitCost: landedUnitCost,
+          receivedDate: new Date(), source: 'purchase',
         });
         touchedItemIds.add(line.item_id);
       }
     }
-
     for (const itemId of touchedItemIds) {
       await recomputeItemStock(req.db, itemId);
       const savedItem = await req.db('inv_items').where({ id: itemId }).first();
       req.io.to(req.company.slug).emit('inv:item_updated', mapItem(savedItem));
     }
-
     await req.db('inv_purchases').where({ id: req.params.id }).update({
       status: 'received', received_date: new Date(), updated_at: new Date(),
       ...(invoiceNumber !== undefined ? { invoice_number: invoiceNumber } : {}),
@@ -431,7 +405,7 @@ router.delete('/purchases/:id', async (req, res) => {
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
     if (purchase.status === 'received') {
-      return res.status(400).json({ error: 'A received purchase has already affected stock and cannot be deleted — cancel future orders instead.' });
+      return res.status(400).json({ error: 'A received purchase has already affected stock and cannot be deleted.' });
     }
     await req.db('inv_purchase_items').where({ purchase_id: req.params.id }).delete();
     await req.db('inv_purchases').where({ id: req.params.id }).delete();

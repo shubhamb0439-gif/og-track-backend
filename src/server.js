@@ -24,6 +24,7 @@ const hrRoutes = require('./routes/hr');
 const crmRoutes = require('./routes/crm');
 const inventoryRoutes = require('./routes/inventory');
 const manufacturingRoutes = require('./routes/manufacturing');
+const salesRoutes = require('./routes/sales');
 const uploadRoutes = require('./routes/upload');
 
 const app = express();
@@ -86,6 +87,7 @@ app.use('/api/:slug/inventory', resolveTenant, requireModule('inventory'), inven
 // FKs into inventory's tables, so masteradmin.html enforces that a company
 // can't have manufacturing without inventory also being enabled.
 app.use('/api/:slug/manufacturing', resolveTenant, requireModule('manufacturing'), manufacturingRoutes);
+app.use('/api/:slug/sales', resolveTenant, requireModule('sales'), salesRoutes);
 app.use('/api/:slug/upload', resolveTenant, uploadRoutes);
 
 // Serve uploaded files (written by the upload route) as static assets.

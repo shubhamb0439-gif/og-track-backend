@@ -1,194 +1,363 @@
 const express = require('express');
 const router = express.Router();
 
-// ── Row mapper ────────────────────────────────────────────────────────────────
-// Frontend reads: id, name, companyName, email, phone, source, assignedTo,
-//   stage, kanbanStatus, estimatedValue, lifetimeValue, customerStatus,
-//   notes, lostReason, createdAt, updatedAt
-const mapContact = (r) => r && ({
-  id: r.id,
-  name: r.name,
-  companyName: r.company_name,
-  email: r.email,
-  phone: r.phone,
-  source: r.source,
-  assignedTo: r.assigned_to,
-  stage: r.stage,
-  kanbanStatus: r.kanban_status,
+// ── Row mappers ────────────────────────────────────────────────────────────────
+const mapLead = (r) => r && ({
+  id: r.id, name: r.name, company: r.company, email: r.email, phone: r.phone,
+  position: r.position, source: r.source, status: r.status,
   estimatedValue: r.estimated_value != null ? Number(r.estimated_value) : null,
+  notes: r.notes, assignedTo: r.assigned_to,
+  convertedToProspectId: r.converted_to_prospect_id, convertedAt: r.converted_at,
+  createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
+});
+
+const mapProspect = (r) => r && ({
+  id: r.id, name: r.name, company: r.company, email: r.email, phone: r.phone,
+  position: r.position, source: r.source, status: r.status,
+  estimatedValue: r.estimated_value != null ? Number(r.estimated_value) : null,
+  notes: r.notes, assignedTo: r.assigned_to,
+  originalLeadId: r.original_lead_id,
+  convertedToCustomerId: r.converted_to_customer_id, convertedAt: r.converted_at,
+  createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
+});
+
+const mapCustomer = (r) => r && ({
+  id: r.id, name: r.name, company: r.company, email: r.email, phone: r.phone,
+  position: r.position, source: r.source, status: r.status,
   lifetimeValue: Number(r.lifetime_value || 0),
-  customerStatus: r.customer_status,
-  notes: r.notes,
-  lostReason: r.lost_reason,
-  createdAt: r.created_at,
-  updatedAt: r.updated_at,
+  billingAddress: r.billing_address, shippingAddress: r.shipping_address,
+  notes: r.notes, assignedTo: r.assigned_to,
+  originalProspectId: r.original_prospect_id,
+  createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
-const mapSale = (r) => r && ({
-  id: r.id,
-  contactId: r.contact_id,
-  amount: Number(r.amount),
-  saleDate: r.sale_date,
-  notes: r.notes,
-  createdBy: r.created_by,
-  createdAt: r.created_at,
+const mapPO = (r) => r && ({
+  id: r.id, poNumber: r.po_number, customerId: r.customer_id,
+  status: r.status, orderDate: r.order_date, deliveryDate: r.delivery_date,
+  totalValue: r.total_value != null ? Number(r.total_value) : null,
+  notes: r.notes, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
-// GET /api/:slug/crm/contacts?stage=lead|prospect|customer|lost
-router.get('/contacts', async (req, res) => {
+const mapPOItem = (r) => r && ({
+  id: r.id, purchaseOrderId: r.purchase_order_id, itemId: r.item_id,
+  quantity: Number(r.quantity), quantityFulfilled: Number(r.quantity_fulfilled || 0),
+  unitPrice: r.unit_price != null ? Number(r.unit_price) : null,
+  lineTotal: r.line_total != null ? Number(r.line_total) : null,
+});
+
+// Helper: which table does an id prefix map to?
+function tableForId(id) {
+  if (!id) return null;
+  if (id.startsWith('lead_')) return 'leads';
+  if (id.startsWith('prospect_')) return 'prospects';
+  if (id.startsWith('customer_')) return 'customers';
+  return null;
+}
+function mapFnForTable(table) {
+  return { leads: mapLead, prospects: mapProspect, customers: mapCustomer }[table];
+}
+
+// ── Leads ─────────────────────────────────────────────────────────────────────
+
+router.get('/leads', async (req, res) => {
   try {
-    let q = req.db('crm_contacts');
-    if (req.query.stage) q = q.where({ stage: req.query.stage });
+    let q = req.db('leads');
+    if (req.query.status) q = q.where({ status: req.query.status });
     const rows = await q.orderBy('updated_at', 'desc');
-    res.json(rows.map(mapContact));
+    res.json(rows.map(mapLead));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/:slug/crm/contacts/:id
-router.get('/contacts/:id', async (req, res) => {
+router.get('/leads/:id', async (req, res) => {
   try {
-    const row = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!row) return res.status(404).json({ error: 'Contact not found' });
-    res.json(mapContact(row));
+    const row = await req.db('leads').where({ id: req.params.id }).first();
+    if (!row) return res.status(404).json({ error: 'Lead not found' });
+    res.json(mapLead(row));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/:slug/crm/contacts — create a new lead
-router.post('/contacts', async (req, res) => {
+router.post('/leads', async (req, res) => {
   try {
-    const { name, companyName, email, phone, source, assignedTo, estimatedValue, notes } = req.body;
+    const { name, company, email, phone, position, source, assignedTo, estimatedValue, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
-    const id = 'lead' + Date.now();
-    const row = {
-      id, name,
-      company_name: companyName || null,
-      email: email || null,
-      phone: phone || null,
-      source: source || null,
-      assigned_to: assignedTo || null,
-      stage: 'lead',
-      kanban_status: 'new',
+    const id = 'lead_' + Date.now();
+    await req.db('leads').insert({
+      id, name, company: company || null, email: email || null, phone: phone || null,
+      position: position || null, source: source || null,
+      assigned_to: assignedTo || null, status: 'new',
       estimated_value: estimatedValue != null ? estimatedValue : null,
-      notes: notes || null,
-    };
-    await req.db('crm_contacts').insert(row);
-    const saved = await req.db('crm_contacts').where({ id }).first();
-    req.io.to(req.company.slug).emit('crm:contact_created', mapContact(saved));
-    res.json(mapContact(saved));
+      notes: notes || null, created_by: req.user?.userId || null,
+    });
+    const saved = await req.db('leads').where({ id }).first();
+    req.io.to(req.company.slug).emit('crm:lead_created', mapLead(saved));
+    res.json(mapLead(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PATCH /api/:slug/crm/contacts/:id — general field edits (name, notes, estimatedValue, etc.)
-router.patch('/contacts/:id', async (req, res) => {
+router.patch('/leads/:id', async (req, res) => {
   try {
-    const existing = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!existing) return res.status(404).json({ error: 'Contact not found' });
-
     const b = req.body;
     const updates = { updated_at: new Date() };
     if (b.name !== undefined) updates.name = b.name;
-    if (b.companyName !== undefined) updates.company_name = b.companyName;
+    if (b.company !== undefined) updates.company = b.company;
     if (b.email !== undefined) updates.email = b.email;
     if (b.phone !== undefined) updates.phone = b.phone;
+    if (b.position !== undefined) updates.position = b.position;
     if (b.source !== undefined) updates.source = b.source;
     if (b.assignedTo !== undefined) updates.assigned_to = b.assignedTo;
+    if (b.status !== undefined) updates.status = b.status;
     if (b.estimatedValue !== undefined) updates.estimated_value = b.estimatedValue;
-    if (b.customerStatus !== undefined) updates.customer_status = b.customerStatus;
-    if (b.kanbanStatus !== undefined) updates.kanban_status = b.kanbanStatus;
     if (b.notes !== undefined) updates.notes = b.notes;
-
-    await req.db('crm_contacts').where({ id: req.params.id }).update(updates);
-    const saved = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    req.io.to(req.company.slug).emit('crm:contact_updated', mapContact(saved));
-    res.json(mapContact(saved));
+    await req.db('leads').where({ id: req.params.id }).update(updates);
+    const saved = await req.db('leads').where({ id: req.params.id }).first();
+    if (!saved) return res.status(404).json({ error: 'Lead not found' });
+    req.io.to(req.company.slug).emit('crm:lead_updated', mapLead(saved));
+    res.json(mapLead(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PATCH /api/:slug/crm/contacts/:id/stage — move through the funnel
-// Body: { stage: 'lead'|'prospect'|'customer'|'lost', kanbanStatus?, lostReason? }
-router.patch('/contacts/:id/stage', async (req, res) => {
+router.delete('/leads/:id', async (req, res) => {
   try {
-    const { stage, kanbanStatus, lostReason } = req.body;
-    if (!['lead', 'prospect', 'customer', 'lost'].includes(stage)) {
-      return res.status(400).json({ error: "stage must be 'lead', 'prospect', 'customer', or 'lost'" });
-    }
-    const existing = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!existing) return res.status(404).json({ error: 'Contact not found' });
-
-    const updates = { stage, updated_at: new Date() };
-    if (kanbanStatus) updates.kanban_status = kanbanStatus;
-    if (stage === 'lost') updates.lost_reason = lostReason || null;
-    // Moving into 'customer' for the first time — default a health status
-    // if one hasn't been set yet.
-    if (stage === 'customer' && !existing.customer_status) updates.customer_status = 'active';
-
-    await req.db('crm_contacts').where({ id: req.params.id }).update(updates);
-    const saved = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    req.io.to(req.company.slug).emit('crm:contact_updated', mapContact(saved));
-    res.json(mapContact(saved));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// DELETE /api/:slug/crm/contacts/:id
-router.delete('/contacts/:id', async (req, res) => {
-  try {
-    await req.db('crm_sales').where({ contact_id: req.params.id }).delete();
-    await req.db('crm_contacts').where({ id: req.params.id }).delete();
-    req.io.to(req.company.slug).emit('crm:contact_deleted', { id: req.params.id });
+    await req.db('leads').where({ id: req.params.id }).delete();
+    req.io.to(req.company.slug).emit('crm:lead_deleted', { id: req.params.id });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Sales ─────────────────────────────────────────────────────────────────────
-
-// GET /api/:slug/crm/contacts/:id/sales — a customer's sale history
-router.get('/contacts/:id/sales', async (req, res) => {
+// POST /api/:slug/crm/leads/:id/convert-to-prospect
+router.post('/leads/:id/convert-to-prospect', async (req, res) => {
   try {
-    const rows = await req.db('crm_sales').where({ contact_id: req.params.id }).orderBy('sale_date', 'desc');
-    res.json(rows.map(mapSale));
+    const lead = await req.db('leads').where({ id: req.params.id }).first();
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (lead.converted_to_prospect_id) {
+      return res.status(400).json({ error: 'This lead has already been converted to a prospect' });
+    }
+    const prospectId = 'prospect_' + Date.now();
+    await req.db('prospects').insert({
+      id: prospectId, name: lead.name, company: lead.company,
+      email: lead.email, phone: lead.phone, position: lead.position,
+      source: lead.source, status: 'engaged',
+      estimated_value: lead.estimated_value, notes: lead.notes,
+      assigned_to: lead.assigned_to, original_lead_id: lead.id,
+      created_by: req.user?.userId || null,
+    });
+    await req.db('leads').where({ id: lead.id }).update({
+      converted_to_prospect_id: prospectId, converted_at: new Date(),
+    });
+    const saved = await req.db('prospects').where({ id: prospectId }).first();
+    req.io.to(req.company.slug).emit('crm:prospect_created', mapProspect(saved));
+    res.json(mapProspect(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/:slug/crm/contacts/:id/sales — record a completed sale.
-// This is the ONLY way lifetime_value changes — it's recomputed as the sum
-// of this contact's sales rows, never taken directly from client input, so
-// the number always matches the audit trail underneath it. Also promotes
-// the contact to stage='customer' if it wasn't already (matches the Cajo
-// behavior where recording a sale is what makes someone a Customer).
-router.post('/contacts/:id/sales', async (req, res) => {
-  try {
-    const { amount, saleDate, notes } = req.body;
-    if (amount == null || isNaN(Number(amount))) {
-      return res.status(400).json({ error: 'amount is required and must be a number' });
-    }
-    const contact = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+// ── Prospects ─────────────────────────────────────────────────────────────────
 
-    const saleId = 'sale' + Date.now();
-    await req.db('crm_sales').insert({
-      id: saleId,
-      contact_id: req.params.id,
-      amount,
-      sale_date: saleDate || new Date(),
-      notes: notes || null,
+router.get('/prospects', async (req, res) => {
+  try {
+    let q = req.db('prospects');
+    if (req.query.status) q = q.where({ status: req.query.status });
+    const rows = await q.orderBy('updated_at', 'desc');
+    res.json(rows.map(mapProspect));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/prospects/:id', async (req, res) => {
+  try {
+    const row = await req.db('prospects').where({ id: req.params.id }).first();
+    if (!row) return res.status(404).json({ error: 'Prospect not found' });
+    res.json(mapProspect(row));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.patch('/prospects/:id', async (req, res) => {
+  try {
+    const b = req.body;
+    const updates = { updated_at: new Date() };
+    if (b.name !== undefined) updates.name = b.name;
+    if (b.company !== undefined) updates.company = b.company;
+    if (b.email !== undefined) updates.email = b.email;
+    if (b.phone !== undefined) updates.phone = b.phone;
+    if (b.position !== undefined) updates.position = b.position;
+    if (b.source !== undefined) updates.source = b.source;
+    if (b.assignedTo !== undefined) updates.assigned_to = b.assignedTo;
+    if (b.status !== undefined) updates.status = b.status;
+    if (b.estimatedValue !== undefined) updates.estimated_value = b.estimatedValue;
+    if (b.notes !== undefined) updates.notes = b.notes;
+    await req.db('prospects').where({ id: req.params.id }).update(updates);
+    const saved = await req.db('prospects').where({ id: req.params.id }).first();
+    if (!saved) return res.status(404).json({ error: 'Prospect not found' });
+    req.io.to(req.company.slug).emit('crm:prospect_updated', mapProspect(saved));
+    res.json(mapProspect(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.delete('/prospects/:id', async (req, res) => {
+  try {
+    await req.db('prospects').where({ id: req.params.id }).delete();
+    req.io.to(req.company.slug).emit('crm:prospect_deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/crm/prospects/:id/convert-to-customer
+router.post('/prospects/:id/convert-to-customer', async (req, res) => {
+  try {
+    const prospect = await req.db('prospects').where({ id: req.params.id }).first();
+    if (!prospect) return res.status(404).json({ error: 'Prospect not found' });
+    if (prospect.converted_to_customer_id) {
+      return res.status(400).json({ error: 'This prospect has already been converted to a customer' });
+    }
+    const customerId = 'customer_' + Date.now();
+    await req.db('customers').insert({
+      id: customerId, name: prospect.name, company: prospect.company,
+      email: prospect.email, phone: prospect.phone, position: prospect.position,
+      source: prospect.source, status: 'active',
+      notes: prospect.notes, assigned_to: prospect.assigned_to,
+      original_prospect_id: prospect.id,
       created_by: req.user?.userId || null,
     });
+    await req.db('prospects').where({ id: prospect.id }).update({
+      converted_to_customer_id: customerId, converted_at: new Date(),
+    });
+    const saved = await req.db('customers').where({ id: customerId }).first();
+    req.io.to(req.company.slug).emit('crm:customer_created', mapCustomer(saved));
+    res.json(mapCustomer(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-    const { sum } = await req.db('crm_sales').where({ contact_id: req.params.id }).sum('amount as sum').first();
-    const contactUpdates = {
-      lifetime_value: sum || 0,
-      updated_at: new Date(),
-    };
-    if (contact.stage !== 'customer') {
-      contactUpdates.stage = 'customer';
-      contactUpdates.customer_status = contact.customer_status || 'active';
+// ── Customers ─────────────────────────────────────────────────────────────────
+
+router.get('/customers', async (req, res) => {
+  try {
+    let q = req.db('customers');
+    if (req.query.status) q = q.where({ status: req.query.status });
+    const rows = await q.orderBy('updated_at', 'desc');
+    res.json(rows.map(mapCustomer));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/customers/:id', async (req, res) => {
+  try {
+    const row = await req.db('customers').where({ id: req.params.id }).first();
+    if (!row) return res.status(404).json({ error: 'Customer not found' });
+    res.json(mapCustomer(row));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.patch('/customers/:id', async (req, res) => {
+  try {
+    const b = req.body;
+    const updates = { updated_at: new Date() };
+    if (b.name !== undefined) updates.name = b.name;
+    if (b.company !== undefined) updates.company = b.company;
+    if (b.email !== undefined) updates.email = b.email;
+    if (b.phone !== undefined) updates.phone = b.phone;
+    if (b.position !== undefined) updates.position = b.position;
+    if (b.source !== undefined) updates.source = b.source;
+    if (b.assignedTo !== undefined) updates.assigned_to = b.assignedTo;
+    if (b.status !== undefined) updates.status = b.status;
+    if (b.billingAddress !== undefined) updates.billing_address = b.billingAddress;
+    if (b.shippingAddress !== undefined) updates.shipping_address = b.shippingAddress;
+    if (b.notes !== undefined) updates.notes = b.notes;
+    await req.db('customers').where({ id: req.params.id }).update(updates);
+    const saved = await req.db('customers').where({ id: req.params.id }).first();
+    if (!saved) return res.status(404).json({ error: 'Customer not found' });
+    req.io.to(req.company.slug).emit('crm:customer_updated', mapCustomer(saved));
+    res.json(mapCustomer(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.delete('/customers/:id', async (req, res) => {
+  try {
+    const hasPOs = await req.db('customer_purchase_orders').where({ customer_id: req.params.id }).first();
+    if (hasPOs) return res.status(400).json({ error: 'This customer has purchase orders and cannot be deleted.' });
+    await req.db('customers').where({ id: req.params.id }).delete();
+    req.io.to(req.company.slug).emit('crm:customer_deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Customer Purchase Orders ───────────────────────────────────────────────────
+
+router.get('/customer-purchase-orders', async (req, res) => {
+  try {
+    let q = req.db('customer_purchase_orders');
+    if (req.query.customerId) q = q.where({ customer_id: req.query.customerId });
+    if (req.query.status) q = q.where({ status: req.query.status });
+    const rows = await q.orderBy('order_date', 'desc');
+    res.json(rows.map(mapPO));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/customer-purchase-orders/:id', async (req, res) => {
+  try {
+    const po = await req.db('customer_purchase_orders').where({ id: req.params.id }).first();
+    if (!po) return res.status(404).json({ error: 'Purchase order not found' });
+    const items = await req.db('customer_purchase_order_items').where({ purchase_order_id: po.id });
+    res.json({ ...mapPO(po), items: items.map(mapPOItem) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/customer-purchase-orders', async (req, res) => {
+  try {
+    const { poNumber, customerId, orderDate, deliveryDate, notes, items } = req.body;
+    if (!poNumber) return res.status(400).json({ error: 'poNumber is required' });
+    if (!customerId) return res.status(400).json({ error: 'customerId is required' });
+    const customer = await req.db('customers').where({ id: customerId }).first();
+    if (!customer) return res.status(400).json({ error: 'Customer not found' });
+
+    const id = 'cpo_' + Date.now();
+    await req.db('customer_purchase_orders').insert({
+      id, po_number: poNumber, customer_id: customerId,
+      order_date: orderDate || new Date(), delivery_date: deliveryDate || null,
+      notes: notes || null, created_by: req.user?.userId || null,
+    });
+
+    let totalValue = 0;
+    for (const item of items || []) {
+      const lineTotal = Number(item.quantity || 0) * Number(item.unitPrice || 0);
+      totalValue += lineTotal;
+      await req.db('customer_purchase_order_items').insert({
+        id: 'cpoi_' + Date.now() + Math.random().toString(36).slice(2, 6),
+        purchase_order_id: id,
+        item_id: item.itemId,
+        quantity: item.quantity,
+        unit_price: item.unitPrice || null,
+        line_total: lineTotal || null,
+      });
     }
-    await req.db('crm_contacts').where({ id: req.params.id }).update(contactUpdates);
+    await req.db('customer_purchase_orders').where({ id }).update({ total_value: totalValue });
 
-    const savedContact = await req.db('crm_contacts').where({ id: req.params.id }).first();
-    const savedSale = await req.db('crm_sales').where({ id: saleId }).first();
-    req.io.to(req.company.slug).emit('crm:contact_updated', mapContact(savedContact));
-    res.json({ sale: mapSale(savedSale), contact: mapContact(savedContact) });
+    const saved = await req.db('customer_purchase_orders').where({ id }).first();
+    const savedItems = await req.db('customer_purchase_order_items').where({ purchase_order_id: id });
+    req.io.to(req.company.slug).emit('crm:customer_po_created', mapPO(saved));
+    res.json({ ...mapPO(saved), items: savedItems.map(mapPOItem) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.patch('/customer-purchase-orders/:id', async (req, res) => {
+  try {
+    const b = req.body;
+    const updates = { updated_at: new Date() };
+    if (b.poNumber !== undefined) updates.po_number = b.poNumber;
+    if (b.status !== undefined) updates.status = b.status;
+    if (b.deliveryDate !== undefined) updates.delivery_date = b.deliveryDate;
+    if (b.notes !== undefined) updates.notes = b.notes;
+    if (b.totalValue !== undefined) updates.total_value = b.totalValue;
+    await req.db('customer_purchase_orders').where({ id: req.params.id }).update(updates);
+    const saved = await req.db('customer_purchase_orders').where({ id: req.params.id }).first();
+    if (!saved) return res.status(404).json({ error: 'Purchase order not found' });
+    req.io.to(req.company.slug).emit('crm:customer_po_updated', mapPO(saved));
+    res.json(mapPO(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.delete('/customer-purchase-orders/:id', async (req, res) => {
+  try {
+    await req.db('customer_purchase_order_items').where({ purchase_order_id: req.params.id }).delete();
+    await req.db('customer_purchase_orders').where({ id: req.params.id }).delete();
+    req.io.to(req.company.slug).emit('crm:customer_po_deleted', { id: req.params.id });
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
