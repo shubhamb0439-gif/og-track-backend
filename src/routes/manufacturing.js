@@ -140,6 +140,51 @@ router.get('/boms/:id/check', async (req, res) => {
 
 // ── Assemblies ────────────────────────────────────────────────────────────────
 
+// GET /api/:slug/manufacturing/boms/:id/vendor-check?quantity=N
+// Per-component breakdown of which vendors currently have enough lot stock
+// remaining to cover this build — a DISPLAY HINT for the "Vendor Source"
+// picker in Create Assembly. Consumption itself stays FIFO-pooled across all
+// vendors (see POST /assemblies below); this endpoint doesn't change that,
+// it only tells the user where the stock they're about to consume actually
+// came from, so they can flag a preferred/known-good batch if it matters.
+router.get('/boms/:id/vendor-check', async (req, res) => {
+  try {
+    const bom = await req.db('mfg_boms').where({ id: req.params.id }).first();
+    if (!bom) return res.status(404).json({ error: 'BOM not found' });
+    const quantity = Number(req.query.quantity || 1);
+    const lines = await req.db('mfg_bom_lines').where({ bom_id: req.params.id });
+    const results = [];
+    for (const line of lines) {
+      const item = await req.db('inv_items').where({ id: line.component_item_id }).first();
+      const required = Number(line.quantity_per_unit) * quantity;
+      const lots = await req.db('inv_stock_lots')
+        .where({ item_id: line.component_item_id })
+        .andWhere('quantity_remaining', '>', 0);
+      const byVendor = {};
+      for (const lot of lots) {
+        const key = lot.vendor_id || '__unassigned__';
+        byVendor[key] = (byVendor[key] || 0) + Number(lot.quantity_remaining);
+      }
+      const vendorRows = await req.db('inv_vendors').whereIn('id', Object.keys(byVendor).filter(k => k !== '__unassigned__'));
+      const vendorName = (id) => vendorRows.find(v => v.id === id)?.name;
+      const vendors = Object.entries(byVendor).map(([vendorId, available]) => ({
+        vendorId: vendorId === '__unassigned__' ? null : vendorId,
+        vendorName: vendorId === '__unassigned__' ? 'Unassigned stock' : (vendorName(vendorId) || 'Unknown vendor'),
+        available, sufficient: available >= required,
+      })).sort((a, b) => b.available - a.available);
+      results.push({
+        componentItemId: line.component_item_id,
+        componentName: item?.name || 'Unknown',
+        required,
+        totalAvailable: Number(item?.stock || 0),
+        vendors,
+        anyVendorSufficient: vendors.some(v => v.sufficient),
+      });
+    }
+    res.json({ quantity, lines: results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get('/assemblies', async (req, res) => {
   try {
     const rows = await req.db('mfg_assemblies').orderBy('created_at', 'desc');
@@ -153,7 +198,36 @@ router.get('/assemblies/:id', async (req, res) => {
     if (!asm) return res.status(404).json({ error: 'Assembly not found' });
     const units = await req.db('mfg_assembly_units').where({ assembly_id: req.params.id }).orderBy('unit_number', 'asc');
     const items = await req.db('mfg_assembly_items').where({ assembly_id: req.params.id });
-    res.json({ ...mapAssembly(asm), units: units.map(mapAssemblyUnit), items: items.map(mapAssemblyItem) });
+
+    // Enrich each consumption row with the vendor that lot came from, for
+    // the "Source" column in the Assembly page's expandable history.
+    const lotIds = [...new Set(items.map(i => i.consumed_lot_id).filter(Boolean))];
+    const lots = lotIds.length ? await req.db('inv_stock_lots').whereIn('id', lotIds) : [];
+    const vendorIds = [...new Set(lots.map(l => l.vendor_id).filter(Boolean))];
+    const vendors = vendorIds.length ? await req.db('inv_vendors').whereIn('id', vendorIds) : [];
+    const lotVendorName = (lotId) => {
+      const lot = lots.find(l => l.id === lotId);
+      if (!lot) return 'Not tracked';
+      if (!lot.vendor_id) return lot.source === 'manual' ? 'Manual adjustment' : 'Unassigned stock';
+      return vendors.find(v => v.id === lot.vendor_id)?.name || 'Unknown vendor';
+    };
+    const itemsEnriched = items.map(i => ({ ...mapAssemblyItem(i), source: lotVendorName(i.consumed_lot_id) }));
+
+    // Per-component summary (Item ID / Name / Qty per Unit / Total Used /
+    // Source) — collapses the per-unit rows into one row per component,
+    // matching the reference screenshot's "Components Used" table.
+    const byComponent = {};
+    for (const i of itemsEnriched) {
+      const key = i.componentItemId;
+      if (!byComponent[key]) byComponent[key] = { componentItemId: key, quantityPerUnit: i.quantity, totalUsed: 0, sources: new Set() };
+      byComponent[key].totalUsed += Number(i.quantity);
+      byComponent[key].sources.add(i.source);
+    }
+    const componentsUsed = Object.values(byComponent).map(c => ({
+      ...c, source: [...c.sources].join(', '), sources: undefined,
+    }));
+
+    res.json({ ...mapAssembly(asm), units: units.map(mapAssemblyUnit), items: itemsEnriched, componentsUsed });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -312,6 +386,142 @@ router.post('/assemblies', async (req, res) => {
 });
 
 // POST /api/:slug/manufacturing/assemblies/:id/reverse
+// PATCH /api/:slug/manufacturing/assemblies/:id
+// Body: { name?, notes?, customerPoNumber?, quantityBuilt? }
+// Editing quantityBuilt adjusts real stock: increasing consumes additional
+// component stock and adds new units (same validation as a fresh build);
+// decreasing returns component stock and removes the highest-numbered units
+// (refusing if any of those units were already sold).
+router.patch('/assemblies/:id', async (req, res) => {
+  try {
+    const asm = await req.db('mfg_assemblies').where({ id: req.params.id }).first();
+    if (!asm) return res.status(404).json({ error: 'Assembly not found' });
+    if (asm.status === 'reversed') return res.status(400).json({ error: 'This assembly was reversed and cannot be edited.' });
+    const { name, notes, customerPoNumber, quantityBuilt } = req.body;
+
+    const simpleUpdates = { updated_at: new Date() };
+    if (name !== undefined) simpleUpdates.name = name;
+    if (notes !== undefined) simpleUpdates.notes = notes;
+    if (customerPoNumber !== undefined) simpleUpdates.customer_po_number = customerPoNumber;
+
+    if (quantityBuilt !== undefined && Number(quantityBuilt) !== Number(asm.quantity_built)) {
+      const newQty = Number(quantityBuilt);
+      if (!newQty || newQty <= 0) return res.status(400).json({ error: 'quantityBuilt must be positive' });
+      const delta = newQty - Number(asm.quantity_built);
+      const bom = await req.db('mfg_boms').where({ id: asm.bom_id }).first();
+      const lines = await req.db('mfg_bom_lines').where({ bom_id: asm.bom_id });
+
+      await req.db.transaction(async (trx) => {
+        if (delta > 0) {
+          // Consume more stock for the additional units, same pre-flight
+          // check pattern as a fresh build.
+          const shortfalls = [];
+          const requirements = [];
+          for (const line of lines) {
+            const item = await trx('inv_items').where({ id: line.component_item_id }).first();
+            const required = Number(line.quantity_per_unit) * delta;
+            const available = Number(item?.stock || 0);
+            requirements.push({ item, required, quantityPerUnit: Number(line.quantity_per_unit) });
+            if (available < required) shortfalls.push(`${item?.name || line.component_item_id}: need ${required}, have ${available}`);
+          }
+          if (shortfalls.length) throw new Error('Not enough stock to increase quantity: ' + shortfalls.join('; '));
+
+          let addedComponentCost = 0;
+          for (const { item, required } of requirements) {
+            const consumed = await consumeStockFIFO(trx, item.id, required);
+            for (const c of consumed) addedComponentCost += c.quantityConsumed * c.unitCost;
+            await recomputeItemStock(trx, item.id);
+          }
+          await createLot(trx, {
+            itemId: asm.product_item_id, lotRef: asm.assembly_number + '-adj',
+            quantity: delta, unitCost: addedComponentCost / delta,
+            source: 'assembly', notes: `Quantity increase on assembly ${asm.assembly_number}`,
+          });
+          await recomputeItemStock(trx, asm.product_item_id);
+
+          const existingUnits = await trx('mfg_assembly_units').where({ assembly_id: req.params.id });
+          let nextUnitNum = existingUnits.length + 1;
+          for (let i = 0; i < delta; i++) {
+            const unitId = 'unit_' + req.params.id + '_' + nextUnitNum;
+            await trx('mfg_assembly_units').insert({ id: unitId, assembly_id: req.params.id, unit_number: nextUnitNum, sold: 0 });
+            for (const { item, quantityPerUnit } of requirements) {
+              const lot = await trx('inv_stock_lots').where({ item_id: item.id }).orderBy('received_date', 'asc').first();
+              if (lot) {
+                await trx('mfg_assembly_items').insert({
+                  id: 'ai_' + unitId + '_' + item.id.slice(-6),
+                  assembly_id: req.params.id, assembly_unit_id: unitId,
+                  component_item_id: item.id, consumed_lot_id: lot.id, quantity: quantityPerUnit,
+                });
+              }
+            }
+            nextUnitNum++;
+          }
+          const newTotalCost = Number(asm.total_cost || 0) + addedComponentCost;
+          simpleUpdates.quantity_built = newQty;
+          simpleUpdates.total_cost = newTotalCost;
+          simpleUpdates.unit_cost = newTotalCost / newQty;
+        } else {
+          // Decreasing: remove the highest-numbered units and return their
+          // component stock, refusing if any of those units were sold.
+          const removeCount = Math.abs(delta);
+          const unitsToRemove = await trx('mfg_assembly_units')
+            .where({ assembly_id: req.params.id }).orderBy('unit_number', 'desc').limit(removeCount);
+          if (unitsToRemove.some(u => u.sold)) {
+            throw new Error('Cannot reduce quantity: one or more of the units that would be removed have already been sold');
+          }
+          const unitIds = unitsToRemove.map(u => u.id);
+          const itemsToRestore = await trx('mfg_assembly_items').whereIn('assembly_unit_id', unitIds);
+          const restoreByLot = {};
+          for (const ai of itemsToRestore) restoreByLot[ai.consumed_lot_id] = (restoreByLot[ai.consumed_lot_id] || 0) + Number(ai.quantity);
+          for (const [lotId, qty] of Object.entries(restoreByLot)) {
+            await trx('inv_stock_lots').where({ id: lotId }).increment('quantity_remaining', qty);
+          }
+          const componentItemIds = [...new Set(itemsToRestore.map(i => i.component_item_id))];
+          for (const itemId of componentItemIds) await recomputeItemStock(trx, itemId);
+
+          await trx('mfg_assembly_items').whereIn('assembly_unit_id', unitIds).delete();
+          await trx('mfg_assembly_units').whereIn('id', unitIds).delete();
+
+          // Shrink the finished-product output lot by the removed quantity.
+          const outputLotId = unitsToRemove[0]?.output_lot_id;
+          if (outputLotId) await trx('inv_stock_lots').where({ id: outputLotId }).decrement('quantity_remaining', removeCount);
+          await recomputeItemStock(trx, asm.product_item_id);
+
+          const removedCost = Number(asm.unit_cost || 0) * removeCount;
+          const newTotalCost = Math.max(0, Number(asm.total_cost || 0) - removedCost);
+          simpleUpdates.quantity_built = newQty;
+          simpleUpdates.total_cost = newTotalCost;
+          simpleUpdates.unit_cost = newQty > 0 ? newTotalCost / newQty : 0;
+        }
+      });
+    }
+
+    await req.db('mfg_assemblies').where({ id: req.params.id }).update(simpleUpdates);
+    const saved = await req.db('mfg_assemblies').where({ id: req.params.id }).first();
+    req.io.to(req.company.slug).emit('mfg:assembly_updated', mapAssembly(saved));
+    res.json(mapAssembly(saved));
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// PATCH /api/:slug/manufacturing/units/:unitId
+// Body: { serialNumber } — assign/update a unit's serial number, used by the
+// Traceability page (serials no longer have to be entered at build time).
+router.patch('/units/:unitId', async (req, res) => {
+  try {
+    const unit = await req.db('mfg_assembly_units').where({ id: req.params.unitId }).first();
+    if (!unit) return res.status(404).json({ error: 'Unit not found' });
+    const { serialNumber } = req.body;
+    if (serialNumber) {
+      const clash = await req.db('mfg_assembly_units').where({ serial_number: serialNumber }).andWhereNot({ id: req.params.unitId }).first();
+      if (clash) return res.status(400).json({ error: `Serial number "${serialNumber}" is already in use` });
+    }
+    await req.db('mfg_assembly_units').where({ id: req.params.unitId }).update({ serial_number: serialNumber || null });
+    const saved = await req.db('mfg_assembly_units').where({ id: req.params.unitId }).first();
+    req.io.to(req.company.slug).emit('mfg:unit_updated', mapAssemblyUnit(saved));
+    res.json(mapAssemblyUnit(saved));
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 router.post('/assemblies/:id/reverse', async (req, res) => {
   try {
     const asm = await req.db('mfg_assemblies').where({ id: req.params.id }).first();
