@@ -1,16 +1,12 @@
 /* =============================================================================
-   MODULE: CRM  (v2 — Cajo-style, replaces the v1 unified contacts table)
+   MODULE: CRM  (v2 — Cajo-style leads/prospects/customers/customer POs)
    =============================================================================
-   This schema follows the leads → prospects → customers pipeline as separate
-   tables (not a single "contacts" table with a stage field), with conversion
-   tracking preserved via original_lead_id / original_prospect_id back-references.
+   Idempotent — re-running against an existing tenant DB silently skips what's
+   already there.
 
-   Customer POs — actual purchase orders CUSTOMERS place with us (distinct from
-   vendor POs which live in the Inventory module) — sit on top of Customers.
-
-   Note: this schema is idempotent. Re-running it against an existing tenant DB
-   silently skips anything that already exists — same convention as every other
-   schema file in this tree.
+   FK constraints that reference cross-module tables (e.g. inv_items) are added
+   at the END of this file via ALTER TABLE, so table creation is order-safe
+   regardless of which other module scripts have already run.
    ========================================================================== */
 
 CREATE TABLE dbo.leads (
@@ -24,18 +20,16 @@ CREATE TABLE dbo.leads (
     status          NVARCHAR(50)   NOT NULL DEFAULT 'new',
     estimated_value DECIMAL(14,2)  NULL,
     notes           NVARCHAR(MAX)  NULL,
-    assigned_to     NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    assigned_to     NVARCHAR(64)   NULL,
     converted_to_prospect_id NVARCHAR(64) NULL,
     converted_at    DATETIME2      NULL,
-    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    created_by      NVARCHAR(64)   NULL,
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    updated_by      NVARCHAR(64)   NULL,
     updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
 CREATE INDEX IX_leads_status ON dbo.leads(status);
-GO
-CREATE INDEX IX_leads_assigned_to ON dbo.leads(assigned_to);
 GO
 
 CREATE TABLE dbo.prospects (
@@ -49,19 +43,17 @@ CREATE TABLE dbo.prospects (
     status          NVARCHAR(50)   NOT NULL DEFAULT 'engaged',
     estimated_value DECIMAL(14,2)  NULL,
     notes           NVARCHAR(MAX)  NULL,
-    assigned_to     NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    original_lead_id NVARCHAR(64)  NULL REFERENCES dbo.leads(id),
+    assigned_to     NVARCHAR(64)   NULL,
+    original_lead_id NVARCHAR(64)  NULL,
     converted_to_customer_id NVARCHAR(64) NULL,
     converted_at    DATETIME2      NULL,
-    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    created_by      NVARCHAR(64)   NULL,
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    updated_by      NVARCHAR(64)   NULL,
     updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
 CREATE INDEX IX_prospects_status ON dbo.prospects(status);
-GO
-CREATE INDEX IX_prospects_original_lead ON dbo.prospects(original_lead_id);
 GO
 
 CREATE TABLE dbo.customers (
@@ -77,29 +69,27 @@ CREATE TABLE dbo.customers (
     billing_address       NVARCHAR(500)  NULL,
     shipping_address      NVARCHAR(500)  NULL,
     notes                 NVARCHAR(MAX)  NULL,
-    assigned_to           NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    original_prospect_id  NVARCHAR(64)   NULL REFERENCES dbo.prospects(id),
-    created_by            NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    assigned_to           NVARCHAR(64)   NULL,
+    original_prospect_id  NVARCHAR(64)   NULL,
+    created_by            NVARCHAR(64)   NULL,
     created_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_by            NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    updated_by            NVARCHAR(64)   NULL,
     updated_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
 CREATE INDEX IX_customers_status ON dbo.customers(status);
 GO
-CREATE INDEX IX_customers_original_prospect ON dbo.customers(original_prospect_id);
-GO
 
 CREATE TABLE dbo.customer_purchase_orders (
     id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
     po_number       NVARCHAR(50)   NOT NULL,
-    customer_id     NVARCHAR(64)   NOT NULL REFERENCES dbo.customers(id),
+    customer_id     NVARCHAR(64)   NOT NULL,
     status          NVARCHAR(20)   NOT NULL DEFAULT 'open',
     order_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
     delivery_date   DATE           NULL,
     total_value     DECIMAL(14,2)  NULL,
     notes           NVARCHAR(MAX)  NULL,
-    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    created_by      NVARCHAR(64)   NULL,
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
 
@@ -108,13 +98,11 @@ CREATE TABLE dbo.customer_purchase_orders (
 GO
 CREATE INDEX IX_customer_po_customer ON dbo.customer_purchase_orders(customer_id);
 GO
-CREATE INDEX IX_customer_po_status ON dbo.customer_purchase_orders(status);
-GO
 
 CREATE TABLE dbo.customer_purchase_order_items (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    purchase_order_id   NVARCHAR(64)   NOT NULL REFERENCES dbo.customer_purchase_orders(id),
-    item_id             NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
+    purchase_order_id   NVARCHAR(64)   NOT NULL,
+    item_id             NVARCHAR(64)   NOT NULL,
     quantity            DECIMAL(14,2)  NOT NULL,
     quantity_fulfilled  DECIMAL(14,2)  NOT NULL DEFAULT 0,
     unit_price          DECIMAL(14,2)  NULL,
@@ -123,5 +111,36 @@ CREATE TABLE dbo.customer_purchase_order_items (
 GO
 CREATE INDEX IX_customer_po_items_po ON dbo.customer_purchase_order_items(purchase_order_id);
 GO
-CREATE INDEX IX_customer_po_items_item ON dbo.customer_purchase_order_items(item_id);
+
+-- FKs to same-module tables (safe: all created above by now)
+ALTER TABLE dbo.prospects ADD CONSTRAINT FK_prospects_lead FOREIGN KEY (original_lead_id) REFERENCES dbo.leads(id);
+GO
+ALTER TABLE dbo.customers ADD CONSTRAINT FK_customers_prospect FOREIGN KEY (original_prospect_id) REFERENCES dbo.prospects(id);
+GO
+ALTER TABLE dbo.customer_purchase_orders ADD CONSTRAINT FK_customer_po_customer FOREIGN KEY (customer_id) REFERENCES dbo.customers(id);
+GO
+ALTER TABLE dbo.customer_purchase_order_items ADD CONSTRAINT FK_customer_po_items_po FOREIGN KEY (purchase_order_id) REFERENCES dbo.customer_purchase_orders(id);
+GO
+
+-- FKs to CORE tables (users exists from module 01, always safe)
+ALTER TABLE dbo.leads ADD CONSTRAINT FK_leads_assigned FOREIGN KEY (assigned_to) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.leads ADD CONSTRAINT FK_leads_created FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.prospects ADD CONSTRAINT FK_prospects_assigned FOREIGN KEY (assigned_to) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.prospects ADD CONSTRAINT FK_prospects_created FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.customers ADD CONSTRAINT FK_customers_assigned FOREIGN KEY (assigned_to) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.customers ADD CONSTRAINT FK_customers_created FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.customer_purchase_orders ADD CONSTRAINT FK_customer_po_created FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+
+-- FKs to OTHER module tables — wrapped in existence checks. If the referenced
+-- module hasn't been provisioned yet, we skip the FK gracefully (it'll get
+-- picked up next time provisioning runs after inventory is enabled).
+IF OBJECT_ID('dbo.inv_items', 'U') IS NOT NULL
+    ALTER TABLE dbo.customer_purchase_order_items ADD CONSTRAINT FK_customer_po_items_item FOREIGN KEY (item_id) REFERENCES dbo.inv_items(id);
 GO

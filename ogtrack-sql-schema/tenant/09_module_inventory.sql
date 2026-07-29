@@ -1,127 +1,192 @@
 /* =============================================================================
-   MODULE: CRM  (v2 — Cajo-style, replaces the v1 unified contacts table)
+   MODULE: INVENTORY  (v2 — vendors + items + purchases + lot tracking)
    =============================================================================
-   This schema follows the leads → prospects → customers pipeline as separate
-   tables (not a single "contacts" table with a stage field), with conversion
-   tracking preserved via original_lead_id / original_prospect_id back-references.
-
-   Customer POs — actual purchase orders CUSTOMERS place with us (distinct from
-   vendor POs which live in the Inventory module) — sit on top of Customers.
-
-   Note: this schema is idempotent. Re-running it against an existing tenant DB
-   silently skips anything that already exists — same convention as every other
-   schema file in this tree.
+   Idempotent. Cross-module FKs deferred to end of file, same pattern as
+   module 08.
    ========================================================================== */
 
-CREATE TABLE dbo.leads (
-    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    name            NVARCHAR(200)  NOT NULL,
-    company         NVARCHAR(200)  NULL,
-    email           NVARCHAR(200)  NULL,
-    phone           NVARCHAR(50)   NULL,
-    position        NVARCHAR(100)  NULL,
-    source          NVARCHAR(100)  NULL,
-    status          NVARCHAR(50)   NOT NULL DEFAULT 'new',
-    estimated_value DECIMAL(14,2)  NULL,
-    notes           NVARCHAR(MAX)  NULL,
-    assigned_to     NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    converted_to_prospect_id NVARCHAR(64) NULL,
-    converted_at    DATETIME2      NULL,
-    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
-);
-GO
-CREATE INDEX IX_leads_status ON dbo.leads(status);
-GO
-CREATE INDEX IX_leads_assigned_to ON dbo.leads(assigned_to);
-GO
-
-CREATE TABLE dbo.prospects (
-    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    name            NVARCHAR(200)  NOT NULL,
-    company         NVARCHAR(200)  NULL,
-    email           NVARCHAR(200)  NULL,
-    phone           NVARCHAR(50)   NULL,
-    position        NVARCHAR(100)  NULL,
-    source          NVARCHAR(100)  NULL,
-    status          NVARCHAR(50)   NOT NULL DEFAULT 'engaged',
-    estimated_value DECIMAL(14,2)  NULL,
-    notes           NVARCHAR(MAX)  NULL,
-    assigned_to     NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    original_lead_id NVARCHAR(64)  NULL REFERENCES dbo.leads(id),
-    converted_to_customer_id NVARCHAR(64) NULL,
-    converted_at    DATETIME2      NULL,
-    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
-);
-GO
-CREATE INDEX IX_prospects_status ON dbo.prospects(status);
-GO
-CREATE INDEX IX_prospects_original_lead ON dbo.prospects(original_lead_id);
-GO
-
-CREATE TABLE dbo.customers (
+CREATE TABLE dbo.inv_vendors (
     id                    NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    vendor_code           NVARCHAR(50)   NULL,
     name                  NVARCHAR(200)  NOT NULL,
-    company               NVARCHAR(200)  NULL,
+    legal_name            NVARCHAR(200)  NULL,
+    vendor_group          NVARCHAR(100)  NULL,
+    contact_name          NVARCHAR(200)  NULL,
     email                 NVARCHAR(200)  NULL,
     phone                 NVARCHAR(50)   NULL,
-    position              NVARCHAR(100)  NULL,
-    source                NVARCHAR(100)  NULL,
-    status                NVARCHAR(50)   NOT NULL DEFAULT 'active',
-    lifetime_value        DECIMAL(14,2)  NOT NULL DEFAULT 0,
-    billing_address       NVARCHAR(500)  NULL,
-    shipping_address      NVARCHAR(500)  NULL,
+    address               NVARCHAR(500)  NULL,
+    currency              NVARCHAR(10)   NOT NULL DEFAULT 'INR',
+    rating_price          DECIMAL(3,2)   NULL,
+    rating_quality        DECIMAL(3,2)   NULL,
+    rating_lead_time      DECIMAL(3,2)   NULL,
     notes                 NVARCHAR(MAX)  NULL,
-    assigned_to           NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    original_prospect_id  NVARCHAR(64)   NULL REFERENCES dbo.prospects(id),
-    created_by            NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    created_by            NVARCHAR(64)   NULL,
     created_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_by            NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    updated_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT CK_inv_vendors_rating_price   CHECK (rating_price   IS NULL OR (rating_price   BETWEEN 0 AND 5)),
+    CONSTRAINT CK_inv_vendors_rating_quality CHECK (rating_quality IS NULL OR (rating_quality BETWEEN 0 AND 5)),
+    CONSTRAINT CK_inv_vendors_rating_lead    CHECK (rating_lead_time IS NULL OR (rating_lead_time BETWEEN 0 AND 5))
+);
+GO
+CREATE UNIQUE INDEX IX_inv_vendors_code ON dbo.inv_vendors(vendor_code) WHERE vendor_code IS NOT NULL;
+GO
+
+CREATE TABLE dbo.inv_items (
+    id                    NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    item_code             NVARCHAR(50)   NULL,
+    name                  NVARCHAR(200)  NOT NULL,
+    display_name          NVARCHAR(200)  NULL,
+    unit                  NVARCHAR(20)   NOT NULL DEFAULT 'pcs',
+    item_group            NVARCHAR(100)  NULL,
+    item_class            NVARCHAR(100)  NULL,
+    stock                 DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    stock_sold            DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    stock_min             DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    stock_max             DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    stock_reorder         DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    avg_cost              DECIMAL(14,2)  NULL,
+    cost_min              DECIMAL(14,2)  NULL,
+    cost_max              DECIMAL(14,2)  NULL,
+    serial_tracked        BIT            NOT NULL DEFAULT 0,
+    notes                 NVARCHAR(MAX)  NULL,
+    created_by            NVARCHAR(64)   NULL,
+    created_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
-CREATE INDEX IX_customers_status ON dbo.customers(status);
+CREATE UNIQUE INDEX IX_inv_items_code ON dbo.inv_items(item_code) WHERE item_code IS NOT NULL;
 GO
-CREATE INDEX IX_customers_original_prospect ON dbo.customers(original_prospect_id);
+CREATE INDEX IX_inv_items_group ON dbo.inv_items(item_group);
 GO
 
-CREATE TABLE dbo.customer_purchase_orders (
+CREATE TABLE dbo.inv_stock_adjustments (
+    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    item_id         NVARCHAR(64)   NOT NULL,
+    delta           DECIMAL(14,2)  NOT NULL,
+    reason          NVARCHAR(500)  NULL,
+    created_by      NVARCHAR(64)   NULL,
+    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+CREATE INDEX IX_inv_stock_adjustments_item ON dbo.inv_stock_adjustments(item_id);
+GO
+
+CREATE TABLE dbo.inv_purchases (
     id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
     po_number       NVARCHAR(50)   NOT NULL,
-    customer_id     NVARCHAR(64)   NOT NULL REFERENCES dbo.customers(id),
-    status          NVARCHAR(20)   NOT NULL DEFAULT 'open',
+    vendor_id       NVARCHAR(64)   NOT NULL,
+    status          NVARCHAR(20)   NOT NULL DEFAULT 'pending',
     order_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
-    delivery_date   DATE           NULL,
-    total_value     DECIMAL(14,2)  NULL,
+    expected_date   DATE           NULL,
+    received_date   DATE           NULL,
+    invoice_number  NVARCHAR(100)  NULL,
     notes           NVARCHAR(MAX)  NULL,
-    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    created_by      NVARCHAR(64)   NULL,
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
 
-    CONSTRAINT CK_customer_po_status CHECK (status IN ('open','late','fulfilled','closed','cancelled'))
+    CONSTRAINT CK_inv_purchases_status CHECK (status IN ('pending','partial','received','cancelled'))
 );
-GO
-CREATE INDEX IX_customer_po_customer ON dbo.customer_purchase_orders(customer_id);
-GO
-CREATE INDEX IX_customer_po_status ON dbo.customer_purchase_orders(status);
 GO
 
-CREATE TABLE dbo.customer_purchase_order_items (
+CREATE TABLE dbo.inv_purchase_items (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    purchase_order_id   NVARCHAR(64)   NOT NULL REFERENCES dbo.customer_purchase_orders(id),
-    item_id             NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
-    quantity            DECIMAL(14,2)  NOT NULL,
-    quantity_fulfilled  DECIMAL(14,2)  NOT NULL DEFAULT 0,
-    unit_price          DECIMAL(14,2)  NULL,
-    line_total          DECIMAL(14,2)  NULL
+    purchase_id         NVARCHAR(64)   NOT NULL,
+    item_id             NVARCHAR(64)   NOT NULL,
+    vendor_item_code    NVARCHAR(100)  NULL,
+    quantity_ordered    DECIMAL(14,2)  NOT NULL,
+    quantity_received   DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    unit_cost           DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    freight_cost        DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    import_charges      DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    lead_time_days      INT            NULL
 );
 GO
-CREATE INDEX IX_customer_po_items_po ON dbo.customer_purchase_order_items(purchase_order_id);
+CREATE INDEX IX_inv_purchase_items_purchase ON dbo.inv_purchase_items(purchase_id);
 GO
-CREATE INDEX IX_customer_po_items_item ON dbo.customer_purchase_order_items(item_id);
+CREATE INDEX IX_inv_purchase_items_item ON dbo.inv_purchase_items(item_id);
+GO
+
+CREATE TABLE dbo.inv_stock_lots (
+    id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    item_id             NVARCHAR(64)   NOT NULL,
+    lot_ref             NVARCHAR(100)  NULL,
+    vendor_id           NVARCHAR(64)   NULL,
+    purchase_item_id    NVARCHAR(64)   NULL,
+    quantity_received   DECIMAL(14,2)  NOT NULL,
+    quantity_remaining  DECIMAL(14,2)  NOT NULL,
+    unit_cost           DECIMAL(14,2)  NOT NULL,
+    received_date       DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
+    source              NVARCHAR(20)   NOT NULL DEFAULT 'purchase',
+    notes               NVARCHAR(500)  NULL,
+    created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT CK_inv_stock_lots_source CHECK (source IN ('purchase','opening_stock','manual','import','assembly'))
+);
+GO
+CREATE INDEX IX_inv_stock_lots_item ON dbo.inv_stock_lots(item_id);
+GO
+CREATE INDEX IX_inv_stock_lots_received_date ON dbo.inv_stock_lots(received_date);
+GO
+
+CREATE TABLE dbo.inv_stock_issues (
+    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    item_id         NVARCHAR(64)   NOT NULL,
+    quantity        DECIMAL(14,2)  NOT NULL,
+    issue_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
+    details         NVARCHAR(500)  NULL,
+    created_by      NVARCHAR(64)   NULL,
+    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+CREATE INDEX IX_inv_stock_issues_item ON dbo.inv_stock_issues(item_id);
+GO
+
+CREATE TABLE dbo.inv_stock_issue_lots (
+    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    issue_id        NVARCHAR(64)   NOT NULL,
+    lot_id          NVARCHAR(64)   NOT NULL,
+    quantity        DECIMAL(14,2)  NOT NULL
+);
+GO
+CREATE INDEX IX_inv_stock_issue_lots_issue ON dbo.inv_stock_issue_lots(issue_id);
+GO
+
+-- FKs added at end for order-safety
+ALTER TABLE dbo.inv_stock_adjustments ADD CONSTRAINT FK_inv_adj_item FOREIGN KEY (item_id) REFERENCES dbo.inv_items(id);
+GO
+ALTER TABLE dbo.inv_stock_adjustments ADD CONSTRAINT FK_inv_adj_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.inv_purchases ADD CONSTRAINT FK_inv_purchases_vendor FOREIGN KEY (vendor_id) REFERENCES dbo.inv_vendors(id);
+GO
+ALTER TABLE dbo.inv_purchases ADD CONSTRAINT FK_inv_purchases_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.inv_purchase_items ADD CONSTRAINT FK_inv_pi_purchase FOREIGN KEY (purchase_id) REFERENCES dbo.inv_purchases(id);
+GO
+ALTER TABLE dbo.inv_purchase_items ADD CONSTRAINT FK_inv_pi_item FOREIGN KEY (item_id) REFERENCES dbo.inv_items(id);
+GO
+ALTER TABLE dbo.inv_stock_lots ADD CONSTRAINT FK_inv_lots_item FOREIGN KEY (item_id) REFERENCES dbo.inv_items(id);
+GO
+ALTER TABLE dbo.inv_stock_lots ADD CONSTRAINT FK_inv_lots_vendor FOREIGN KEY (vendor_id) REFERENCES dbo.inv_vendors(id);
+GO
+ALTER TABLE dbo.inv_stock_lots ADD CONSTRAINT FK_inv_lots_pi FOREIGN KEY (purchase_item_id) REFERENCES dbo.inv_purchase_items(id);
+GO
+ALTER TABLE dbo.inv_stock_issues ADD CONSTRAINT FK_inv_issues_item FOREIGN KEY (item_id) REFERENCES dbo.inv_items(id);
+GO
+ALTER TABLE dbo.inv_stock_issues ADD CONSTRAINT FK_inv_issues_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.inv_stock_issue_lots ADD CONSTRAINT FK_inv_il_issue FOREIGN KEY (issue_id) REFERENCES dbo.inv_stock_issues(id);
+GO
+ALTER TABLE dbo.inv_stock_issue_lots ADD CONSTRAINT FK_inv_il_lot FOREIGN KEY (lot_id) REFERENCES dbo.inv_stock_lots(id);
+GO
+ALTER TABLE dbo.inv_vendors ADD CONSTRAINT FK_inv_vendors_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.inv_items ADD CONSTRAINT FK_inv_items_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+
+-- Back-add the CRM cross-module FK if that module was created first
+IF OBJECT_ID('dbo.customer_purchase_order_items', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_customer_po_items_item')
+    ALTER TABLE dbo.customer_purchase_order_items ADD CONSTRAINT FK_customer_po_items_item FOREIGN KEY (item_id) REFERENCES dbo.inv_items(id);
 GO
