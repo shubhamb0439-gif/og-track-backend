@@ -54,16 +54,28 @@ router.post('/boms', async (req, res) => {
   try {
     const { name, productItemId, notes, lines } = req.body;
     if (!name || !productItemId) return res.status(400).json({ error: 'name and productItemId are required' });
-    if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'At least one component line is required' });
+    // Lines are optional at creation time — the BOM Builder's two-panel flow
+    // creates an empty BOM first, then components get added one at a time
+    // via "+ Add Component", so requiring a line up front just forces every
+    // caller (including this app's own frontend) into an awkward placeholder
+    // insert-then-clear dance.
     const product = await req.db('inv_items').where({ id: productItemId }).first();
     if (!product) return res.status(400).json({ error: 'Product item not found' });
+
+    // One BOM per finished good (mfg_boms.product_item_id is UNIQUE) — check
+    // up front so the person gets a clear message pointing at the existing
+    // BOM, instead of a raw SQL constraint-violation error.
+    const existing = await req.db('mfg_boms').where({ product_item_id: productItemId }).first();
+    if (existing) {
+      return res.status(400).json({ error: `"${product.name}" already has a BOM ("${existing.name}") — edit that one instead of creating a second.` });
+    }
 
     const id = 'bom_' + Date.now();
     await req.db('mfg_boms').insert({
       id, name, product_item_id: productItemId,
       notes: notes || null, created_by: req.user?.userId || null,
     });
-    for (const line of lines) {
+    for (const line of (lines || [])) {
       if (!line.componentItemId || !line.quantityPerUnit) continue;
       await req.db('mfg_bom_lines').insert({
         id: 'boml_' + Date.now() + Math.random().toString(36).slice(2, 6),
@@ -75,7 +87,15 @@ router.post('/boms', async (req, res) => {
     const savedLines = await req.db('mfg_bom_lines').where({ bom_id: id });
     req.io.to(req.company.slug).emit('mfg:bom_created', mapBom(saved));
     res.json({ ...mapBom(saved), lines: savedLines.map(mapBomLine) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    // Safety net in case of a race (two requests for the same product
+    // landing between the pre-check and the insert) — translate the raw
+    // SQL unique-constraint message into something readable.
+    if (/UQ_mfg_boms_product/i.test(e.message)) {
+      return res.status(400).json({ error: 'This item already has a BOM. Refresh and edit the existing one instead.' });
+    }
+    res.status(500).json({ error: e.message });
+  }
 });
 
 router.patch('/boms/:id', async (req, res) => {
