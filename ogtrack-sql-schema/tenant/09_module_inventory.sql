@@ -1,184 +1,127 @@
 /* =============================================================================
-   TENANT DATABASE — Part 9: INVENTORY (Phase 2 of the Inventory+CRM addon)
-   Provisioned when the 'inventory' module is enabled.
+   MODULE: CRM  (v2 — Cajo-style, replaces the v1 unified contacts table)
+   =============================================================================
+   This schema follows the leads → prospects → customers pipeline as separate
+   tables (not a single "contacts" table with a stage field), with conversion
+   tracking preserved via original_lead_id / original_prospect_id back-references.
 
-   Covers: Vendors, Items (Part/Component/Product), Purchases + receiving,
-   and stock math. Manufacturing (BOM/Assembly) is Phase 3 — not here yet.
-   ============================================================================= */
+   Customer POs — actual purchase orders CUSTOMERS place with us (distinct from
+   vendor POs which live in the Inventory module) — sit on top of Customers.
 
-/* ---------------------------------------------------------------------------
-   inv_vendors — external suppliers you buy from. Money flows OUT to them.
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.inv_vendors (
+   Note: this schema is idempotent. Re-running it against an existing tenant DB
+   silently skips anything that already exists — same convention as every other
+   schema file in this tree.
+   ========================================================================== */
+
+CREATE TABLE dbo.leads (
     id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
     name            NVARCHAR(200)  NOT NULL,
+    company         NVARCHAR(200)  NULL,
     email           NVARCHAR(200)  NULL,
     phone           NVARCHAR(50)   NULL,
-    address         NVARCHAR(500)  NULL,
+    position        NVARCHAR(100)  NULL,
+    source          NVARCHAR(100)  NULL,
+    status          NVARCHAR(50)   NOT NULL DEFAULT 'new',
+    estimated_value DECIMAL(14,2)  NULL,
     notes           NVARCHAR(MAX)  NULL,
+    assigned_to     NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    converted_to_prospect_id NVARCHAR(64) NULL,
+    converted_at    DATETIME2      NULL,
+    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
     updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
+CREATE INDEX IX_leads_status ON dbo.leads(status);
+GO
+CREATE INDEX IX_leads_assigned_to ON dbo.leads(assigned_to);
+GO
 
-/* ---------------------------------------------------------------------------
-   inv_items — the master inventory catalog: Parts, Components, Products.
-   `stock` is maintained by the app (purchase receipts add to it, manual
-   adjustments correct it) — there's no "type over the stock count" field,
-   matching how the real Cajo ERP behaves.
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.inv_items (
+CREATE TABLE dbo.prospects (
     id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
     name            NVARCHAR(200)  NOT NULL,
-    item_code       NVARCHAR(100)  NULL,                    -- SKU / part number
-    item_group      NVARCHAR(20)   NOT NULL DEFAULT 'part',  -- part | component | product
-    item_class      NVARCHAR(5)    NULL,                     -- A | B | C (ABC priority tier)
-    unit            NVARCHAR(30)   NULL DEFAULT 'pcs',
-
-    stock           DECIMAL(14,2)  NOT NULL DEFAULT 0,       -- current on-hand (maintained, not typed in)
-    sold            DECIMAL(14,2)  NOT NULL DEFAULT 0,       -- cumulative units sold (Phase 3+/manual for now)
-    avg_cost        DECIMAL(14,2)  NULL,                     -- recomputed from received purchase lines
-    avg_lead_time_days INT         NULL,
-
-    min_stock       DECIMAL(14,2)  NULL,
-    max_stock       DECIMAL(14,2)  NULL,
-    reorder_point   DECIMAL(14,2)  NULL,
-
+    company         NVARCHAR(200)  NULL,
+    email           NVARCHAR(200)  NULL,
+    phone           NVARCHAR(50)   NULL,
+    position        NVARCHAR(100)  NULL,
+    source          NVARCHAR(100)  NULL,
+    status          NVARCHAR(50)   NOT NULL DEFAULT 'engaged',
+    estimated_value DECIMAL(14,2)  NULL,
     notes           NVARCHAR(MAX)  NULL,
-    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-
-    CONSTRAINT CK_inv_items_group CHECK (item_group IN ('part','component','product'))
-);
-GO
-CREATE INDEX IX_inv_items_group ON dbo.inv_items(item_group);
-GO
-
-/* ---------------------------------------------------------------------------
-   inv_stock_adjustments — manual corrections (physical counts, damage,
-   write-offs). Every change to dbo.inv_items.stock that ISN'T a purchase
-   receipt goes through here, so there's always an audit trail for "why did
-   the stock number change".
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.inv_stock_adjustments (
-    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    item_id         NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
-    delta           DECIMAL(14,2)  NOT NULL,                 -- can be negative
-    reason          NVARCHAR(500)  NULL,
+    assigned_to     NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    original_lead_id NVARCHAR(64)  NULL REFERENCES dbo.leads(id),
+    converted_to_customer_id NVARCHAR(64) NULL,
+    converted_at    DATETIME2      NULL,
     created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
-CREATE INDEX IX_inv_stock_adjustments_item ON dbo.inv_stock_adjustments(item_id);
+CREATE INDEX IX_prospects_status ON dbo.prospects(status);
+GO
+CREATE INDEX IX_prospects_original_lead ON dbo.prospects(original_lead_id);
 GO
 
-/* ---------------------------------------------------------------------------
-   inv_purchases — one row per purchase order placed with a vendor.
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.inv_purchases (
+CREATE TABLE dbo.customers (
+    id                    NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    name                  NVARCHAR(200)  NOT NULL,
+    company               NVARCHAR(200)  NULL,
+    email                 NVARCHAR(200)  NULL,
+    phone                 NVARCHAR(50)   NULL,
+    position              NVARCHAR(100)  NULL,
+    source                NVARCHAR(100)  NULL,
+    status                NVARCHAR(50)   NOT NULL DEFAULT 'active',
+    lifetime_value        DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    billing_address       NVARCHAR(500)  NULL,
+    shipping_address      NVARCHAR(500)  NULL,
+    notes                 NVARCHAR(MAX)  NULL,
+    assigned_to           NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    original_prospect_id  NVARCHAR(64)   NULL REFERENCES dbo.prospects(id),
+    created_by            NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    created_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_by            NVARCHAR(64)   NULL REFERENCES dbo.users(id),
+    updated_at            DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+CREATE INDEX IX_customers_status ON dbo.customers(status);
+GO
+CREATE INDEX IX_customers_original_prospect ON dbo.customers(original_prospect_id);
+GO
+
+CREATE TABLE dbo.customer_purchase_orders (
     id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
     po_number       NVARCHAR(50)   NOT NULL,
-    vendor_id       NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_vendors(id),
-    status          NVARCHAR(20)   NOT NULL DEFAULT 'pending',  -- pending | partial | received | cancelled
+    customer_id     NVARCHAR(64)   NOT NULL REFERENCES dbo.customers(id),
+    status          NVARCHAR(20)   NOT NULL DEFAULT 'open',
     order_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
-    expected_date   DATE           NULL,
-    received_date   DATE           NULL,
-    invoice_number  NVARCHAR(100)  NULL,                        -- vendor's invoice — filled in at receiving, not creation
+    delivery_date   DATE           NULL,
+    total_value     DECIMAL(14,2)  NULL,
     notes           NVARCHAR(MAX)  NULL,
     created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
 
-    CONSTRAINT CK_inv_purchases_status CHECK (status IN ('pending','partial','received','cancelled'))
+    CONSTRAINT CK_customer_po_status CHECK (status IN ('open','late','fulfilled','closed','cancelled'))
 );
 GO
-CREATE INDEX IX_inv_purchases_vendor ON dbo.inv_purchases(vendor_id);
+CREATE INDEX IX_customer_po_customer ON dbo.customer_purchase_orders(customer_id);
 GO
-CREATE INDEX IX_inv_purchases_status ON dbo.inv_purchases(status);
+CREATE INDEX IX_customer_po_status ON dbo.customer_purchase_orders(status);
 GO
 
-/* ---------------------------------------------------------------------------
-   inv_purchase_items — line items on a purchase order.
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.inv_purchase_items (
+CREATE TABLE dbo.customer_purchase_order_items (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    purchase_id         NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_purchases(id),
-    item_id              NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
-    quantity_ordered     DECIMAL(14,2)  NOT NULL,
-    quantity_received    DECIMAL(14,2)  NOT NULL DEFAULT 0,
-    unit_cost            DECIMAL(14,2)  NOT NULL DEFAULT 0,
-    freight_cost         DECIMAL(14,2)  NOT NULL DEFAULT 0,     -- delivery charges for this line
-    import_charges       DECIMAL(14,2)  NOT NULL DEFAULT 0      -- import duty for this line
-);
-GO
-CREATE INDEX IX_inv_purchase_items_purchase ON dbo.inv_purchase_items(purchase_id);
-GO
-CREATE INDEX IX_inv_purchase_items_item ON dbo.inv_purchase_items(item_id);
-GO
-
-/* ---------------------------------------------------------------------------
-   inv_stock_lots — the real source of truth for stock. Every unit on hand
-   belongs to exactly one lot, and a lot keeps its OWN landed cost forever —
-   never blended into an average, matching how the business has actually
-   been tracking this in spreadsheets (each Ref like "23NOV0001" is its own
-   batch, issued down specifically, not pooled with any other batch's cost).
-
-   dbo.inv_items.avg_cost is still maintained as a convenience DISPLAY
-   number (weighted average across a item's currently-remaining lots) —
-   but it is no longer the source of truth. dbo.inv_items.stock is the sum
-   of this item's lots' quantity_remaining.
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.inv_stock_lots (
-    id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    purchase_order_id   NVARCHAR(64)   NOT NULL REFERENCES dbo.customer_purchase_orders(id),
     item_id             NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
-    lot_ref             NVARCHAR(100)  NULL,                     -- human-readable batch code, e.g. "23NOV0001"
-    vendor_id           NVARCHAR(64)   NULL REFERENCES dbo.inv_vendors(id),
-    purchase_item_id    NVARCHAR(64)   NULL REFERENCES dbo.inv_purchase_items(id),  -- NULL for opening-stock/manual/imported lots
-    quantity_received   DECIMAL(14,2)  NOT NULL,                 -- original quantity this lot started with
-    quantity_remaining  DECIMAL(14,2)  NOT NULL,                 -- decreases as it's consumed
-    unit_cost           DECIMAL(14,2)  NOT NULL,                 -- landed cost per unit — fixed for this lot's lifetime
-    received_date       DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
-    source              NVARCHAR(20)   NOT NULL DEFAULT 'purchase', -- purchase | opening_stock | manual | import
-    notes               NVARCHAR(500)  NULL,
-    created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-
-    CONSTRAINT CK_inv_stock_lots_source CHECK (source IN ('purchase','opening_stock','manual','import','assembly'))
+    quantity            DECIMAL(14,2)  NOT NULL,
+    quantity_fulfilled  DECIMAL(14,2)  NOT NULL DEFAULT 0,
+    unit_price          DECIMAL(14,2)  NULL,
+    line_total          DECIMAL(14,2)  NULL
 );
 GO
-CREATE INDEX IX_inv_stock_lots_item ON dbo.inv_stock_lots(item_id);
+CREATE INDEX IX_customer_po_items_po ON dbo.customer_purchase_order_items(purchase_order_id);
 GO
-CREATE INDEX IX_inv_stock_lots_received_date ON dbo.inv_stock_lots(received_date);
-GO
-
-/* ---------------------------------------------------------------------------
-   inv_stock_issues — general stock consumption that ISN'T a manufacturing
-   assembly (sales, scrap, samples, whatever). Manufacturing's own assembly
-   consumption is logged separately in mfg_assembly_lines — this table is
-   for everything else, matching the real "Issues" sheet which includes
-   things sent to customers/production/write-offs, not just BOM builds.
-   Each row can span multiple lots if one issue draws from more than one
-   batch (see inv_stock_issue_lots).
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.inv_stock_issues (
-    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    item_id         NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
-    quantity        DECIMAL(14,2)  NOT NULL,
-    issue_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
-    details         NVARCHAR(500)  NULL,                        -- e.g. "Invoice 117/Cajo OY/Bluebird"
-    created_by      NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
-);
-GO
-CREATE INDEX IX_inv_stock_issues_item ON dbo.inv_stock_issues(item_id);
-GO
-
-/* Which specific lots (and how much of each) a stock issue actually drew from. */
-CREATE TABLE dbo.inv_stock_issue_lots (
-    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    issue_id        NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_stock_issues(id),
-    lot_id          NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_stock_lots(id),
-    quantity        DECIMAL(14,2)  NOT NULL
-);
-GO
-CREATE INDEX IX_inv_stock_issue_lots_issue ON dbo.inv_stock_issue_lots(issue_id);
+CREATE INDEX IX_customer_po_items_item ON dbo.customer_purchase_order_items(item_id);
 GO

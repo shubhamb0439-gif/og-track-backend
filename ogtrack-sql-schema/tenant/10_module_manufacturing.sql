@@ -1,63 +1,55 @@
 /* =============================================================================
-   TENANT DATABASE — Part 10: MANUFACTURING (Phase 3 of the Inventory+CRM addon)
-   Provisioned when the 'manufacturing' module is enabled.
+   MODULE: MANUFACTURING  (v2 — Cajo-style per-unit traceability)
+   =============================================================================
+   Key change from v1: an assembly no longer just produces "N units of the
+   product item". It now produces N INDIVIDUALLY TRACKED units (mfg_assembly_units),
+   each with its own serial number. Every component consumed on that unit is
+   linked to the specific unit via mfg_assembly_items, giving full per-unit
+   component traceability — same design as Cajo's system.
+   ========================================================================== */
 
-   DEPENDS ON THE INVENTORY MODULE (dbo.inv_items) — provisioning.js forces
-   09_module_inventory.sql to run first if it hasn't already, specifically
-   because of this dependency.
-
-   Covers: BOM (Bill of Materials = the recipe) and Assembly (the act of
-   building, which consumes components and creates product).
-   ============================================================================= */
-
-/* ---------------------------------------------------------------------------
-   mfg_boms — one row per recipe. A product can have more than one BOM (e.g.
-   different versions), and — per the nested-BOM pattern in real manufacturing
-   — a BOM's product can itself be used as a component inside ANOTHER BOM
-   (e.g. a "wheel" BOM produces a wheel, which is then a component line in
-   the "bicycle" BOM). Nothing enforces that here; it falls out naturally
-   from product_item_id and component_item_id both just pointing at
-   dbo.inv_items.
-   --------------------------------------------------------------------------- */
 CREATE TABLE dbo.mfg_boms (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
     name                NVARCHAR(200)  NOT NULL,
     product_item_id     NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
     notes               NVARCHAR(MAX)  NULL,
+    created_by          NVARCHAR(64)   NULL REFERENCES dbo.users(id),
     created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+    updated_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT UQ_mfg_boms_product UNIQUE (product_item_id)
 );
 GO
-CREATE INDEX IX_mfg_boms_product ON dbo.mfg_boms(product_item_id);
-GO
 
-/* ---------------------------------------------------------------------------
-   mfg_bom_lines — the recipe's ingredient list: "N units of this component
-   per 1 unit of the product".
-   --------------------------------------------------------------------------- */
 CREATE TABLE dbo.mfg_bom_lines (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    bom_id              NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_boms(id),
+    bom_id              NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_boms(id) ON DELETE CASCADE,
     component_item_id   NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
-    quantity_per_unit   DECIMAL(14,2)  NOT NULL
+    quantity_per_unit   DECIMAL(14,2)  NOT NULL,
+
+    CONSTRAINT CK_mfg_bom_lines_qty CHECK (quantity_per_unit > 0)
 );
 GO
 CREATE INDEX IX_mfg_bom_lines_bom ON dbo.mfg_bom_lines(bom_id);
 GO
 
-/* ---------------------------------------------------------------------------
-   mfg_assemblies — one row per build event: "we built N units of this
-   product, following this BOM, on this date".
-   --------------------------------------------------------------------------- */
 CREATE TABLE dbo.mfg_assemblies (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    assembly_number     NVARCHAR(50)   NOT NULL,             -- e.g. 'ASM-0001'
+    name                NVARCHAR(200)  NULL,
     bom_id              NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_boms(id),
-    product_item_id     NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),  -- denormalized for convenience
-    quantity_built       DECIMAL(14,2)  NOT NULL,
-    assembly_date       DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
-    notes               NVARCHAR(500)  NULL,
+    product_item_id     NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
+    quantity_built      DECIMAL(14,2)  NOT NULL,
+    unit_cost           DECIMAL(14,2)  NULL,                 -- computed cost per built unit
+    total_cost          DECIMAL(14,2)  NULL,                 -- unit_cost * quantity_built
+    customer_po_number  NVARCHAR(50)   NULL,                 -- optional link to a customer PO
+    status              NVARCHAR(20)   NOT NULL DEFAULT 'completed',
+    notes               NVARCHAR(MAX)  NULL,
     created_by          NVARCHAR(64)   NULL REFERENCES dbo.users(id),
-    created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+    created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT CK_mfg_assemblies_status CHECK (status IN ('completed','reversed'))
 );
 GO
 CREATE INDEX IX_mfg_assemblies_bom ON dbo.mfg_assemblies(bom_id);
@@ -65,31 +57,49 @@ GO
 CREATE INDEX IX_mfg_assemblies_product ON dbo.mfg_assemblies(product_item_id);
 GO
 
-/* ---------------------------------------------------------------------------
-   mfg_assembly_lines — exactly how much of each component this specific
-   assembly run actually consumed (quantity_per_unit * quantity_built at the
-   time it ran) — kept as its own audit trail rather than recomputed later,
-   in case the BOM itself changes afterward.
-   --------------------------------------------------------------------------- */
-CREATE TABLE dbo.mfg_assembly_lines (
+/* Per-unit tracking: every unit produced by an assembly is its own row.
+   For a "5 lasers built" run there will be 5 rows here, each with its own
+   serial number, each linkable to its specific component instances below. */
+CREATE TABLE dbo.mfg_assembly_units (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    assembly_id         NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_assemblies(id),
-    component_item_id   NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
-    quantity_consumed   DECIMAL(14,2)  NOT NULL
+    assembly_id         NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_assemblies(id) ON DELETE CASCADE,
+    unit_number         INT            NOT NULL,             -- 1..quantity_built
+    serial_number       NVARCHAR(100)  NULL,                 -- unique per tenant when set
+    -- The lot this specific finished unit belongs to (a build creates exactly
+    -- one lot per assembly, and every unit produced by that build points at it).
+    output_lot_id       NVARCHAR(64)   NULL REFERENCES dbo.inv_stock_lots(id),
+    -- Set once the unit is sold. Not FK'd to sales here because sales lives in
+    -- module 11; the FK is enforced from the other side (sale_items -> unit_id).
+    sold                BIT            NOT NULL DEFAULT 0,
+    created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
-CREATE INDEX IX_mfg_assembly_lines_assembly ON dbo.mfg_assembly_lines(assembly_id);
+CREATE UNIQUE INDEX IX_mfg_assembly_units_serial ON dbo.mfg_assembly_units(serial_number) WHERE serial_number IS NOT NULL;
+GO
+CREATE INDEX IX_mfg_assembly_units_assembly ON dbo.mfg_assembly_units(assembly_id);
 GO
 
-/* Which specific stock lot(s) an assembly line's consumption actually came
-   from — a build might draw from more than one batch of the same component
-   if one lot alone didn't have enough remaining. */
-CREATE TABLE dbo.mfg_assembly_line_lots (
+/* Per-component-per-unit traceability: which SPECIFIC lot(s) of a component
+   went into which SPECIFIC finished unit. This is what makes Cajo's story
+   ("serial number 12345 of laser X — what exact filter batch did it use?") work.
+   A single assembly line may split across multiple lots if one lot was too
+   small to cover a build. */
+CREATE TABLE dbo.mfg_assembly_items (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    assembly_line_id    NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_assembly_lines(id),
-    lot_id              NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_stock_lots(id),
-    quantity            DECIMAL(14,2)  NOT NULL
+    assembly_id         NVARCHAR(64)   NOT NULL REFERENCES dbo.mfg_assemblies(id) ON DELETE CASCADE,
+    assembly_unit_id    NVARCHAR(64)   NULL REFERENCES dbo.mfg_assembly_units(id),
+    component_item_id   NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_items(id),
+    -- The specific stock lot this consumption drew from.
+    consumed_lot_id     NVARCHAR(64)   NOT NULL REFERENCES dbo.inv_stock_lots(id),
+    quantity            DECIMAL(14,2)  NOT NULL,
+    -- If the component itself is serial-tracked (rare — e.g. a sub-assembly
+    -- whose OWN serial matters), the specific unit consumed here.
+    consumed_unit_id    NVARCHAR(64)   NULL REFERENCES dbo.mfg_assembly_units(id)
 );
 GO
-CREATE INDEX IX_mfg_assembly_line_lots_line ON dbo.mfg_assembly_line_lots(assembly_line_id);
+CREATE INDEX IX_mfg_assembly_items_assembly ON dbo.mfg_assembly_items(assembly_id);
+GO
+CREATE INDEX IX_mfg_assembly_items_unit ON dbo.mfg_assembly_items(assembly_unit_id);
+GO
+CREATE INDEX IX_mfg_assembly_items_component ON dbo.mfg_assembly_items(component_item_id);
 GO
