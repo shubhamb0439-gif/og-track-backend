@@ -342,18 +342,20 @@ router.post('/assemblies', async (req, res) => {
         created_by: req.user?.userId || null,
       });
 
-      // Create a stock lot for the finished product
-      const lotId = 'lot_asm_' + assemblyId;
-      await createLot(trx, {
+      // Create a stock lot for the finished product. createLot generates
+      // its own internal id and returns it — it does not accept/honor a
+      // caller-supplied id, so we must capture what it actually returns
+      // rather than assume our own guessed id was used (using a guessed,
+      // never-inserted id here previously broke the FK on
+      // mfg_assembly_units.output_lot_id).
+      outputLotId = await createLot(trx, {
         itemId: bom.product_item_id,
         lotRef: assemblyNumber,
         quantity: quantityBuilt,
         unitCost: unitCost,
         source: 'assembly',
         notes: `Built via assembly ${assemblyNumber}`,
-        lotId,
       });
-      outputLotId = lotId;
       await recomputeItemStock(trx, bom.product_item_id);
       updatedItemIds.push(bom.product_item_id);
 
@@ -452,7 +454,7 @@ router.patch('/assemblies/:id', async (req, res) => {
             for (const c of consumed) addedComponentCost += c.quantityConsumed * c.unitCost;
             await recomputeItemStock(trx, item.id);
           }
-          await createLot(trx, {
+          const addedOutputLotId = await createLot(trx, {
             itemId: asm.product_item_id, lotRef: asm.assembly_number + '-adj',
             quantity: delta, unitCost: addedComponentCost / delta,
             source: 'assembly', notes: `Quantity increase on assembly ${asm.assembly_number}`,
@@ -463,7 +465,7 @@ router.patch('/assemblies/:id', async (req, res) => {
           let nextUnitNum = existingUnits.length + 1;
           for (let i = 0; i < delta; i++) {
             const unitId = 'unit_' + req.params.id + '_' + nextUnitNum;
-            await trx('mfg_assembly_units').insert({ id: unitId, assembly_id: req.params.id, unit_number: nextUnitNum, sold: 0 });
+            await trx('mfg_assembly_units').insert({ id: unitId, assembly_id: req.params.id, unit_number: nextUnitNum, output_lot_id: addedOutputLotId, sold: 0 });
             for (const { item, quantityPerUnit } of requirements) {
               const lot = await trx('inv_stock_lots').where({ item_id: item.id }).orderBy('received_date', 'asc').first();
               if (lot) {

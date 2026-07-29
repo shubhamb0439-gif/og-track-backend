@@ -515,4 +515,29 @@ router.delete('/purchases/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── One-time backfill ────────────────────────────────────────────────────────
+// POST /api/:slug/inventory/backfill-lot-vendors
+// Historical stock lots created before vendor tracking was wired through
+// end-to-end may have vendor_id = NULL even though they came from a purchase
+// with a known vendor (traceable via purchase_item_id -> inv_purchases).
+// This fixes those in place. Safe to re-run — only touches lots that are
+// currently NULL and have a resolvable vendor.
+router.post('/backfill-lot-vendors', async (req, res) => {
+  try {
+    const orphanLots = await req.db('inv_stock_lots')
+      .whereNull('vendor_id')
+      .whereNotNull('purchase_item_id');
+    let fixed = 0;
+    for (const lot of orphanLots) {
+      const purchaseItem = await req.db('inv_purchase_items').where({ id: lot.purchase_item_id }).first();
+      if (!purchaseItem) continue;
+      const purchase = await req.db('inv_purchases').where({ id: purchaseItem.purchase_id }).first();
+      if (!purchase || !purchase.vendor_id) continue;
+      await req.db('inv_stock_lots').where({ id: lot.id }).update({ vendor_id: purchase.vendor_id });
+      fixed++;
+    }
+    res.json({ checked: orphanLots.length, fixed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
