@@ -35,12 +35,15 @@ const mapPO = (r) => r && ({
   id: r.id, poNumber: r.po_number, customerId: r.customer_id,
   status: r.status, orderDate: r.order_date, deliveryDate: r.delivery_date,
   totalValue: r.total_value != null ? Number(r.total_value) : null,
+  paymentTerms: r.payment_terms,
   notes: r.notes, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
 const mapPOItem = (r) => r && ({
   id: r.id, purchaseOrderId: r.purchase_order_id, itemId: r.item_id,
-  quantity: Number(r.quantity), quantityFulfilled: Number(r.quantity_fulfilled || 0),
+  bomId: r.bom_id, assemblyQuantity: r.assembly_quantity != null ? Number(r.assembly_quantity) : null,
+  quantity: r.quantity != null ? Number(r.quantity) : null,
+  quantityFulfilled: Number(r.quantity_fulfilled || 0),
   unitPrice: r.unit_price != null ? Number(r.unit_price) : null,
   lineTotal: r.line_total != null ? Number(r.line_total) : null,
 });
@@ -285,7 +288,25 @@ router.get('/customer-purchase-orders', async (req, res) => {
     if (req.query.customerId) q = q.where({ customer_id: req.query.customerId });
     if (req.query.status) q = q.where({ status: req.query.status });
     const rows = await q.orderBy('order_date', 'desc');
-    res.json(rows.map(mapPO));
+    const enriched = await Promise.all(rows.map(async (po) => {
+      const items = await req.db('customer_purchase_order_items').where({ purchase_order_id: po.id });
+      const customer = await req.db('customers').where({ id: po.customer_id }).first();
+      const itemsWithBomName = await Promise.all(items.map(async (i) => {
+        if (i.bom_id) {
+          const bom = await req.db('mfg_boms').where({ id: i.bom_id }).first();
+          return { ...mapPOItem(i), bomName: bom?.name || null };
+        }
+        return mapPOItem(i);
+      }));
+      return {
+        ...mapPO(po),
+        customerName: customer?.name || null,
+        customerEmail: customer?.email || null,
+        items: itemsWithBomName,
+        totalQuantity: itemsWithBomName.reduce((s, i) => s + Number(i.assemblyQuantity || i.quantity || 0), 0),
+      };
+    }));
+    res.json(enriched);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -300,29 +321,60 @@ router.get('/customer-purchase-orders/:id', async (req, res) => {
 
 router.post('/customer-purchase-orders', async (req, res) => {
   try {
-    const { poNumber, customerId, orderDate, deliveryDate, notes, items } = req.body;
+    const { poNumber, customerId, orderDate, deliveryDate, paymentTerms, notes, items } = req.body;
     if (!poNumber) return res.status(400).json({ error: 'poNumber is required' });
     if (!customerId) return res.status(400).json({ error: 'customerId is required' });
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'At least one BOM line is required' });
     const customer = await req.db('customers').where({ id: customerId }).first();
     if (!customer) return res.status(400).json({ error: 'Customer not found' });
+
+    // Every line must reference a BOM going forward — building a customer PO
+    // always means "manufacture N units of this assembly", not ordering raw
+    // inventory items directly.
+    const shortfalls = [];
+    const preparedLines = [];
+    for (const line of items) {
+      if (!line.bomId) return res.status(400).json({ error: 'Each PO line must specify a BOM' });
+      const qty = Number(line.assemblyQuantity || 0);
+      if (!qty || qty <= 0) return res.status(400).json({ error: 'Each PO line needs a positive assembly quantity' });
+
+      const bom = await req.db('mfg_boms').where({ id: line.bomId }).first();
+      if (!bom) return res.status(400).json({ error: `BOM ${line.bomId} not found` });
+      const bomLines = await req.db('mfg_bom_lines').where({ bom_id: line.bomId });
+      if (!bomLines.length) return res.status(400).json({ error: `BOM "${bom.name}" has no components defined` });
+
+      for (const bl of bomLines) {
+        const component = await req.db('inv_items').where({ id: bl.component_item_id }).first();
+        const required = Number(bl.quantity_per_unit) * qty;
+        const available = Number(component?.stock || 0);
+        if (available < required) {
+          shortfalls.push(`${component?.name || bl.component_item_id}: need ${required} for "${bom.name}" x${qty}, have ${available}`);
+        }
+      }
+      preparedLines.push({ bom, qty, unitPrice: Number(line.unitPrice || 0) });
+    }
+    if (shortfalls.length) {
+      return res.status(400).json({ error: 'Not enough component stock to fulfil this PO: ' + shortfalls.join('; ') });
+    }
 
     const id = 'cpo_' + Date.now();
     await req.db('customer_purchase_orders').insert({
       id, po_number: poNumber, customer_id: customerId,
       order_date: orderDate || new Date(), delivery_date: deliveryDate || null,
+      payment_terms: paymentTerms || null,
       notes: notes || null, created_by: req.user?.userId || null,
     });
 
     let totalValue = 0;
-    for (const item of items || []) {
-      const lineTotal = Number(item.quantity || 0) * Number(item.unitPrice || 0);
+    for (const { bom, qty, unitPrice } of preparedLines) {
+      const lineTotal = qty * unitPrice;
       totalValue += lineTotal;
       await req.db('customer_purchase_order_items').insert({
         id: 'cpoi_' + Date.now() + Math.random().toString(36).slice(2, 6),
         purchase_order_id: id,
-        item_id: item.itemId,
-        quantity: item.quantity,
-        unit_price: item.unitPrice || null,
+        bom_id: bom.id,
+        assembly_quantity: qty,
+        unit_price: unitPrice || null,
         line_total: lineTotal || null,
       });
     }
@@ -335,6 +387,29 @@ router.post('/customer-purchase-orders', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/:slug/crm/customer-purchase-orders/:id/history — order/sales/delivery
+// history for the expandable row in the Orders page.
+router.get('/customer-purchase-orders/:id/history', async (req, res) => {
+  try {
+    const po = await req.db('customer_purchase_orders').where({ id: req.params.id }).first();
+    if (!po) return res.status(404).json({ error: 'Purchase order not found' });
+    const sales = await req.db('sales').where({ customer_po_id: req.params.id }).orderBy('sale_date', 'desc');
+    const saleIds = sales.map(s => s.id);
+    const deliveries = saleIds.length
+      ? await req.db('deliveries').whereIn('sale_id', saleIds).orderBy('created_at', 'desc')
+      : [];
+    res.json({
+      sales: sales.map(s => ({
+        id: s.id, saleNumber: s.sale_number, saleDate: s.sale_date, total: Number(s.total || 0),
+      })),
+      deliveries: deliveries.map(d => ({
+        id: d.id, deliveryNumber: d.delivery_number, scheduledDate: d.scheduled_date,
+        delivered: !!d.delivered, deliveredDate: d.delivered_date,
+      })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.patch('/customer-purchase-orders/:id', async (req, res) => {
   try {
     const b = req.body;
@@ -342,6 +417,7 @@ router.patch('/customer-purchase-orders/:id', async (req, res) => {
     if (b.poNumber !== undefined) updates.po_number = b.poNumber;
     if (b.status !== undefined) updates.status = b.status;
     if (b.deliveryDate !== undefined) updates.delivery_date = b.deliveryDate;
+    if (b.paymentTerms !== undefined) updates.payment_terms = b.paymentTerms;
     if (b.notes !== undefined) updates.notes = b.notes;
     if (b.totalValue !== undefined) updates.total_value = b.totalValue;
     await req.db('customer_purchase_orders').where({ id: req.params.id }).update(updates);
