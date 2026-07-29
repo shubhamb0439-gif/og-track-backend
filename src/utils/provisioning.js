@@ -69,19 +69,39 @@ function generateTempPassword() {
 
 // True if the error is SQL Server's "already exists" complaint — safe to
 // skip rather than treat as a real failure, which is what makes re-running
-// scripts on an existing tenant DB safe instead of destructive. SQL Server
-// uses genuinely DIFFERENT wording depending on the object type:
-//   - duplicate TABLE/VIEW/etc: "There is already an object named 'X' ..."
-//   - duplicate INDEX/statistics:  "... already exists on table 'X'."
-// Missing the second pattern was the actual bug — CREATE TABLE statements
-// were being skipped correctly, but CREATE INDEX statements for indexes
-// that already existed (from an earlier successful run) were being counted
-// as genuine failures instead.
+// scripts on an existing tenant DB safe instead of destructive.
+//
+// SQL Server surfaces failures with genuinely different wording depending on
+// what's being created, AND wraps some errors in a generic outer error that
+// hides the real cause. Specifically:
+//   - duplicate TABLE:      "There is already an object named 'X' ..."   (top-level)
+//   - duplicate INDEX:      "... already exists on table 'X'."           (top-level)
+//   - duplicate CONSTRAINT: "Could not create constraint or index. See
+//                            previous errors." (top-level, generic)
+//                          + a *preceding* error with the real "already
+//                            exists" text (which mssql attaches under
+//                            e.precedingErrors, not e.message).
+// This checks all of them.
 function isAlreadyExistsError(e) {
-  const msg = e.message || '';
-  return /there is already an object named/i.test(msg)
-      || /already exists on table/i.test(msg)
-      || /already exists/i.test(msg); // broad catch-all for any other "already exists" phrasing
+  const looksLikeAlreadyExists = (msg) => {
+    if (!msg) return false;
+    return /there is already an object named/i.test(msg)
+        || /already exists on table/i.test(msg)
+        || /already exists/i.test(msg)
+        || /is already present in the object/i.test(msg)
+        || /msg 2714|msg 1913|msg 2705/i.test(msg); // SQL Server error codes for these specific cases
+  };
+  if (looksLikeAlreadyExists(e.message)) return true;
+  // mssql attaches individual SQL Server errors under e.precedingErrors
+  // (for wrapped generic errors like "See previous errors.")
+  const preceding = e.precedingErrors || (e.originalError && e.originalError.precedingErrors) || [];
+  for (const p of preceding) {
+    if (looksLikeAlreadyExists(p.message)) return true;
+  }
+  // Some driver versions expose the underlying tedious error info differently
+  if (e.originalError && looksLikeAlreadyExists(e.originalError.message)) return true;
+  if (e.info && looksLikeAlreadyExists(e.info.message)) return true;
+  return false;
 }
 
 /**
