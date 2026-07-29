@@ -94,6 +94,28 @@ router.post('/', async (req, res) => {
     let subtotal = 0;
 
     await req.db.transaction(async (trx) => {
+      // The parent `sales` row must exist before any `sale_items` row can
+      // reference it via the sale_id foreign key — SQL Server checks FKs
+      // immediately (no deferred constraint checking), so inserting child
+      // rows first always fails. Compute the totals up front from the
+      // request, then insert sales -> sale_items -> per-unit side effects,
+      // in that order.
+      let subtotalCalc = 0;
+      for (const item of items) {
+        subtotalCalc += Number(item.quantity || 1) * Number(item.unitPrice);
+      }
+      const taxAmt = Number(tax || 0);
+      const total = subtotalCalc + taxAmt;
+
+      await trx('sales').insert({
+        id: saleId, sale_number: saleNumber, customer_id: customerId,
+        customer_po_id: customerPoId || null,
+        sale_date: saleDate || new Date(),
+        subtotal: subtotalCalc, tax: taxAmt, total,
+        is_delivered: 0, notes: notes || null,
+        created_by: req.user?.userId || null,
+      });
+
       for (const item of items) {
         const unit = await trx('mfg_assembly_units').where({ id: item.assemblyUnitId }).first();
         const asm = await trx('mfg_assemblies').where({ id: unit.assembly_id }).first();
@@ -116,18 +138,6 @@ router.post('/', async (req, res) => {
         // Decrement the product item's stock_sold
         await trx('inv_items').where({ id: asm.product_item_id }).increment('stock_sold', Number(item.quantity || 1));
       }
-
-      const taxAmt = Number(tax || 0);
-      const total = subtotal + taxAmt;
-
-      await trx('sales').insert({
-        id: saleId, sale_number: saleNumber, customer_id: customerId,
-        customer_po_id: customerPoId || null,
-        sale_date: saleDate || new Date(),
-        subtotal, tax: taxAmt, total,
-        is_delivered: 0, notes: notes || null,
-        created_by: req.user?.userId || null,
-      });
 
       // Update customer lifetime_value
       const { sum } = await trx('sales').where({ customer_id: customerId }).sum('total as sum').first();
