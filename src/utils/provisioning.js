@@ -74,34 +74,43 @@ function generateTempPassword() {
 // SQL Server surfaces failures with genuinely different wording depending on
 // what's being created, AND wraps some errors in a generic outer error that
 // hides the real cause. Specifically:
-//   - duplicate TABLE:      "There is already an object named 'X' ..."   (top-level)
-//   - duplicate INDEX:      "... already exists on table 'X'."           (top-level)
-//   - duplicate CONSTRAINT: "Could not create constraint or index. See
-//                            previous errors." (top-level, generic)
-//                          + a *preceding* error with the real "already
-//                            exists" text (which mssql attaches under
-//                            e.precedingErrors, not e.message).
-// This checks all of them.
+//   - duplicate TABLE:      "There is already an object named 'X' ..."
+//   - duplicate INDEX:      "... already exists on table 'X'."
+//   - duplicate CONSTRAINT: outer error is a generic "Could not create
+//                          constraint or index. See previous errors." —
+//                          the real "already exists" text is stashed on a
+//                          NESTED property (precedingErrors / originalError
+//                          / errors / info — mssql picks inconsistently
+//                          depending on error type).
+//
+// Rather than enumerate every property name, walk the whole error object
+// recursively and match on ANY string that looks like an "already exists"
+// message. This is the same idea as JSON.stringify(e) then regex-searching,
+// but avoids circular-ref issues and doesn't need to know the driver's
+// internals.
 function isAlreadyExistsError(e) {
-  const looksLikeAlreadyExists = (msg) => {
-    if (!msg) return false;
-    return /there is already an object named/i.test(msg)
-        || /already exists on table/i.test(msg)
-        || /already exists/i.test(msg)
-        || /is already present in the object/i.test(msg)
-        || /msg 2714|msg 1913|msg 2705/i.test(msg); // SQL Server error codes for these specific cases
-  };
-  if (looksLikeAlreadyExists(e.message)) return true;
-  // mssql attaches individual SQL Server errors under e.precedingErrors
-  // (for wrapped generic errors like "See previous errors.")
-  const preceding = e.precedingErrors || (e.originalError && e.originalError.precedingErrors) || [];
-  for (const p of preceding) {
-    if (looksLikeAlreadyExists(p.message)) return true;
+  const patterns = [
+    /there is already an object named/i,
+    /already exists on table/i,
+    /already exists/i,
+    /is already present in the object/i,
+    /msg\s*2714|msg\s*1913|msg\s*2705/i,
+  ];
+  const codes = new Set([2714, 1913, 2705]);
+
+  const seen = new WeakSet();
+  function walk(node) {
+    if (!node || typeof node !== 'object' || seen.has(node)) return false;
+    seen.add(node);
+    if (typeof node.number === 'number' && codes.has(node.number)) return true;
+    for (const val of Object.values(node)) {
+      if (typeof val === 'string' && patterns.some(p => p.test(val))) return true;
+      if (Array.isArray(val)) { for (const item of val) if (walk(item)) return true; }
+      else if (typeof val === 'object' && walk(val)) return true;
+    }
+    return false;
   }
-  // Some driver versions expose the underlying tedious error info differently
-  if (e.originalError && looksLikeAlreadyExists(e.originalError.message)) return true;
-  if (e.info && looksLikeAlreadyExists(e.info.message)) return true;
-  return false;
+  return walk(e);
 }
 
 /**
