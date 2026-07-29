@@ -310,14 +310,15 @@ router.get('/purchases/:id', async (req, res) => {
 router.post('/purchases', async (req, res) => {
   try {
     const { poNumber, vendorId, orderDate, expectedDate, invoiceNumber, notes, lines } = req.body;
-    if (!poNumber || !vendorId) return res.status(400).json({ error: 'poNumber and vendorId are required' });
     if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'At least one line item is required' });
-    const vendor = await req.db('inv_vendors').where({ id: vendorId }).first();
-    if (!vendor) return res.status(400).json({ error: 'Vendor not found' });
+    if (vendorId) {
+      const vendor = await req.db('inv_vendors').where({ id: vendorId }).first();
+      if (!vendor) return res.status(400).json({ error: 'Vendor not found' });
+    }
 
     const id = 'po_' + Date.now();
     await req.db('inv_purchases').insert({
-      id, po_number: poNumber, vendor_id: vendorId, status: 'pending',
+      id, po_number: poNumber || null, vendor_id: vendorId || null, status: 'pending',
       order_date: orderDate || new Date(), expected_date: expectedDate || null,
       invoice_number: invoiceNumber || null,
       notes: notes || null, created_by: req.user?.userId || null,
@@ -346,6 +347,9 @@ router.patch('/purchases/:id', async (req, res) => {
   try {
     const b = req.body;
     const updates = { updated_at: new Date() };
+    if (b.poNumber !== undefined) updates.po_number = b.poNumber || null;
+    if (b.vendorId !== undefined) updates.vendor_id = b.vendorId || null;
+    if (b.orderDate !== undefined) updates.order_date = b.orderDate;
     if (b.status !== undefined) updates.status = b.status;
     if (b.notes !== undefined) updates.notes = b.notes;
     if (b.expectedDate !== undefined) updates.expected_date = b.expectedDate;
@@ -398,6 +402,103 @@ router.post('/purchases/:id/receive', async (req, res) => {
     req.io.to(req.company.slug).emit('inv:purchase_updated', mapPurchase(saved));
     res.json(mapPurchase(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /purchases/:id/receive-lines — per-line partial receiving, driven by
+// the Edit Purchase modal's Not Received / Partially Received / Fully
+// Received controls (with a % slider for the partial case). Unlike the older
+// /receive endpoint (which always force-completes every outstanding line),
+// this only advances each line to the quantityReceived the caller specifies,
+// and only creates a lot for the newly-received delta on that line.
+// Body: { lines: [{ purchaseItemId, quantityReceived }] }
+router.post('/purchases/:id/receive-lines', async (req, res) => {
+  try {
+    const { lines } = req.body;
+    if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'lines is required' });
+    const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
+    if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
+    if (purchase.status === 'cancelled') return res.status(400).json({ error: 'Purchase was cancelled.' });
+
+    const existingLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
+    const touchedItemIds = new Set();
+
+    for (const update of lines) {
+      const line = existingLines.find(l => l.id === update.purchaseItemId);
+      if (!line) continue;
+      const newReceived = Math.max(0, Math.min(Number(line.quantity_ordered), Number(update.quantityReceived || 0)));
+      const delta = newReceived - Number(line.quantity_received || 0);
+      if (delta === 0) continue;
+
+      if (delta > 0) {
+        const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
+          + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
+          / Number(line.quantity_ordered);
+        await createLot(req.db, {
+          itemId: line.item_id,
+          lotRef: `${purchase.po_number || purchase.id}-${line.id.slice(-6)}`,
+          vendorId: purchase.vendor_id, purchaseItemId: line.id,
+          quantity: delta, unitCost: landedUnitCost,
+          receivedDate: new Date(), source: 'purchase',
+        });
+      } else {
+        // Receiving was reduced (e.g. correcting an over-receipt) — consume
+        // back out of that item's stock. This is a rare correction path, so
+        // we accept it may touch a different (newer) lot than the one this
+        // receipt originally created; recomputeItemStock keeps totals correct.
+        await consumeStockFIFO(req.db, line.item_id, Math.abs(delta));
+      }
+      await req.db('inv_purchase_items').where({ id: line.id }).update({ quantity_received: newReceived });
+      touchedItemIds.add(line.item_id);
+    }
+
+    for (const itemId of touchedItemIds) {
+      await recomputeItemStock(req.db, itemId);
+      const savedItem = await req.db('inv_items').where({ id: itemId }).first();
+      req.io.to(req.company.slug).emit('inv:item_updated', mapItem(savedItem));
+    }
+
+    const refreshedLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
+    const totalOrdered = refreshedLines.reduce((s, l) => s + Number(l.quantity_ordered), 0);
+    const totalReceived = refreshedLines.reduce((s, l) => s + Number(l.quantity_received || 0), 0);
+    const newStatus = totalReceived <= 0 ? 'pending' : (totalReceived >= totalOrdered ? 'received' : 'partial');
+    await req.db('inv_purchases').where({ id: req.params.id }).update({
+      status: newStatus, updated_at: new Date(),
+      ...(newStatus === 'received' ? { received_date: new Date() } : {}),
+    });
+
+    const saved = await req.db('inv_purchases').where({ id: req.params.id }).first();
+    req.io.to(req.company.slug).emit('inv:purchase_updated', mapPurchase(saved));
+    res.json({ ...mapPurchase(saved), items: refreshedLines.map(mapPurchaseItem) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// PATCH /purchases/:purchaseId/items/:itemId — edit a single purchase line's
+// ordered quantity / unit cost / vendor code / lead time (not its received
+// quantity — that's handled by /receive-lines to keep stock lot logic in
+// one place). Blocks shrinking quantityOrdered below what's already received.
+router.patch('/purchases/:purchaseId/items/:lineId', async (req, res) => {
+  try {
+    const line = await req.db('inv_purchase_items').where({ id: req.params.lineId, purchase_id: req.params.purchaseId }).first();
+    if (!line) return res.status(404).json({ error: 'Purchase line not found' });
+    const b = req.body;
+    const updates = {};
+    if (b.quantityOrdered !== undefined) {
+      if (Number(b.quantityOrdered) < Number(line.quantity_received || 0)) {
+        return res.status(400).json({ error: 'Cannot reduce ordered quantity below what has already been received' });
+      }
+      updates.quantity_ordered = b.quantityOrdered;
+    }
+    if (b.vendorItemCode !== undefined) updates.vendor_item_code = b.vendorItemCode;
+    if (b.unitCost !== undefined) updates.unit_cost = b.unitCost;
+    if (b.freightCost !== undefined) updates.freight_cost = b.freightCost;
+    if (b.importCharges !== undefined) updates.import_charges = b.importCharges;
+    if (b.leadTimeDays !== undefined) updates.lead_time_days = b.leadTimeDays;
+    if (Object.keys(updates).length) await req.db('inv_purchase_items').where({ id: req.params.lineId }).update(updates);
+    const saved = await req.db('inv_purchase_items').where({ id: req.params.lineId }).first();
+    const savedPurchase = await req.db('inv_purchases').where({ id: req.params.purchaseId }).first();
+    req.io.to(req.company.slug).emit('inv:purchase_updated', mapPurchase(savedPurchase));
+    res.json(mapPurchaseItem(saved));
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 router.delete('/purchases/:id', async (req, res) => {
