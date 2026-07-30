@@ -121,6 +121,17 @@ router.patch('/leads/:id', async (req, res) => {
 
 router.delete('/leads/:id', async (req, res) => {
   try {
+    const lead = await req.db('leads').where({ id: req.params.id }).first();
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    // A converted lead has a prospect row pointing back at it via
+    // original_lead_id (FK_prospects_lead) — deleting the lead outright
+    // fails on that FK. The prospect itself already carries its own copy of
+    // the lead's data (name/company/etc. were copied over at conversion
+    // time), so clearing the back-reference is safe: it just means "this
+    // prospect's original lead record no longer exists", not a data loss.
+    if (lead.converted_to_prospect_id) {
+      await req.db('prospects').where({ id: lead.converted_to_prospect_id }).update({ original_lead_id: null });
+    }
     await req.db('leads').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('crm:lead_deleted', { id: req.params.id });
     res.json({ success: true });
@@ -196,6 +207,15 @@ router.patch('/prospects/:id', async (req, res) => {
 
 router.delete('/prospects/:id', async (req, res) => {
   try {
+    const prospect = await req.db('prospects').where({ id: req.params.id }).first();
+    if (!prospect) return res.status(404).json({ error: 'Prospect not found' });
+    // Same situation as leads: a converted prospect has a customer pointing
+    // back at it via original_prospect_id (FK_customers_prospect). Clear
+    // that back-reference before deleting — the customer already has its
+    // own copy of the data, so nothing is lost.
+    if (prospect.converted_to_customer_id) {
+      await req.db('customers').where({ id: prospect.converted_to_customer_id }).update({ original_prospect_id: null });
+    }
     await req.db('prospects').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('crm:prospect_deleted', { id: req.params.id });
     res.json({ success: true });
@@ -274,6 +294,11 @@ router.delete('/customers/:id', async (req, res) => {
   try {
     const hasPOs = await req.db('customer_purchase_orders').where({ customer_id: req.params.id }).first();
     if (hasPOs) return res.status(400).json({ error: 'This customer has purchase orders and cannot be deleted.' });
+    // sales.customer_id also references customers (FK_sales_customer) and
+    // wasn't being checked here — a customer with sales but no POs would
+    // still hit a raw FK failure instead of this clear message.
+    const hasSales = await req.db('sales').where({ customer_id: req.params.id }).first();
+    if (hasSales) return res.status(400).json({ error: 'This customer has sales records and cannot be deleted.' });
     await req.db('customers').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('crm:customer_deleted', { id: req.params.id });
     res.json({ success: true });
