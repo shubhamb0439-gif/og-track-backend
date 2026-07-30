@@ -81,13 +81,13 @@ router.get('/leads/:id', async (req, res) => {
 
 router.post('/leads', async (req, res) => {
   try {
-    const { name, company, email, phone, position, source, assignedTo, estimatedValue, notes } = req.body;
+    const { name, company, email, phone, position, source, assignedTo, status, estimatedValue, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
     const id = 'lead_' + Date.now();
     await req.db('leads').insert({
       id, name, company: company || null, email: email || null, phone: phone || null,
       position: position || null, source: source || null,
-      assigned_to: assignedTo || null, status: 'new',
+      assigned_to: assignedTo || null, status: status || 'New',
       estimated_value: estimatedValue != null ? estimatedValue : null,
       notes: notes || null, created_by: req.user?.userId || null,
     });
@@ -96,6 +96,29 @@ router.post('/leads', async (req, res) => {
     res.json(mapLead(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// Shared conversion logic used by both the manual "Convert to Prospect"
+// button and the automatic trigger when a lead's status is set to
+// "Qualified" (see PATCH /leads/:id below). Returns the new prospect row,
+// or null if this lead was already converted.
+async function convertLeadToProspectInternal(db, io, companySlug, userId, lead) {
+  if (lead.converted_to_prospect_id) return null;
+  const prospectId = 'prospect_' + Date.now();
+  await db('prospects').insert({
+    id: prospectId, name: lead.name, company: lead.company,
+    email: lead.email, phone: lead.phone, position: lead.position,
+    source: lead.source, status: 'Contacted',
+    estimated_value: lead.estimated_value, notes: lead.notes,
+    assigned_to: lead.assigned_to, original_lead_id: lead.id,
+    created_by: userId || null,
+  });
+  await db('leads').where({ id: lead.id }).update({
+    converted_to_prospect_id: prospectId, converted_at: new Date(),
+  });
+  const saved = await db('prospects').where({ id: prospectId }).first();
+  io.to(companySlug).emit('crm:prospect_created', mapProspect(saved));
+  return saved;
+}
 
 router.patch('/leads/:id', async (req, res) => {
   try {
@@ -114,8 +137,19 @@ router.patch('/leads/:id', async (req, res) => {
     await req.db('leads').where({ id: req.params.id }).update(updates);
     const saved = await req.db('leads').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Lead not found' });
+
+    // Auto-conversion: setting a lead's status to "Qualified" moves it to
+    // Prospects automatically, same as clicking the manual Convert button.
+    // Only fires on the transition into Qualified (not e.g. re-saving an
+    // already-Qualified lead) and only if it hasn't been converted already.
+    let autoConvertedProspect = null;
+    if (b.status !== undefined && String(b.status).toLowerCase() === 'qualified' && !saved.converted_to_prospect_id) {
+      autoConvertedProspect = await convertLeadToProspectInternal(req.db, req.io, req.company.slug, req.user?.userId, saved);
+    }
+
     req.io.to(req.company.slug).emit('crm:lead_updated', mapLead(saved));
-    res.json(mapLead(saved));
+    const response = mapLead(autoConvertedProspect ? await req.db('leads').where({ id: req.params.id }).first() : saved);
+    res.json(autoConvertedProspect ? { ...response, autoConvertedToProspect: mapProspect(autoConvertedProspect) } : response);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -146,20 +180,7 @@ router.post('/leads/:id/convert-to-prospect', async (req, res) => {
     if (lead.converted_to_prospect_id) {
       return res.status(400).json({ error: 'This lead has already been converted to a prospect' });
     }
-    const prospectId = 'prospect_' + Date.now();
-    await req.db('prospects').insert({
-      id: prospectId, name: lead.name, company: lead.company,
-      email: lead.email, phone: lead.phone, position: lead.position,
-      source: lead.source, status: 'engaged',
-      estimated_value: lead.estimated_value, notes: lead.notes,
-      assigned_to: lead.assigned_to, original_lead_id: lead.id,
-      created_by: req.user?.userId || null,
-    });
-    await req.db('leads').where({ id: lead.id }).update({
-      converted_to_prospect_id: prospectId, converted_at: new Date(),
-    });
-    const saved = await req.db('prospects').where({ id: prospectId }).first();
-    req.io.to(req.company.slug).emit('crm:prospect_created', mapProspect(saved));
+    const saved = await convertLeadToProspectInternal(req.db, req.io, req.company.slug, req.user?.userId, lead);
     res.json(mapProspect(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -175,6 +196,30 @@ router.get('/prospects', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/:slug/crm/prospects — direct creation, for when a prospect
+// starts here rather than arriving via lead conversion (the "+ Add
+// Prospect" button on the Prospects page). This route was missing entirely,
+// which is why calling it hit Express's default 404 HTML error page instead
+// of a JSON response — surfacing as "Unexpected token '<'" in the browser
+// when the frontend tried to JSON.parse() that HTML.
+router.post('/prospects', async (req, res) => {
+  try {
+    const { name, company, email, phone, position, source, assignedTo, status, estimatedValue, notes } = req.body;
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    const id = 'prospect_' + Date.now();
+    await req.db('prospects').insert({
+      id, name, company: company || null, email: email || null, phone: phone || null,
+      position: position || null, source: source || null,
+      assigned_to: assignedTo || null, status: status || 'Contacted',
+      estimated_value: estimatedValue != null ? estimatedValue : null,
+      notes: notes || null, created_by: req.user?.userId || null,
+    });
+    const saved = await req.db('prospects').where({ id }).first();
+    req.io.to(req.company.slug).emit('crm:prospect_created', mapProspect(saved));
+    res.json(mapProspect(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get('/prospects/:id', async (req, res) => {
   try {
     const row = await req.db('prospects').where({ id: req.params.id }).first();
@@ -182,6 +227,28 @@ router.get('/prospects/:id', async (req, res) => {
     res.json(mapProspect(row));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// Shared conversion logic used by both the manual "Convert to Customer"
+// button and the automatic trigger when a prospect's status is set to "Won"
+// (see PATCH /prospects/:id below).
+async function convertProspectToCustomerInternal(db, io, companySlug, userId, prospect) {
+  if (prospect.converted_to_customer_id) return null;
+  const customerId = 'customer_' + Date.now();
+  await db('customers').insert({
+    id: customerId, name: prospect.name, company: prospect.company,
+    email: prospect.email, phone: prospect.phone, position: prospect.position,
+    source: prospect.source, status: 'Active',
+    notes: prospect.notes, assigned_to: prospect.assigned_to,
+    original_prospect_id: prospect.id,
+    created_by: userId || null,
+  });
+  await db('prospects').where({ id: prospect.id }).update({
+    converted_to_customer_id: customerId, converted_at: new Date(),
+  });
+  const saved = await db('customers').where({ id: customerId }).first();
+  io.to(companySlug).emit('crm:customer_created', mapCustomer(saved));
+  return saved;
+}
 
 router.patch('/prospects/:id', async (req, res) => {
   try {
@@ -200,8 +267,17 @@ router.patch('/prospects/:id', async (req, res) => {
     await req.db('prospects').where({ id: req.params.id }).update(updates);
     const saved = await req.db('prospects').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Prospect not found' });
+
+    // Auto-conversion: setting a prospect's status to "Won" moves it to
+    // Customers automatically, same as clicking the manual Convert button.
+    let autoConvertedCustomer = null;
+    if (b.status !== undefined && String(b.status).toLowerCase() === 'won' && !saved.converted_to_customer_id) {
+      autoConvertedCustomer = await convertProspectToCustomerInternal(req.db, req.io, req.company.slug, req.user?.userId, saved);
+    }
+
     req.io.to(req.company.slug).emit('crm:prospect_updated', mapProspect(saved));
-    res.json(mapProspect(saved));
+    const response = mapProspect(autoConvertedCustomer ? await req.db('prospects').where({ id: req.params.id }).first() : saved);
+    res.json(autoConvertedCustomer ? { ...response, autoConvertedToCustomer: mapCustomer(autoConvertedCustomer) } : response);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -230,20 +306,7 @@ router.post('/prospects/:id/convert-to-customer', async (req, res) => {
     if (prospect.converted_to_customer_id) {
       return res.status(400).json({ error: 'This prospect has already been converted to a customer' });
     }
-    const customerId = 'customer_' + Date.now();
-    await req.db('customers').insert({
-      id: customerId, name: prospect.name, company: prospect.company,
-      email: prospect.email, phone: prospect.phone, position: prospect.position,
-      source: prospect.source, status: 'active',
-      notes: prospect.notes, assigned_to: prospect.assigned_to,
-      original_prospect_id: prospect.id,
-      created_by: req.user?.userId || null,
-    });
-    await req.db('prospects').where({ id: prospect.id }).update({
-      converted_to_customer_id: customerId, converted_at: new Date(),
-    });
-    const saved = await req.db('customers').where({ id: customerId }).first();
-    req.io.to(req.company.slug).emit('crm:customer_created', mapCustomer(saved));
+    const saved = await convertProspectToCustomerInternal(req.db, req.io, req.company.slug, req.user?.userId, prospect);
     res.json(mapCustomer(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -256,6 +319,28 @@ router.get('/customers', async (req, res) => {
     if (req.query.status) q = q.where({ status: req.query.status });
     const rows = await q.orderBy('updated_at', 'desc');
     res.json(rows.map(mapCustomer));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/crm/customers — direct creation, for when a customer
+// starts here rather than arriving via prospect conversion (the "+ Add
+// Customer" button). Same missing-route bug as prospects: calling this
+// endpoint previously hit a 404 HTML page instead of JSON.
+router.post('/customers', async (req, res) => {
+  try {
+    const { name, company, email, phone, position, source, assignedTo, status, billingAddress, shippingAddress, notes } = req.body;
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    const id = 'customer_' + Date.now();
+    await req.db('customers').insert({
+      id, name, company: company || null, email: email || null, phone: phone || null,
+      position: position || null, source: source || null,
+      assigned_to: assignedTo || null, status: status || 'Active',
+      billing_address: billingAddress || null, shipping_address: shippingAddress || null,
+      notes: notes || null, created_by: req.user?.userId || null,
+    });
+    const saved = await req.db('customers').where({ id }).first();
+    req.io.to(req.company.slug).emit('crm:customer_created', mapCustomer(saved));
+    res.json(mapCustomer(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
