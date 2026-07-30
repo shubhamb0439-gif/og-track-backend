@@ -55,6 +55,51 @@ router.get('/', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/:slug/sales/deliveries and PATCH /api/:slug/sales/deliveries/:id
+// MUST be registered before the generic GET/PATCH /:id routes below. Express
+// matches routes in registration order, and /:id matches ANY path segment —
+// including literally the word "deliveries". With the old ordering, every
+// request to GET /sales/deliveries or PATCH /sales/deliveries/:id was being
+// silently intercepted by the generic /:id handler (which tried to treat
+// "deliveries" as a sale id, found nothing, and returned a 404/error JSON
+// object instead of the expected array/delivery object). That's what broke
+// the Deliveries page and the whole "mark as delivered" workflow — not a
+// module permission issue, a genuine route-ordering bug.
+router.get('/deliveries', async (req, res) => {
+  try {
+    let q = req.db('deliveries');
+    if (req.query.delivered !== undefined) q = q.where({ delivered: req.query.delivered === 'true' ? 1 : 0 });
+    const rows = await q.orderBy('created_at', 'desc');
+    res.json(rows.map(mapDelivery));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/:slug/sales/deliveries/:id
+router.patch('/deliveries/:id', async (req, res) => {
+  try {
+    const b = req.body;
+    const updates = { updated_at: new Date() };
+    if (b.deliveryAddress !== undefined) updates.delivery_address = b.deliveryAddress;
+    if (b.deliveryLocation !== undefined) updates.delivery_location = b.deliveryLocation;
+    if (b.scheduledDate !== undefined) updates.scheduled_date = b.scheduledDate;
+    if (b.notes !== undefined) updates.notes = b.notes;
+    if (b.delivered !== undefined) {
+      updates.delivered = b.delivered ? 1 : 0;
+      updates.delivered_date = b.delivered ? new Date() : null;
+      // Mirror onto the sale
+      const delivery = await req.db('deliveries').where({ id: req.params.id }).first();
+      if (delivery) {
+        await req.db('sales').where({ id: delivery.sale_id }).update({ is_delivered: b.delivered ? 1 : 0 });
+      }
+    }
+    await req.db('deliveries').where({ id: req.params.id }).update(updates);
+    const saved = await req.db('deliveries').where({ id: req.params.id }).first();
+    if (!saved) return res.status(404).json({ error: 'Delivery not found' });
+    req.io.to(req.company.slug).emit('sales:delivery_updated', mapDelivery(saved));
+    res.json(mapDelivery(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const sale = await req.db('sales').where({ id: req.params.id }).first();
@@ -194,15 +239,6 @@ router.delete('/:id', async (req, res) => {
 
 // ── Deliveries ────────────────────────────────────────────────────────────────
 
-router.get('/deliveries', async (req, res) => {
-  try {
-    let q = req.db('deliveries');
-    if (req.query.delivered !== undefined) q = q.where({ delivered: req.query.delivered === 'true' ? 1 : 0 });
-    const rows = await q.orderBy('created_at', 'desc');
-    res.json(rows.map(mapDelivery));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 // POST /api/:slug/sales/:id/delivery — create delivery for a sale
 router.post('/:id/delivery', async (req, res) => {
   try {
@@ -225,32 +261,6 @@ router.post('/:id/delivery', async (req, res) => {
     });
     const saved = await req.db('deliveries').where({ id }).first();
     req.io.to(req.company.slug).emit('sales:delivery_created', mapDelivery(saved));
-    res.json(mapDelivery(saved));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// PATCH /api/:slug/sales/deliveries/:id
-router.patch('/deliveries/:id', async (req, res) => {
-  try {
-    const b = req.body;
-    const updates = { updated_at: new Date() };
-    if (b.deliveryAddress !== undefined) updates.delivery_address = b.deliveryAddress;
-    if (b.deliveryLocation !== undefined) updates.delivery_location = b.deliveryLocation;
-    if (b.scheduledDate !== undefined) updates.scheduled_date = b.scheduledDate;
-    if (b.notes !== undefined) updates.notes = b.notes;
-    if (b.delivered !== undefined) {
-      updates.delivered = b.delivered ? 1 : 0;
-      updates.delivered_date = b.delivered ? new Date() : null;
-      // Mirror onto the sale
-      const delivery = await req.db('deliveries').where({ id: req.params.id }).first();
-      if (delivery) {
-        await req.db('sales').where({ id: delivery.sale_id }).update({ is_delivered: b.delivered ? 1 : 0 });
-      }
-    }
-    await req.db('deliveries').where({ id: req.params.id }).update(updates);
-    const saved = await req.db('deliveries').where({ id: req.params.id }).first();
-    if (!saved) return res.status(404).json({ error: 'Delivery not found' });
-    req.io.to(req.company.slug).emit('sales:delivery_updated', mapDelivery(saved));
     res.json(mapDelivery(saved));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
