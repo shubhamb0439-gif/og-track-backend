@@ -207,7 +207,13 @@ router.get('/boms/:id/vendor-check', async (req, res) => {
 
 router.get('/assemblies', async (req, res) => {
   try {
-    const rows = await req.db('mfg_assemblies').orderBy('created_at', 'desc');
+    // A 'reversed' assembly is this app's soft-delete — once reversed it
+    // shouldn't keep appearing in the list (its stock effects are undone
+    // and its units/items are gone), same as any other deleted record.
+    // Pass ?includeReversed=1 to see them anyway (e.g. an audit view).
+    let q = req.db('mfg_assemblies');
+    if (!req.query.includeReversed) q = q.whereNot({ status: 'reversed' });
+    const rows = await q.orderBy('created_at', 'desc');
     res.json(rows.map(mapAssembly));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -548,10 +554,27 @@ router.post('/assemblies/:id/reverse', async (req, res) => {
   try {
     const asm = await req.db('mfg_assemblies').where({ id: req.params.id }).first();
     if (!asm) return res.status(404).json({ error: 'Assembly not found' });
-    if (asm.status === 'reversed') return res.status(400).json({ error: 'Already reversed' });
-    // Check no units have been sold
-    const soldUnit = await req.db('mfg_assembly_units').where({ assembly_id: req.params.id, sold: 1 }).first();
-    if (soldUnit) return res.status(400).json({ error: 'Cannot reverse: one or more units from this assembly have been sold' });
+    if (asm.status === 'reversed') {
+      // Could be a genuinely-already-reversed assembly (nothing left to do —
+      // treat repeat calls as a harmless success), or it could be stuck from
+      // an earlier attempt that set status='reversed' but died partway
+      // through before actually deleting the units/items (the bug that
+      // caused "already reversed" to show up on a row that was still
+      // sitting in the list with real leftover data). Finish the cleanup in
+      // that case instead of just erroring out again.
+      const leftoverUnits = await req.db('mfg_assembly_units').where({ assembly_id: req.params.id });
+      if (!leftoverUnits.length) {
+        return res.json(mapAssembly(asm));
+      }
+      if (leftoverUnits.some(u => u.sold)) {
+        return res.status(400).json({ error: 'Cannot finish reversing: one or more units from this assembly have been sold. Contact support — this assembly is in an inconsistent state.' });
+      }
+      // fall through to the normal reverse logic below to finish the cleanup
+    } else {
+      // Check no units have been sold
+      const soldUnit = await req.db('mfg_assembly_units').where({ assembly_id: req.params.id, sold: 1 }).first();
+      if (soldUnit) return res.status(400).json({ error: 'Cannot reverse: one or more units from this assembly have been sold' });
+    }
 
     await req.db.transaction(async (trx) => {
       const units = await trx('mfg_assembly_units').where({ assembly_id: req.params.id });
