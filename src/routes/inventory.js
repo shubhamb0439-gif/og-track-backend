@@ -125,12 +125,35 @@ router.patch('/vendors/:id', async (req, res) => {
 
 router.delete('/vendors/:id', async (req, res) => {
   try {
-    const inUse = await req.db('inv_purchases').where({ vendor_id: req.params.id }).first();
-    if (inUse) return res.status(400).json({ error: 'This vendor has purchase orders and cannot be deleted.' });
+    const vendor = await req.db('inv_vendors').where({ id: req.params.id }).first();
+    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+
+    // Real, received stock traced to this vendor is meaningful history —
+    // block on that rather than on merely having a purchase order on file.
+    const receivedLots = await req.db('inv_stock_lots').where({ vendor_id: req.params.id }).andWhere('quantity_received', '>', 0).first();
+    if (receivedLots) return res.status(400).json({ error: 'This vendor has received stock history and cannot be deleted. Consider archiving it instead.' });
+
+    // Any zero-quantity lots (edge case) and pending/never-received purchase
+    // orders for this vendor are harmless leftovers — clean those up so the
+    // delete can actually succeed instead of blocking forever.
+    const purchases = await req.db('inv_purchases').where({ vendor_id: req.params.id });
+    for (const p of purchases) {
+      const lines = await req.db('inv_purchase_items').where({ purchase_id: p.id });
+      const anyReceived = lines.some(l => Number(l.quantity_received || 0) > 0);
+      if (anyReceived) return res.status(400).json({ error: `Purchase "${p.po_number || p.id}" for this vendor has received items and cannot be cleaned up automatically. Delete or reassign that purchase first.` });
+    }
+    for (const p of purchases) {
+      const lineIds = (await req.db('inv_purchase_items').where({ purchase_id: p.id })).map(l => l.id);
+      if (lineIds.length) await req.db('inv_stock_lots').whereIn('purchase_item_id', lineIds).delete();
+      await req.db('inv_purchase_items').where({ purchase_id: p.id }).delete();
+    }
+    await req.db('inv_purchases').where({ vendor_id: req.params.id }).delete();
+    await req.db('inv_stock_lots').where({ vendor_id: req.params.id }).delete();
+
     await req.db('inv_vendors').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('inv:vendor_deleted', { id: req.params.id });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ── Items ─────────────────────────────────────────────────────────────────────
@@ -202,15 +225,50 @@ router.patch('/items/:id', async (req, res) => {
 
 router.delete('/items/:id', async (req, res) => {
   try {
-    const inUse = await req.db('inv_purchase_items').where({ item_id: req.params.id }).first();
-    if (inUse) return res.status(400).json({ error: 'This item appears on a purchase and cannot be deleted.' });
-    const hasLots = await req.db('inv_stock_lots').where({ item_id: req.params.id }).first();
-    if (hasLots) return res.status(400).json({ error: 'This item has stock lot history and cannot be deleted.' });
+    const item = await req.db('inv_items').where({ id: req.params.id }).first();
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    // Block only on real, meaningful history — not on merely having once
+    // appeared on a purchase order line. A pending/never-received purchase
+    // line has no downstream consequence and gets cleaned up automatically
+    // below instead of blocking the delete outright.
+    const soldAsProduct = await req.db('sale_items').where({ item_id: req.params.id }).first();
+    if (soldAsProduct) return res.status(400).json({ error: 'This item has sales history and cannot be deleted.' });
+
+    const usedInBom = await req.db('mfg_boms').where({ product_item_id: req.params.id }).first();
+    if (usedInBom) return res.status(400).json({ error: `This item is the product of BOM "${usedInBom.name}" and cannot be deleted. Delete that BOM first.` });
+
+    const usedAsComponent = await req.db('mfg_bom_lines').where({ component_item_id: req.params.id }).first();
+    if (usedAsComponent) return res.status(400).json({ error: 'This item is used as a component in a BOM and cannot be deleted.' });
+
+    const usedInAssembly = await req.db('mfg_assemblies').where({ product_item_id: req.params.id }).first();
+    if (usedInAssembly) return res.status(400).json({ error: 'This item has been built via an assembly and cannot be deleted.' });
+
+    const consumedInAssembly = await req.db('mfg_assembly_items').where({ component_item_id: req.params.id }).first();
+    if (consumedInAssembly) return res.status(400).json({ error: 'This item has been consumed in an assembly and cannot be deleted.' });
+
+    const orderedByCustomer = await req.db('customer_purchase_order_items').where({ item_id: req.params.id }).first();
+    if (orderedByCustomer) return res.status(400).json({ error: 'This item appears on a customer purchase order and cannot be deleted.' });
+
+    // Real, received stock is meaningful history — block on that.
+    const receivedLots = await req.db('inv_stock_lots').where({ item_id: req.params.id }).andWhere('quantity_received', '>', 0).first();
+    if (receivedLots) return res.status(400).json({ error: 'This item has received stock history and cannot be deleted. Consider archiving it instead.' });
+
+    // Anything left at this point is harmless leftovers from pending/
+    // never-received purchase lines, zero-quantity stock lots, adjustments,
+    // and issues — clean those up so the delete can actually succeed.
+    const purchaseLineIds = (await req.db('inv_purchase_items').where({ item_id: req.params.id })).map(l => l.id);
+    if (purchaseLineIds.length) {
+      await req.db('inv_stock_lots').whereIn('purchase_item_id', purchaseLineIds).delete();
+      await req.db('inv_purchase_items').whereIn('id', purchaseLineIds).delete();
+    }
+    await req.db('inv_stock_lots').where({ item_id: req.params.id }).delete();
+    await req.db('inv_stock_issues').where({ item_id: req.params.id }).delete();
     await req.db('inv_stock_adjustments').where({ item_id: req.params.id }).delete();
     await req.db('inv_items').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('inv:item_deleted', { id: req.params.id });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 router.get('/items/:id/lots', async (req, res) => {
@@ -505,14 +563,27 @@ router.delete('/purchases/:id', async (req, res) => {
   try {
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
-    if (purchase.status === 'received') {
-      return res.status(400).json({ error: 'A received purchase has already affected stock and cannot be deleted.' });
+
+    const lines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
+    const anyReceived = lines.some(l => Number(l.quantity_received || 0) > 0);
+    if (anyReceived) {
+      // Covers both fully- and partially-received purchases — either way,
+      // real stock lots exist referencing these line items (FK_inv_lots_pi),
+      // so deleting outright would fail. Rather than silently blocking
+      // (the previous behavior only checked overall status === 'received',
+      // missing the 'partial' case entirely), give a clear, specific reason.
+      return res.status(400).json({ error: 'This purchase has received items that already affected stock and cannot be deleted. Reduce it to fully unreceived via Edit Purchase first if you need to remove it.' });
     }
+
+    // Nothing received yet — safe to remove any (zero-quantity) lots that
+    // might still reference these lines, then the lines and purchase itself.
+    const lineIds = lines.map(l => l.id);
+    if (lineIds.length) await req.db('inv_stock_lots').whereIn('purchase_item_id', lineIds).delete();
     await req.db('inv_purchase_items').where({ purchase_id: req.params.id }).delete();
     await req.db('inv_purchases').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('inv:purchase_deleted', { id: req.params.id });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ── One-time backfill ────────────────────────────────────────────────────────
