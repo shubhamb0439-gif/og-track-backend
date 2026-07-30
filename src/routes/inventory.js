@@ -565,22 +565,38 @@ router.delete('/purchases/:id', async (req, res) => {
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
 
     const lines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
-    const anyReceived = lines.some(l => Number(l.quantity_received || 0) > 0);
-    if (anyReceived) {
-      // Covers both fully- and partially-received purchases — either way,
-      // real stock lots exist referencing these line items (FK_inv_lots_pi),
-      // so deleting outright would fail. Rather than silently blocking
-      // (the previous behavior only checked overall status === 'received',
-      // missing the 'partial' case entirely), give a clear, specific reason.
-      return res.status(400).json({ error: 'This purchase has received items that already affected stock and cannot be deleted. Reduce it to fully unreceived via Edit Purchase first if you need to remove it.' });
+    const lineIds = lines.map(l => l.id);
+    const lots = lineIds.length ? await req.db('inv_stock_lots').whereIn('purchase_item_id', lineIds) : [];
+
+    // If any of this purchase's stock has already been consumed downstream
+    // (built into an assembly), we can't cleanly reverse it — the
+    // consumption record (mfg_assembly_items.consumed_lot_id) would be left
+    // pointing at a lot whose remaining quantity no longer reflects reality,
+    // and reducing quantity_remaining below zero would misrepresent stock.
+    // This is a real safety boundary, not an arbitrary block: it protects
+    // downstream records that legitimately depend on this stock having
+    // existed, same as the sold-unit check on assembly reversal.
+    const lotIds = lots.map(l => l.id);
+    if (lotIds.length) {
+      const consumed = await req.db('mfg_assembly_items').whereIn('consumed_lot_id', lotIds).first();
+      if (consumed) {
+        return res.status(400).json({ error: 'Stock from this purchase has already been used in a manufacturing assembly and cannot be safely removed. Reverse the assembly first if you need to undo this.' });
+      }
     }
 
-    // Nothing received yet — safe to remove any (zero-quantity) lots that
-    // might still reference these lines, then the lines and purchase itself.
-    const lineIds = lines.map(l => l.id);
-    if (lineIds.length) await req.db('inv_stock_lots').whereIn('purchase_item_id', lineIds).delete();
-    await req.db('inv_purchase_items').where({ purchase_id: req.params.id }).delete();
-    await req.db('inv_purchases').where({ id: req.params.id }).delete();
+    await req.db.transaction(async (trx) => {
+      // Reverse each line's received quantity from the item's stock, then
+      // remove the lots and lines, then the purchase itself. This lets a
+      // received (or partially-received) purchase actually be deleted,
+      // rather than permanently blocking it — matching how assembly
+      // reversal works elsewhere in the app.
+      const itemIds = [...new Set(lines.map(l => l.item_id))];
+      if (lotIds.length) await trx('inv_stock_lots').whereIn('id', lotIds).delete();
+      if (lineIds.length) await trx('inv_purchase_items').whereIn('id', lineIds).delete();
+      await trx('inv_purchases').where({ id: req.params.id }).delete();
+      for (const itemId of itemIds) await recomputeItemStock(trx, itemId);
+    });
+
     req.io.to(req.company.slug).emit('inv:purchase_deleted', { id: req.params.id });
     res.json({ success: true });
   } catch (e) { res.status(400).json({ error: e.message }); }

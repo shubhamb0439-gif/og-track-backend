@@ -554,17 +554,28 @@ router.post('/assemblies/:id/reverse', async (req, res) => {
     if (soldUnit) return res.status(400).json({ error: 'Cannot reverse: one or more units from this assembly have been sold' });
 
     await req.db.transaction(async (trx) => {
-      // Remove the finished-product lot
       const units = await trx('mfg_assembly_units').where({ assembly_id: req.params.id });
-      for (const unit of units) {
-        if (unit.output_lot_id) {
-          await trx('inv_stock_lots').where({ id: unit.output_lot_id }).delete();
-        }
-      }
+      const items = await trx('mfg_assembly_items').where({ assembly_id: req.params.id });
+
+      // mfg_assembly_units.output_lot_id references inv_stock_lots
+      // (FK_mfg_au_lot) — the lot can't be deleted while a unit row still
+      // points at it. Clear that reference first, then delete the units and
+      // their per-component consumption rows, THEN the lots. Deleting the
+      // lot before clearing/removing the referencing unit (the previous
+      // order) hit the FK immediately. `units` and `items` were captured
+      // above before any deletes, so the restore-stock step below still has
+      // everything it needs even after these rows are gone.
+      await trx('mfg_assembly_units').where({ assembly_id: req.params.id }).update({ output_lot_id: null });
+      await trx('mfg_assembly_items').where({ assembly_id: req.params.id }).delete();
+      await trx('mfg_assembly_units').where({ assembly_id: req.params.id }).delete();
+
+      // Remove the finished-product lot(s) now that nothing references them
+      const outputLotIds = [...new Set(units.map(u => u.output_lot_id).filter(Boolean))];
+      if (outputLotIds.length) await trx('inv_stock_lots').whereIn('id', outputLotIds).delete();
       await recomputeItemStock(trx, asm.product_item_id);
 
-      // Restore component stock by re-creating lots from the assembly_items traceability
-      const items = await trx('mfg_assembly_items').where({ assembly_id: req.params.id });
+      // Restore component stock by re-creating lots from the assembly_items
+      // traceability captured before it was deleted.
       const restoreByLot = {};
       for (const ai of items) {
         restoreByLot[ai.consumed_lot_id] = (restoreByLot[ai.consumed_lot_id] || 0) + Number(ai.quantity);
