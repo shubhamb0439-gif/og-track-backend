@@ -131,7 +131,10 @@ router.delete('/vendors/:id', async (req, res) => {
     // Real, received stock traced to this vendor is meaningful history —
     // block on that rather than on merely having a purchase order on file.
     const receivedLots = await req.db('inv_stock_lots').where({ vendor_id: req.params.id }).andWhere('quantity_received', '>', 0).first();
-    if (receivedLots) return res.status(400).json({ error: 'This vendor has received stock history and cannot be deleted. Consider archiving it instead.' });
+    if (receivedLots) {
+      const item = await req.db('inv_items').where({ id: receivedLots.item_id }).first();
+      return res.status(400).json({ error: `This vendor still has received stock (lot ${receivedLots.lot_ref || receivedLots.id} for "${item?.name || receivedLots.item_id}") and cannot be deleted. Consider archiving it instead.` });
+    }
 
     // Any zero-quantity lots (edge case) and pending/never-received purchase
     // orders for this vendor are harmless leftovers — clean those up so the
@@ -238,21 +241,42 @@ router.delete('/items/:id', async (req, res) => {
     const usedInBom = await req.db('mfg_boms').where({ product_item_id: req.params.id }).first();
     if (usedInBom) return res.status(400).json({ error: `This item is the product of BOM "${usedInBom.name}" and cannot be deleted. Delete that BOM first.` });
 
-    const usedAsComponent = await req.db('mfg_bom_lines').where({ component_item_id: req.params.id }).first();
+    // Only count component usage in BOMs that still exist — mfg_bom_lines
+    // rows are supposed to be deleted along with their BOM, but check
+    // defensively rather than assume that cascade always ran cleanly.
+    const usedAsComponent = await req.db('mfg_bom_lines')
+      .where({ component_item_id: req.params.id })
+      .whereExists(function () { this.select('*').from('mfg_boms').whereRaw('mfg_boms.id = mfg_bom_lines.bom_id'); })
+      .first();
     if (usedAsComponent) return res.status(400).json({ error: 'This item is used as a component in a BOM and cannot be deleted.' });
 
-    const usedInAssembly = await req.db('mfg_assemblies').where({ product_item_id: req.params.id }).first();
-    if (usedInAssembly) return res.status(400).json({ error: 'This item has been built via an assembly and cannot be deleted.' });
+    const usedInAssembly = await req.db('mfg_assemblies').where({ product_item_id: req.params.id }).whereNot({ status: 'reversed' }).first();
+    if (usedInAssembly) return res.status(400).json({ error: 'This item has been built via an active assembly and cannot be deleted.' });
 
-    const consumedInAssembly = await req.db('mfg_assembly_items').where({ component_item_id: req.params.id }).first();
-    if (consumedInAssembly) return res.status(400).json({ error: 'This item has been consumed in an assembly and cannot be deleted.' });
+    // Only count component consumption from assemblies that are still
+    // active — a reversed assembly's items rows are supposed to be deleted
+    // during reversal, but check defensively (joined against the assembly's
+    // current status) in case an assembly got stuck in a bad state before
+    // that fix, rather than trusting leftover rows are never present.
+    const consumedInAssembly = await req.db('mfg_assembly_items')
+      .where({ component_item_id: req.params.id })
+      .whereExists(function () {
+        this.select('*').from('mfg_assemblies')
+          .whereRaw('mfg_assemblies.id = mfg_assembly_items.assembly_id')
+          .whereNot({ status: 'reversed' });
+      })
+      .first();
+    if (consumedInAssembly) return res.status(400).json({ error: 'This item has been consumed in an active assembly and cannot be deleted.' });
 
     const orderedByCustomer = await req.db('customer_purchase_order_items').where({ item_id: req.params.id }).first();
     if (orderedByCustomer) return res.status(400).json({ error: 'This item appears on a customer purchase order and cannot be deleted.' });
 
     // Real, received stock is meaningful history — block on that.
     const receivedLots = await req.db('inv_stock_lots').where({ item_id: req.params.id }).andWhere('quantity_received', '>', 0).first();
-    if (receivedLots) return res.status(400).json({ error: 'This item has received stock history and cannot be deleted. Consider archiving it instead.' });
+    if (receivedLots) {
+      const sourceLabel = { purchase: 'a purchase order', assembly: 'a manufacturing assembly', manual: 'a manual stock adjustment' }[receivedLots.source] || 'stock history';
+      return res.status(400).json({ error: `This item still has received stock from ${sourceLabel} (lot ${receivedLots.lot_ref || receivedLots.id}) and cannot be deleted. Consider archiving it instead.` });
+    }
 
     // Anything left at this point is harmless leftovers from pending/
     // never-received purchase lines, zero-quantity stock lots, adjustments,
@@ -578,9 +602,16 @@ router.delete('/purchases/:id', async (req, res) => {
     // existed, same as the sold-unit check on assembly reversal.
     const lotIds = lots.map(l => l.id);
     if (lotIds.length) {
-      const consumed = await req.db('mfg_assembly_items').whereIn('consumed_lot_id', lotIds).first();
+      const consumed = await req.db('mfg_assembly_items')
+        .whereIn('consumed_lot_id', lotIds)
+        .whereExists(function () {
+          this.select('*').from('mfg_assemblies')
+            .whereRaw('mfg_assemblies.id = mfg_assembly_items.assembly_id')
+            .whereNot({ status: 'reversed' });
+        })
+        .first();
       if (consumed) {
-        return res.status(400).json({ error: 'Stock from this purchase has already been used in a manufacturing assembly and cannot be safely removed. Reverse the assembly first if you need to undo this.' });
+        return res.status(400).json({ error: 'Stock from this purchase has already been used in an active manufacturing assembly and cannot be safely removed. Reverse the assembly first if you need to undo this.' });
       }
     }
 

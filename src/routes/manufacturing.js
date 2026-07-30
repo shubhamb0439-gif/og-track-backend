@@ -127,13 +127,22 @@ router.patch('/boms/:id', async (req, res) => {
 
 router.delete('/boms/:id', async (req, res) => {
   try {
-    const inUse = await req.db('mfg_assemblies').where({ bom_id: req.params.id }).first();
-    if (inUse) return res.status(400).json({ error: 'This BOM has assembly history and cannot be deleted.' });
+    // A reversed assembly is this app's soft-delete for assemblies (see
+    // GET /assemblies, which already excludes them) — it shouldn't still
+    // count as "this BOM has history" once its stock effects are undone and
+    // its units/items are gone. Only a still-active assembly should block
+    // deleting the BOM it was built from.
+    const inUse = await req.db('mfg_assemblies').where({ bom_id: req.params.id }).whereNot({ status: 'reversed' }).first();
+    if (inUse) return res.status(400).json({ error: 'This BOM has active assembly history and cannot be deleted.' });
     await req.db('mfg_bom_lines').where({ bom_id: req.params.id }).delete();
+    // Reversed assemblies for this BOM still exist as rows (they're not
+    // hard-deleted, just marked reversed) — clear their bom_id reference so
+    // deleting the BOM doesn't hit FK_mfg_asm_bom.
+    await req.db('mfg_assemblies').where({ bom_id: req.params.id, status: 'reversed' }).update({ bom_id: null });
     await req.db('mfg_boms').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('mfg:bom_deleted', { id: req.params.id });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // GET /api/:slug/manufacturing/boms/:id/check?quantity=N
