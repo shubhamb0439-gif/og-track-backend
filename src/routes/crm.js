@@ -328,7 +328,7 @@ router.get('/customers', async (req, res) => {
 // endpoint previously hit a 404 HTML page instead of JSON.
 router.post('/customers', async (req, res) => {
   try {
-    const { name, company, email, phone, position, source, assignedTo, status, billingAddress, shippingAddress, notes } = req.body;
+    const { name, company, email, phone, position, source, assignedTo, status, billingAddress, shippingAddress, lifetimeValue, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
     const id = 'customer_' + Date.now();
     await req.db('customers').insert({
@@ -336,6 +336,7 @@ router.post('/customers', async (req, res) => {
       position: position || null, source: source || null,
       assigned_to: assignedTo || null, status: status || 'Active',
       billing_address: billingAddress || null, shipping_address: shippingAddress || null,
+      lifetime_value: lifetimeValue != null ? lifetimeValue : 0,
       notes: notes || null, created_by: req.user?.userId || null,
     });
     const saved = await req.db('customers').where({ id }).first();
@@ -366,6 +367,7 @@ router.patch('/customers/:id', async (req, res) => {
     if (b.status !== undefined) updates.status = b.status;
     if (b.billingAddress !== undefined) updates.billing_address = b.billingAddress;
     if (b.shippingAddress !== undefined) updates.shipping_address = b.shippingAddress;
+    if (b.lifetimeValue !== undefined) updates.lifetime_value = b.lifetimeValue;
     if (b.notes !== undefined) updates.notes = b.notes;
     await req.db('customers').where({ id: req.params.id }).update(updates);
     const saved = await req.db('customers').where({ id: req.params.id }).first();
