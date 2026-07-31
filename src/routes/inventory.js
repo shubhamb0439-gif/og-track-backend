@@ -380,6 +380,23 @@ router.get('/purchases', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/:slug/inventory/purchases/all-items — bulk fetch every purchase's line
+// items in ONE query, grouped by purchase_id. Used by the Purchases list page to
+// populate its line-items cache in a single request instead of firing one fetch
+// per purchase order (which, with hundreds/thousands of real POs, caused the list
+// to visibly re-render/flicker repeatedly as each individual fetch resolved).
+router.get('/purchases/all-items', async (req, res) => {
+  try {
+    const items = await req.db('inv_purchase_items');
+    const byPurchase = {};
+    for (const item of items) {
+      if (!byPurchase[item.purchase_id]) byPurchase[item.purchase_id] = [];
+      byPurchase[item.purchase_id].push(mapPurchaseItem(item));
+    }
+    res.json(byPurchase);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get('/purchases/:id', async (req, res) => {
   try {
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
