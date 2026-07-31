@@ -393,14 +393,13 @@ router.post('/purchases', async (req, res) => {
   try {
     const { poNumber, vendorId, orderDate, expectedDate, invoiceNumber, notes, lines } = req.body;
     if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'At least one line item is required' });
-    if (vendorId) {
-      const vendor = await req.db('inv_vendors').where({ id: vendorId }).first();
-      if (!vendor) return res.status(400).json({ error: 'Vendor not found' });
-    }
+    if (!vendorId) return res.status(400).json({ error: 'vendorId is required' });
+    const vendor = await req.db('inv_vendors').where({ id: vendorId }).first();
+    if (!vendor) return res.status(400).json({ error: 'Vendor not found' });
 
     const id = 'po_' + Date.now();
     await req.db('inv_purchases').insert({
-      id, po_number: poNumber || null, vendor_id: vendorId || null, status: 'pending',
+      id, po_number: poNumber || null, vendor_id: vendorId, status: 'pending',
       order_date: orderDate || new Date(), expected_date: expectedDate || null,
       invoice_number: invoiceNumber || null,
       notes: notes || null, created_by: req.user?.userId || null,
