@@ -82,7 +82,13 @@ router.get('/clients', async (req, res) => {
 });
 router.post('/clients', async (req, res) => {
   try {
-    const { name, contactName, contact_name, contactEmail, contact_email, contactPhone, contact_phone, ...rest } = req.body;
+    const { name, contactName, contact_name, contactEmail, contact_email, contactPhone, contact_phone, requestingUserRole, ...rest } = req.body;
+    // Client creation is part of "client management" (Issue 2) — the "+ Add
+    // Client" button is already hidden from Accountants/Interns in the
+    // frontend; this makes that restriction real at the API boundary too.
+    if (requestingUserRole === 'accountant' || requestingUserRole === 'intern') {
+      return res.status(403).json({ error: 'Only Senior Accountants and Accounting Managers can create clients.' });
+    }
     const id = 'cl' + Date.now();
     await req.db('clients').insert({
       id, name,
@@ -104,16 +110,41 @@ router.patch('/clients/:id', async (req, res) => {
     // Same pattern as PATCH /time-entries/:id and PATCH /eod-reports/:id below:
     // only true columns are written directly; everything else (assignedTo,
     // description, industry, createdBy, etc.) is merged into extra_json.
-    // Previously this route spread unknown fields straight into the SQL
-    // UPDATE via ...rest, which broke the moment a request included
-    // assignedTo (or any other non-column field) — Knex would try to SET a
-    // column that doesn't exist on dbo.clients, and SQL Server would throw.
-    // That raw error is what surfaced in the UI as "SQL/database error" on
-    // Remove Me, Pick Up, and Edit Client — and because assignedTo never
-    // actually reached a persisted location (neither a real column nor
-    // extra_json), assignments never showed up for the assignee either.
-    const { name, contactName, contactEmail, contactPhone, status, ...extra } = req.body;
+    const { name, contactName, contactEmail, contactPhone, status, requestingUserRole, requestingUserName, ...extra } = req.body;
     const currentExtra = current.extra_json ? JSON.parse(current.extra_json) : {};
+
+    // Server-side authorization for assignment changes (Issue 1 / Issue 2).
+    // This app has no auth middleware anywhere (no route applies requireAuth
+    // in server.js, so req.user/req.auth is never populated on any request
+    // in this codebase) — so, consistent with how this same route already
+    // trusts body fields for assignedTo/createdBy, the requester's role and
+    // name are passed the same way and validated here. This is what makes
+    // the restriction a real backend rule rather than something a direct
+    // API call (bypassing the UI) could bypass entirely.
+    if (extra.assignedTo !== undefined) {
+      const isAccountantTier = requestingUserRole === 'accountant' || requestingUserRole === 'intern';
+      if (isAccountantTier) {
+        const before = new Set(currentExtra.assignedTo || []);
+        const after = new Set(extra.assignedTo || []);
+        const added = [...after].filter(n => !before.has(n));
+        const removed = [...before].filter(n => !after.has(n));
+        const onlyRemovingSelf = added.length === 0 && removed.length === 1 && removed[0] === requestingUserName;
+        if (!onlyRemovingSelf) {
+          return res.status(403).json({ error: 'Accountants can only remove themselves from a client they are already assigned to.' });
+        }
+      }
+    }
+    // Only Senior Accountants and Accounting Managers may edit any other
+    // client field (name, description, industry, status, etc.) — matches
+    // Issue 2's requirement that Accountants must never reach client-edit
+    // functionality, not just have the button hidden.
+    const otherFieldsBeingChanged = name !== undefined || contactName !== undefined || contactEmail !== undefined
+      || contactPhone !== undefined || status !== undefined
+      || Object.keys(extra).some(k => k !== 'assignedTo');
+    if (otherFieldsBeingChanged && (requestingUserRole === 'accountant' || requestingUserRole === 'intern')) {
+      return res.status(403).json({ error: 'Only Senior Accountants and Accounting Managers can edit client details.' });
+    }
+
     const upd = { updated_at: new Date(), extra_json: JSON.stringify({ ...currentExtra, ...extra }) };
     if (name !== undefined) upd.name = name;
     if (contactName !== undefined) upd.contact_name = contactName;
@@ -135,6 +166,14 @@ router.patch('/clients/:id', async (req, res) => {
 });
 router.delete('/clients/:id', async (req, res) => {
   try {
+    // ROOT CAUSE FIX (Issue 2): Accountants/Interns must never be able to
+    // delete a client, even via a direct API call. Same trust-the-body
+    // pattern as above, since this is the only mechanism available anywhere
+    // in this backend for identifying the requester's role.
+    const requestingUserRole = req.body?.requestingUserRole || req.query?.requestingUserRole;
+    if (requestingUserRole === 'accountant' || requestingUserRole === 'intern') {
+      return res.status(403).json({ error: 'Only Senior Accountants and Accounting Managers can delete clients.' });
+    }
     await req.db('clients').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('client:deleted', { id: req.params.id });
     res.json({ success: true });
