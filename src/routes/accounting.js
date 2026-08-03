@@ -78,7 +78,7 @@ const mapRoute = (r) => r && ({
 // ── CLIENTS ───────────────────────────────────────────────────────────────────
 router.get('/clients', async (req, res) => {
   try { res.json((await req.db('clients')).map(mapClient)); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  catch (e) { console.error('GET /clients failed:', e); res.status(500).json({ error: 'Could not load clients. Please try again.' }); }
 });
 router.post('/clients', async (req, res) => {
   try {
@@ -95,28 +95,50 @@ router.post('/clients', async (req, res) => {
     const saved = mapClient(await req.db('clients').where({ id }).first());
     req.io.to(req.company.slug).emit('client:created', saved);
     res.json(saved);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('POST /clients failed:', e); res.status(500).json({ error: 'Could not create this client. Please try again.' }); }
 });
 router.patch('/clients/:id', async (req, res) => {
   try {
-    const { contactName, contactEmail, contactPhone, ...rest } = req.body;
-    const upd = { ...rest, updated_at: new Date() };
+    const current = await req.db('clients').where({ id: req.params.id }).first();
+    if (!current) return res.status(404).json({ error: 'Client not found' });
+    // Same pattern as PATCH /time-entries/:id and PATCH /eod-reports/:id below:
+    // only true columns are written directly; everything else (assignedTo,
+    // description, industry, createdBy, etc.) is merged into extra_json.
+    // Previously this route spread unknown fields straight into the SQL
+    // UPDATE via ...rest, which broke the moment a request included
+    // assignedTo (or any other non-column field) — Knex would try to SET a
+    // column that doesn't exist on dbo.clients, and SQL Server would throw.
+    // That raw error is what surfaced in the UI as "SQL/database error" on
+    // Remove Me, Pick Up, and Edit Client — and because assignedTo never
+    // actually reached a persisted location (neither a real column nor
+    // extra_json), assignments never showed up for the assignee either.
+    const { name, contactName, contactEmail, contactPhone, status, ...extra } = req.body;
+    const currentExtra = current.extra_json ? JSON.parse(current.extra_json) : {};
+    const upd = { updated_at: new Date(), extra_json: JSON.stringify({ ...currentExtra, ...extra }) };
+    if (name !== undefined) upd.name = name;
     if (contactName !== undefined) upd.contact_name = contactName;
     if (contactEmail !== undefined) upd.contact_email = contactEmail;
     if (contactPhone !== undefined) upd.contact_phone = contactPhone;
-    delete upd.contactName; delete upd.contactEmail; delete upd.contactPhone; delete upd.extra;
+    if (status !== undefined) upd.status = status;
     await req.db('clients').where({ id: req.params.id }).update(upd);
     const saved = mapClient(await req.db('clients').where({ id: req.params.id }).first());
     req.io.to(req.company.slug).emit('client:updated', saved);
     res.json(saved);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    // Do not leak raw SQL/driver exceptions to the UI — log server-side and
+    // return a clean, generic message instead. Matches the requirement not
+    // to expose SQL/database exceptions, and gives the frontend something
+    // sensible to show in a toast either way.
+    console.error('PATCH /clients/:id failed:', e);
+    res.status(500).json({ error: 'Could not update this client. Please try again.' });
+  }
 });
 router.delete('/clients/:id', async (req, res) => {
   try {
     await req.db('clients').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('client:deleted', { id: req.params.id });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('DELETE /clients/:id failed:', e); res.status(500).json({ error: 'Could not delete this client. Please try again.' }); }
 });
 
 // ── TIME ENTRIES ──────────────────────────────────────────────────────────────
@@ -126,7 +148,7 @@ router.get('/time-entries', async (req, res) => {
     if (req.query.accountantId) q = q.where('accountant_id', req.query.accountantId);
     if (req.query.date) q = q.where('date', req.query.date);
     res.json((await q).map(mapTimeEntry));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /time-entries failed:', e); res.status(500).json({ error: 'Could not load time entries. Please try again.' }); }
 });
 router.post('/time-entries', async (req, res) => {
   try {
@@ -146,12 +168,12 @@ router.post('/time-entries', async (req, res) => {
     const saved = mapTimeEntry(await req.db('time_entries').where({ id }).first());
     req.io.to(req.company.slug).emit('timeEntry:created', saved);
     res.json(saved);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('POST /time-entries failed:', e); res.status(500).json({ error: 'Could not save this time entry. Please try again.' }); }
 });
 router.patch('/time-entries/:id', async (req, res) => {
   try {
     const current = await req.db('time_entries').where({ id: req.params.id }).first();
-    if (!current) return res.status(404).json({ error: 'Not found' });
+    if (!current) return res.status(404).json({ error: 'Time entry not found' });
     const { hours, task, accountantId, clientId, date, ...extra } = req.body;
     const currentExtra = current.extra_json ? JSON.parse(current.extra_json) : {};
     const upd = { updated_at: new Date(), extra_json: JSON.stringify({ ...currentExtra, ...extra }) };
@@ -164,7 +186,7 @@ router.patch('/time-entries/:id', async (req, res) => {
     const saved = mapTimeEntry(await req.db('time_entries').where({ id: req.params.id }).first());
     req.io.to(req.company.slug).emit('timeEntry:updated', saved);
     res.json(saved);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('PATCH /time-entries/:id failed:', e); res.status(500).json({ error: 'Could not update this time entry. Please try again.' }); }
 });
 
 // ── EOD REPORTS ───────────────────────────────────────────────────────────────
@@ -175,31 +197,47 @@ router.get('/eod-reports', async (req, res) => {
     if (req.query.date) q = q.where('date', req.query.date);
     if (req.query.status) q = q.where('status', req.query.status);
     res.json((await q).map(mapEodReport));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /eod-reports failed:', e); res.status(500).json({ error: 'Could not load EOD reports. Please try again.' }); }
 });
 router.post('/eod-reports', async (req, res) => {
   try {
     // Frontend sends: { accountantId, accountantName, accountantRole, date, clientSummary[],
     //   totalDuration, status, submittedAt, reviewNote, reviewedBy, reviewedAt }
-    const { accountantId, date, status, summary, ...extra } = req.body;
+    const { accountantId, date, status, summary, accountantRole, ...extraRest } = req.body;
+    // An Accounts Manager has no reviewer above them in the hierarchy — their
+    // own EOD is final the moment they submit it, not "pending review" by
+    // someone else. Enforcing this here (not just hiding the button in the
+    // UI) is what actually prevents an Accounts Manager from being stuck in
+    // a submitted/pending state forever, since nothing in this system is
+    // ever positioned to review a Manager's own report.
+    const isManagerSelfReport = accountantRole === 'accounts_manager';
+    const finalStatus = isManagerSelfReport ? 'reviewed' : (status || 'submitted');
+    const extra = { ...extraRest, accountantRole };
+    if (isManagerSelfReport) {
+      extra.reviewedBy = extra.reviewedBy || req.body.accountantName || null;
+      extra.reviewedAt = extra.reviewedAt || new Date().toISOString();
+    }
     const id = 'eod' + Date.now();
     await req.db('eod_reports').insert({
       id,
       accountant_id: accountantId || req.body.accountant_id,
       date: date || null,
-      status: status || 'submitted',
+      status: finalStatus,
       summary: summary || null,
       extra_json: JSON.stringify(extra),
     });
     const saved = mapEodReport(await req.db('eod_reports').where({ id }).first());
     req.io.to(req.company.slug).emit('eodReport:submitted', saved);
     res.json(saved);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error('POST /eod-reports failed:', e);
+    res.status(500).json({ error: 'Could not submit the EOD report. Please try again.' });
+  }
 });
 router.patch('/eod-reports/:id', async (req, res) => {
   try {
     const current = await req.db('eod_reports').where({ id: req.params.id }).first();
-    if (!current) return res.status(404).json({ error: 'Not found' });
+    if (!current) return res.status(404).json({ error: 'EOD report not found' });
     const { status, summary, accountantId, date, ...extra } = req.body;
     const currentExtra = current.extra_json ? JSON.parse(current.extra_json) : {};
     const upd = { updated_at: new Date(), extra_json: JSON.stringify({ ...currentExtra, ...extra }) };
@@ -209,13 +247,13 @@ router.patch('/eod-reports/:id', async (req, res) => {
     const saved = mapEodReport(await req.db('eod_reports').where({ id: req.params.id }).first());
     req.io.to(req.company.slug).emit('eodReport:updated', saved);
     res.json(saved);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('PATCH /eod-reports/:id failed:', e); res.status(500).json({ error: 'Could not update this EOD report. Please try again.' }); }
 });
 
 // ── EOD ROUTES ────────────────────────────────────────────────────────────────
 router.get('/eod-routes', async (req, res) => {
   try { res.json((await req.db('eod_routes')).map(mapRoute)); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  catch (e) { console.error('GET /eod-routes failed:', e); res.status(500).json({ error: 'Could not load reviewer routing. Please try again.' }); }
 });
 router.post('/eod-routes', async (req, res) => {
   try {
@@ -229,11 +267,11 @@ router.post('/eod-routes', async (req, res) => {
     const id = 'route' + Date.now();
     await req.db('eod_routes').insert({ id, accountant_id: accountantId, accountant_name: accountantName, reviewer_id: reviewerId, reviewer_name: reviewerName });
     res.json(mapRoute(await req.db('eod_routes').where({ id }).first()));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('POST /eod-routes failed:', e); res.status(500).json({ error: 'Could not save reviewer routing. Please try again.' }); }
 });
 router.delete('/eod-routes/:id', async (req, res) => {
   try { await req.db('eod_routes').where({ id: req.params.id }).delete(); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  catch (e) { console.error('DELETE /eod-routes/:id failed:', e); res.status(500).json({ error: 'Could not remove this reviewer routing. Please try again.' }); }
 });
 
 module.exports = router;
