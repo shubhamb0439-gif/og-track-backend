@@ -75,7 +75,7 @@ router.post('/clockin', async (req, res) => {
     }
     req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockIn: now.toISOString() });
     res.json({ success: true, clockIn: now.toISOString() });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('POST /clockin failed:', e); res.status(500).json({ error: 'Could not clock in. Please try again.' }); }
 });
 
 // ── Clock out ───────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ router.post('/clockout', async (req, res) => {
     await req.db('attendance').where({ id }).update({ clock_out: now, total_hours: hrs });
     req.io.to(req.company.slug).emit(`attendance:${userId}`, { date, clockOut: now.toISOString(), totalHours: hrs });
     res.json({ success: true, clockOut: now.toISOString(), totalHours: hrs });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('POST /clockout failed:', e); res.status(500).json({ error: 'Could not clock out. Please try again.' }); }
 });
 
 // ── Today's record for a user ────────────────────────────────────────────────
@@ -101,7 +101,7 @@ router.get('/today/:userId', async (req, res) => {
   try {
     const rec = await req.db('attendance').where({ id: `${req.params.userId}_${todayStr()}` }).first();
     res.json(mapAtt(rec) || null);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /today/:userId failed:', e); res.status(500).json({ error: 'Could not load today\'s attendance. Please try again.' }); }
 });
 
 // ── Last 60 days for a user ──────────────────────────────────────────────────
@@ -109,7 +109,7 @@ router.get('/user/:userId', async (req, res) => {
   try {
     const rows = await req.db('attendance').where({ user_id: req.params.userId }).orderBy('date', 'desc').limit(60);
     res.json(rows.map(mapAtt));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /user/:userId failed:', e); res.status(500).json({ error: 'Could not load attendance history. Please try again.' }); }
 });
 
 // ── Org-wide (last 300) ──────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ router.get('/all', async (req, res) => {
   try {
     const rows = await req.db('attendance').orderBy('date', 'desc').limit(300);
     res.json(rows.map(mapAtt));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /all failed:', e); res.status(500).json({ error: 'Could not load attendance records. Please try again.' }); }
 });
 
 // ── Regularization requests ──────────────────────────────────────────────────
@@ -129,7 +129,7 @@ router.post('/regularize', async (req, res) => {
     await req.db('regularize_requests').insert(data);
     req.io.to(req.company.slug).emit('regularize:new', mapReg(data));
     res.json({ success: true, id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('POST /regularize failed:', e); res.status(500).json({ error: 'Could not submit regularization request. Please try again.' }); }
 });
 
 router.get('/regularize', async (req, res) => {
@@ -137,7 +137,7 @@ router.get('/regularize', async (req, res) => {
     let q = req.db('regularize_requests').orderBy('created_at', 'desc');
     if (req.query.userId) q = q.where('user_id', req.query.userId);
     res.json((await q).map(mapReg));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /regularize failed:', e); res.status(500).json({ error: 'Could not load regularization requests. Please try again.' }); }
 });
 
 router.patch('/regularize/:id', async (req, res) => {
@@ -156,7 +156,7 @@ router.patch('/regularize/:id', async (req, res) => {
     }
     req.io.to(req.company.slug).emit('regularize:updated', { id: req.params.id, status });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('PATCH /regularize/:id failed:', e); res.status(500).json({ error: 'Could not update this regularization request. Please try again.' }); }
 });
 
 // ── Leave requests ───────────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ router.post('/leave', async (req, res) => {
     await req.db('leave_requests').insert(data);
     req.io.to(req.company.slug).emit('leave:new', mapLeave(data));
     res.json({ success: true, id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('POST /leave failed:', e); res.status(500).json({ error: 'Could not submit leave request. Please try again.' }); }
 });
 
 router.get('/leave', async (req, res) => {
@@ -176,7 +176,7 @@ router.get('/leave', async (req, res) => {
     let q = req.db('leave_requests').orderBy('created_at', 'desc');
     if (req.query.userId) q = q.where('user_id', req.query.userId);
     res.json((await q).map(mapLeave));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /leave failed:', e); res.status(500).json({ error: 'Could not load leave requests. Please try again.' }); }
 });
 
 router.patch('/leave/:id', async (req, res) => {
@@ -185,7 +185,7 @@ router.patch('/leave/:id', async (req, res) => {
     await req.db('leave_requests').where({ id: req.params.id }).update({ status, approved_by: approvedBy, resolved_at: new Date() });
     req.io.to(req.company.slug).emit('leave:updated', { id: req.params.id, status });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('PATCH /leave/:id failed:', e); res.status(500).json({ error: 'Could not update this leave request. Please try again.' }); }
 });
 
 // ── QR attendance ─────────────────────────────────────────────────────────────
@@ -208,7 +208,7 @@ router.get('/qr-token', async (req, res) => {
     const sig = signQrBucket(req.company.slug, bucket);
     const token = Buffer.from(`${req.company.slug}.${bucket}.${sig}`).toString('base64');
     res.json({ token, expiresInSeconds: QR_BUCKET_SECONDS });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('GET /qr-token failed:', e); res.status(500).json({ error: 'Could not generate QR code. Please try again.' }); }
 });
 
 // POST /api/:slug/attendance/qr-scan — an employee's phone scans the
@@ -257,7 +257,16 @@ router.post('/qr-scan', async (req, res) => {
       return res.json({ success: true, action: 'clockout', time: now.toISOString(), totalHours: hrs });
     }
     return res.status(400).json({ error: 'Already clocked in and out for today' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    // Do not leak raw SQL/driver exceptions to the UI — this is what
+    // previously surfaced literally as "insert into [attendance] (...)
+    // values (...) - Invalid column name 'mode'" directly in the QR
+    // scanner screen (the real bug: the 'mode' column was missing from the
+    // schema entirely — see patch_07_attendance_mode_column.sql). Log the
+    // real error server-side and show a clean, actionable message instead.
+    console.error('POST /qr-scan failed:', e);
+    res.status(500).json({ error: 'Could not record attendance. Please tap close and try again.' });
+  }
 });
 
 module.exports = router;
