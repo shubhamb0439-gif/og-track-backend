@@ -243,19 +243,19 @@ router.post('/eod-reports', async (req, res) => {
     // Frontend sends: { accountantId, accountantName, accountantRole, date, clientSummary[],
     //   totalDuration, status, submittedAt, reviewNote, reviewedBy, reviewedAt }
     const { accountantId, date, status, summary, accountantRole, ...extraRest } = req.body;
-    // An Accounts Manager has no reviewer above them in the hierarchy — their
-    // own EOD is final the moment they submit it, not "pending review" by
-    // someone else. Enforcing this here (not just hiding the button in the
-    // UI) is what actually prevents an Accounts Manager from being stuck in
-    // a submitted/pending state forever, since nothing in this system is
-    // ever positioned to review a Manager's own report.
-    const isManagerSelfReport = accountantRole === 'accounts_manager';
-    const finalStatus = isManagerSelfReport ? 'reviewed' : (status || 'submitted');
+    // Submission and review are always two separate events, even for an
+    // Accounts Manager (who has no one above them to review their report).
+    // Previously this route auto-set status to 'reviewed' and silently
+    // backfilled reviewedBy/reviewedAt the moment a Manager submitted —
+    // meaning their report never had a genuine "pending review" state and
+    // no real review action ever actually happened, just an assumption
+    // baked into the insert. A Manager's own report now starts as
+    // 'submitted' exactly like anyone else's; self-reviewing it afterward
+    // (via the same reviewEodReport() action, just performed on their own
+    // report) is what moves it to 'reviewed', matching how every other
+    // report in this system reaches that status.
+    const finalStatus = status || 'submitted';
     const extra = { ...extraRest, accountantRole };
-    if (isManagerSelfReport) {
-      extra.reviewedBy = extra.reviewedBy || req.body.accountantName || null;
-      extra.reviewedAt = extra.reviewedAt || new Date().toISOString();
-    }
     const id = 'eod' + Date.now();
     await req.db('eod_reports').insert({
       id,
