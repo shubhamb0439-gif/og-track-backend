@@ -74,9 +74,10 @@ app.use('/api/:slug/sub-tickets', resolveTenant, requireModule('sub_tickets'), s
 app.use('/api/:slug/roles', resolveTenant, rolesRoutes);
 app.use('/api/:slug/attendance', resolveTenant, requireModule('attendance'), attendanceRoutes);
 app.use('/api/:slug/conversations', resolveTenant, requireModule('messages'), messagingRoutes);
-// Accounting suite (clients, time-entries, eod-reports, eod-routes) — the
-// router defines those sub-paths, gated as a whole by the acc_clients module.
-app.use('/api/:slug/acc', resolveTenant, requireModule('acc_clients'), accountingRoutes);
+// Accounting suite (clients, time-entries, eod-reports, eod-routes) — any
+// accounting-related module checkbox unlocks it (a company can enable Timer
+// and EOD Reports without Clients, e.g. Cajo, and still needs those routes).
+app.use('/api/:slug/acc', resolveTenant, requireModule(['acc_clients', 'acc_timer', 'acc_eod']), accountingRoutes);
 // HR suite (jobs, candidates, interviews) — any HR-related module checkbox unlocks it.
 app.use('/api/:slug/hr', resolveTenant, requireModule(['hr_dashboard','hr_jobs','hr_candidates','hr_interviews']), hrRoutes);
 // Sales / CRM funnel (leads, prospects, customers, sales log) — gated by crm.
