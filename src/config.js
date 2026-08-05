@@ -60,13 +60,4 @@ module.exports = {
     jwtSecret: required('JWT_SECRET'),
     bcryptRounds: parseInt(process.env.BCRYPT_ROUNDS || '10', 10),
   },
-  // AIDA (AI orchestration layer) — intentionally NOT using required() here.
-  // Every other module in this app is core to running OGTrack at all, so a
-  // missing env var should fail startup loudly. AIDA is an optional layer on
-  // top of the existing product; if this key is absent, AIDA should report
-  // itself as unavailable to the frontend rather than crash the whole server.
-  aida: {
-    openaiApiKey: process.env.OPENAI_API_KEY || null,
-    openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-  },
 };
