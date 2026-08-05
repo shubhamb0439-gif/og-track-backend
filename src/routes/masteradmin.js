@@ -132,32 +132,8 @@ router.patch('/companies/:id', requireMasterAdmin, async (req, res) => {
 
     const existing = await coreDb('companies').where({ id: req.params.id }).first();
     if (!existing) return res.status(404).json({ error: 'Company not found' });
-
-    // Slug changes need the same validation as creation (POST /companies
-    // above) — this route previously spread req.body straight into the
-    // UPDATE with no format cleaning or uniqueness check at all, meaning a
-    // masteradmin using the existing slug field in the edit UI could
-    // silently collide with another company's slug (breaking routing for
-    // BOTH companies) or save garbage characters that don't survive URL
-    // parsing. Only runs this check when slug is actually part of the
-    // request and actually different from what's already stored.
-    if (updates.slug !== undefined) {
-      const cleanSlug = String(updates.slug).toLowerCase().replace(/[^a-z0-9-]/g, '');
-      if (!cleanSlug) return res.status(400).json({ error: 'Slug cannot be empty after removing invalid characters.' });
-      if (cleanSlug !== existing.slug) {
-        const collision = await coreDb('companies').where({ slug: cleanSlug }).whereNot({ id: req.params.id }).first();
-        if (collision) return res.status(400).json({ error: `Slug "${cleanSlug}" is already in use by another company.` });
-      }
-      updates.slug = cleanSlug;
-    }
-
     await coreDb('companies').where({ id: req.params.id }).update(updates);
     invalidateCompanyCache(existing.slug);
-    // If the slug actually changed, the OLD slug's cache entry (just
-    // invalidated above) is enough — the next request under the NEW slug
-    // is simply a cache miss, which getCompanyBySlug already handles by
-    // falling through to a fresh DB lookup. No separate cache entry needs
-    // pre-warming here.
 
     const row = await coreDb('companies').where({ id: req.params.id }).first();
     const newModules = JSON.parse(row.enabled_modules || '[]');

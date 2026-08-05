@@ -110,29 +110,8 @@ router.patch('/:id', async (req, res) => {
     const existing = await coreDb('companies').where({ id: req.params.id }).first();
     if (!existing) return res.status(404).json({ error: 'Company not found' });
 
-    // Slug changes need the same validation as creation (POST / above) —
-    // this route previously had no format cleaning or uniqueness check at
-    // all for slug, unlike creation. A masteradmin using the existing slug
-    // field in the edit UI could silently collide with another company's
-    // slug (breaking routing for BOTH companies, since by-slug lookups
-    // would only ever find whichever row happens to match first) or save
-    // characters that don't survive URL path parsing.
-    if (updates.slug !== undefined) {
-      const cleanSlug = String(updates.slug).toLowerCase().replace(/[^a-z0-9-]/g, '');
-      if (!cleanSlug) return res.status(400).json({ error: 'Slug cannot be empty after removing invalid characters.' });
-      if (cleanSlug !== existing.slug) {
-        const collision = await coreDb('companies').where({ slug: cleanSlug }).whereNot({ id: req.params.id }).first();
-        if (collision) return res.status(400).json({ error: `Slug "${cleanSlug}" is already in use by another company.` });
-      }
-      updates.slug = cleanSlug;
-    }
-
     await coreDb('companies').where({ id: req.params.id }).update(updates);
     invalidateCompanyCache(existing.slug); // so branding/module changes take effect immediately, not after 30s TTL
-    // If the slug changed, the OLD slug's cache entry (just invalidated) is
-    // enough — the next request under the NEW slug is simply a cache miss,
-    // which the cache lookup already handles by falling through to a fresh
-    // DB read. No separate entry needs pre-warming here.
 
     const row = await coreDb('companies').where({ id: req.params.id }).first();
     res.json({ ...row, enabled_modules: JSON.parse(row.enabled_modules) });
