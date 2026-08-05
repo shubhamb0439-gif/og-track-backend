@@ -79,4 +79,34 @@ router.patch('/:id/role', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// DELETE /api/:slug/users/:id
+router.delete('/:id', async (req, res) => {
+  try {
+    const user = await req.db('users').where({ id: req.params.id }).first();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    // Safety rail: never allow deleting the last superadmin (or any
+    // superadmin) via this route — that's the one account guaranteed to
+    // always be able to log back in and fix things. Revoking/deleting a
+    // superadmin, if ever needed, should be a deliberate separate action,
+    // not something reachable from the same button as every other user.
+    if (user.role === 'superadmin') {
+      return res.status(400).json({ error: 'Superadmin accounts cannot be deleted from here.' });
+    }
+    await req.db('users').where({ id: req.params.id }).delete();
+    req.io.to(req.company.slug).emit('user:deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) {
+    // A user with real data still referencing them elsewhere (time entries,
+    // sales, bugs they created, etc.) will hit a foreign key constraint —
+    // surface that as a clear, specific message rather than a raw SQL
+    // exception reaching the UI.
+    if (e.message && /FK_|REFERENCE constraint|foreign key/i.test(e.message)) {
+      console.error('DELETE /users/:id blocked by FK:', e.message);
+      return res.status(409).json({ error: 'This user still has data linked to them (bugs, sales, time entries, etc.) and cannot be deleted directly. Reassign or remove that data first.' });
+    }
+    console.error('DELETE /users/:id failed:', e);
+    res.status(500).json({ error: 'Could not delete this user. Please try again.' });
+  }
+});
+
 module.exports = router;
