@@ -60,4 +60,72 @@ module.exports = {
     jwtSecret: required('JWT_SECRET'),
     bcryptRounds: parseInt(process.env.BCRYPT_ROUNDS || '10', 10),
   },
+  // AIDA (AI orchestration layer) — deliberately NOT validated via required()
+  // like the rest of config: the app must keep booting for every existing
+  // tenant even if AIDA hasn't been configured yet. Routes check
+  // config.aida.enabled themselves and return 503 rather than crashing here.
+  //
+  // Provider is picked via AIDA_PROVIDER ('anthropic' | 'openai', defaults to
+  // anthropic) — src/aida/engine.js dispatches to the matching adapter under
+  // src/aida/providers/. Only that provider's API key needs to be set.
+  aida: (() => {
+    const provider = (process.env.AIDA_PROVIDER || 'anthropic').toLowerCase();
+    const apiKey = provider === 'openai' ? (process.env.OPENAI_API_KEY || null) : (process.env.ANTHROPIC_API_KEY || null);
+    const defaultModel = provider === 'openai' ? 'gpt-4o' : 'claude-sonnet-5';
+    return {
+      provider,
+      enabled: !!apiKey,
+      apiKey,
+      model: process.env.AIDA_MODEL || defaultModel,
+      maxToolIterations: parseInt(process.env.AIDA_MAX_TOOL_ITERATIONS || '4', 10),
+      sessionTtlMs: parseInt(process.env.AIDA_SESSION_TTL_MINUTES || '120', 10) * 60 * 1000,
+      maxHistoryMessages: parseInt(process.env.AIDA_MAX_HISTORY_MESSAGES || '20', 10),
+      // Internal loopback base URL AIDA uses to call OG Track's OWN REST API —
+      // this is what makes "never touch the DB directly" real: every tool
+      // executes as a normal HTTP call through the same Express app, so it
+      // goes through the same resolveTenant/requireModule gates as any browser
+      // request. Override if the app is behind a reverse proxy internally.
+      internalBaseUrl: process.env.AIDA_INTERNAL_BASE_URL || `http://127.0.0.1:${parseInt(process.env.PORT || '3000', 10)}`,
+      // Lightweight repo-diagnosis capability (src/aida/jobs/jobKinds/devDiagnose.js):
+      // clone + read-only source scan + LLM report, no code execution, no sandbox —
+      // an interim step before the full sandboxed dev/deploy pipeline from the AIDA
+      // power-tier plan. githubToken is only needed for PRIVATE repos; authorizedRepos
+      // is a hard allowlist checked both at tool-call time and again inside the job
+      // itself (defense in depth) — nothing outside this list can ever be cloned.
+      githubToken: process.env.AIDA_GITHUB_TOKEN || null,
+      authorizedRepos: (process.env.AIDA_AUTHORIZED_REPOS || '')
+        .split(',').map((s) => s.trim()).filter(Boolean),
+      // Voice (src/aida/voice/) — ElevenLabs TTS, chunked over the existing
+      // socket.io connection. Soft-optional like the rest of this block:
+      // enabled only when both an API key AND a voice id are set, so a
+      // POST /chat with voice:true silently stays text-only otherwise
+      // rather than erroring.
+      voice: (() => {
+        const apiKey = process.env.ELEVENLABS_API_KEY || null;
+        const voiceId = process.env.ELEVENLABS_VOICE_ID || null;
+        return {
+          enabled: !!apiKey && !!voiceId,
+          apiKey,
+          voiceId,
+          modelId: process.env.ELEVENLABS_MODEL_ID || 'eleven_flash_v2_5',
+          outputFormat: process.env.ELEVENLABS_OUTPUT_FORMAT || 'mp3_44100_128',
+          maxConcurrentChunks: parseInt(process.env.ELEVENLABS_MAX_CONCURRENT_CHUNKS || '2', 10),
+          maxCharsPerReply: parseInt(process.env.ELEVENLABS_MAX_CHARS_PER_REPLY || '2000', 10),
+        };
+      })(),
+      // Speech-to-text for POST /aida/voice-input (src/aida/voice/speechToText.js).
+      // Deliberately reads OPENAI_API_KEY directly rather than config.aida.apiKey
+      // above — Whisper is OpenAI-specific regardless of which provider is
+      // selected for AIDA's chat replies (AIDA_PROVIDER may be 'anthropic' while
+      // an OpenAI key still exists purely for transcription, or vice versa).
+      speechToText: (() => {
+        const apiKey = process.env.OPENAI_API_KEY || null;
+        return {
+          enabled: !!apiKey,
+          apiKey,
+          model: process.env.AIDA_STT_MODEL || 'whisper-1',
+        };
+      })(),
+    };
+  })(),
 };

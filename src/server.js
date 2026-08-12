@@ -26,6 +26,8 @@ const inventoryRoutes = require('./routes/inventory');
 const manufacturingRoutes = require('./routes/manufacturing');
 const salesRoutes = require('./routes/sales');
 const uploadRoutes = require('./routes/upload');
+const { tenantAidaRouter, masterAdminAidaRouter } = require('./routes/aida');
+const aidaJobRunner = require('./aida/jobs/jobRunner');
 
 const app = express();
 const server = http.createServer(app);
@@ -36,6 +38,11 @@ app.use(express.json({ limit: '5mb' }));
 
 // Make io available to every route via req.io.
 app.use((req, _res, next) => { req.io = io; next(); });
+
+// AIDA's background job runner needs the same io instance to push job status
+// updates into a client's room asynchronously (a job can finish long after
+// its originating POST /aida/chat request has already returned).
+aidaJobRunner.start(io);
 
 // ── Socket.io: per-tenant rooms ──────────────────────────────────────────────
 // Every client joins a room named after its company slug. All real-time
@@ -61,6 +68,8 @@ app.get('/health', async (_req, res) => {
 // ── Platform-level (masteradmin) routes — operate on OGCore, NOT tenant-scoped ─
 app.use('/api/companies', companiesRoutes);
 app.use('/api/masteradmin', masteradminRoutes);
+// AIDA for master admin (domain.com/master-admin/aida) — cross-company tools only.
+app.use('/api/masteradmin/aida', masterAdminAidaRouter);
 
 // ── Tenant-scoped routes — every path carries the :slug segment ───────────────
 // resolveTenant runs first (attaches req.db + req.company), then each module's
@@ -90,6 +99,10 @@ app.use('/api/:slug/inventory', resolveTenant, requireModule('inventory'), inven
 app.use('/api/:slug/manufacturing', resolveTenant, requireModule('manufacturing'), manufacturingRoutes);
 app.use('/api/:slug/sales', resolveTenant, requireModule('sales'), salesRoutes);
 app.use('/api/:slug/upload', resolveTenant, uploadRoutes);
+// AIDA — the AI orchestration layer (domain.com/<slug>/aida in the frontend).
+// Not gated by requireModule: it's not a module, it's a layer over every
+// module. Each individual tool self-gates against req.company.enabled_modules.
+app.use('/api/:slug/aida', resolveTenant, tenantAidaRouter);
 
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));

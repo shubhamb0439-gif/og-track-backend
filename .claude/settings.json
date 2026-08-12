@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Bash(curl -s http://localhost:3000/api/cajo/aida/tools -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ1MTc4NTEzMzM4MjE4MCIsInJvbGUiOiJzdXBlcmFkbWluIiwic2x1ZyI6ImNham8iLCJpYXQiOjE3ODY0NDAyMzksImV4cCI6MTc4NjQ4MzQzOX0.yHvSi_V-0zm-D6HpfPNIJbKjQfB22TTg3iLZWFAQhuc')",
+      "Bash(netstat -ano)",
+      "Read(//c/OG track/OG track updated main/Og track new/ogtrack-frontend/ogtrack-frontend/**)",
+      "Bash(curl -s http://localhost:8080/masteradmin.html/aida)",
+      "Bash(taskkill //PID 18172 //F)",
+      "Bash(node serve.js)",
+      "Bash(curl -s http://localhost:3000/api/masteradmin/aida/jobs/job_1786447011880_55lvft -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZG1pbklkIjoidGVzdC1hZG1pbiIsInJvbGUiOiJtYXN0ZXJhZG1pbiIsImlhdCI6MTc4NjQ0Njk5NCwiZXhwIjoxNzg2NDU0MTk0fQ.SbkyA7DHKZKn1T2F6SEI_VfKxbfTswNj9pK0e0QS8HI')",
+      "Bash(curl -s http://localhost:3000/api/masteradmin/aida/jobs/job_1786447011880_dyvfgu -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZG1pbklkIjoidGVzdC1hZG1pbiIsInJvbGUiOiJtYXN0ZXJhZG1pbiIsImlhdCI6MTc4NjQ0Njk5NCwiZXhwIjoxNzg2NDU0MTk0fQ.SbkyA7DHKZKn1T2F6SEI_VfKxbfTswNj9pK0e0QS8HI')",
+      "Bash(node -c src/aida/engine.js)",
+      "Bash(taskkill //PID 38668 //F)",
+      "Bash(AIDA_AUTHORIZED_REPOS=\"octocat/Hello-World,sindresorhus/is-odd\" node src/server.js)",
+      "Bash(curl -s http://localhost:3000/api/masteradmin/aida/jobs/job_1786447295381_olew8y -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZG1pbklkIjoidGVzdC1hZG1pbiIsInJvbGUiOiJtYXN0ZXJhZG1pbiIsImlhdCI6MTc4NjQ0NzExNiwiZXhwIjoxNzg2NDU0MzE2fQ.Op6eVKhW_6DSEO8yIr6cwFJ6FC08eGD0KWla3ApB3_I')",
+      "Bash(node \"C:\\\\Users\\\\SHUBHA~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--OG-track-OG-track-updated-main-Og-track-new-ogtrack-backend-new-ogtrack-backend\\\\30e1f414-0d91-49c7-8bf0-1ce6c18c5584\\\\scratchpad\\\\debugToolCallSkip.js\")",
+      "Bash(taskkill //PID 40672 //F)",
+      "Bash(node \"C:\\\\Users\\\\SHUBHA~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--OG-track-OG-track-updated-main-Og-track-new-ogtrack-backend-new-ogtrack-backend\\\\30e1f414-0d91-49c7-8bf0-1ce6c18c5584\\\\scratchpad\\\\repeatToolCallTest.js\")",
+      "Bash(node -c src/aida/toolRegistry.js)",
+      "Bash(node -c src/aida/jobs/jobKinds/devDiagnose.js)",
+      "Bash(taskkill //PID 41532 //F)"
+    ]
+  }
+}

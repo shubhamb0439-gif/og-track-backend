@@ -271,4 +271,91 @@ router.post('/admins', requireMasterAdmin, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── GET /api/masteradmin/dashboard/summary — aggregated stats for the dashboard ───
+// One call, everything the dashboard needs — company counts/growth/module
+// adoption from OGCore directly, provisioning health from provisioning_log,
+// and pending-approval counts via the same cross-tenant loop GET /pending-users
+// already uses (just counting instead of returning full rows).
+router.get('/dashboard/summary', requireMasterAdmin, async (req, res) => {
+  try {
+    const { getTenantDbByName } = require('../db/tenantConnections');
+
+    const companies = await coreDb('companies');
+    const companyCounts = { total: companies.length, active: 0, suspended: 0, other: 0 };
+    const moduleAdoption = {};
+    for (const c of companies) {
+      if (c.status === 'active') companyCounts.active++;
+      else if (c.status === 'suspended') companyCounts.suspended++;
+      else companyCounts.other++;
+      const modules = JSON.parse(c.enabled_modules || '[]');
+      for (const m of modules) moduleAdoption[m] = (moduleAdoption[m] || 0) + 1;
+    }
+
+    // Growth: companies created per month, last 12 months (oldest first).
+    const now = new Date();
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({ key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, count: 0 });
+    }
+    const monthIndex = new Map(months.map((m, i) => [m.key, i]));
+    for (const c of companies) {
+      const created = c.created_at instanceof Date ? c.created_at : new Date(c.created_at);
+      const key = `${created.getFullYear()}-${String(created.getMonth() + 1).padStart(2, '0')}`;
+      if (monthIndex.has(key)) months[monthIndex.get(key)].count++;
+    }
+
+    // Provisioning health, last 30 days.
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const recentLogs = await coreDb('provisioning_log').where('created_at', '>=', thirtyDaysAgo);
+    const provisioningHealth = { success: 0, failed: 0, pending: 0 };
+    for (const log of recentLogs) {
+      if (log.status === 'success') provisioningHealth.success++;
+      else if (log.status === 'failed') provisioningHealth.failed++;
+      else provisioningHealth.pending++;
+    }
+
+    // Pending approvals across every active tenant — same loop GET /pending-users
+    // uses, counting only (and how many of those arrived this month).
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    let pendingApprovalsCount = 0;
+    let pendingApprovalsThisMonth = 0;
+    for (const company of companies.filter((c) => c.status === 'active')) {
+      try {
+        const db = getTenantDbByName(company.db_name);
+        const pending = await db('users').where({ status: 'pending' }).select('created_at');
+        pendingApprovalsCount += pending.length;
+        for (const u of pending) {
+          const created = u.created_at instanceof Date ? u.created_at : new Date(u.created_at);
+          if (created >= startOfMonth) pendingApprovalsThisMonth++;
+        }
+      } catch (e) {
+        console.warn(`[dashboard/summary] skipped ${company.slug}:`, e.message);
+      }
+    }
+
+    const newCompaniesThisMonth = companies.filter((c) => {
+      const created = c.created_at instanceof Date ? c.created_at : new Date(c.created_at);
+      return created >= startOfMonth;
+    }).length;
+    const provisioningFailuresThisMonth = recentLogs.filter((l) => {
+      const created = l.created_at instanceof Date ? l.created_at : new Date(l.created_at);
+      return l.status === 'failed' && created >= startOfMonth;
+    }).length;
+
+    res.json({
+      companyCounts,
+      moduleAdoption,
+      growth: months,
+      provisioningHealth,
+      pendingApprovalsCount,
+      thisMonth: {
+        newCompanies: newCompaniesThisMonth,
+        newPendingUsers: pendingApprovalsThisMonth,
+        provisioningFailures: provisioningFailuresThisMonth,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
