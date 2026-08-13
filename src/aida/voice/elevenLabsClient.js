@@ -22,6 +22,7 @@ async function* synthesizeChunkStream(text, opts = {}) {
   const voiceId = opts.voiceId || voice.voiceId;
   const modelId = opts.modelId || voice.modelId;
   const outputFormat = opts.outputFormat || voice.outputFormat;
+  const speed = opts.speed !== undefined ? opts.speed : voice.speed;
 
   const url = `${BASE_URL}/${encodeURIComponent(voiceId)}/stream?output_format=${encodeURIComponent(outputFormat)}`;
 
@@ -34,7 +35,7 @@ async function* synthesizeChunkStream(text, opts = {}) {
         'Content-Type': 'application/json',
         Accept: 'audio/mpeg',
       },
-      body: JSON.stringify({ text, model_id: modelId }),
+      body: JSON.stringify({ text, model_id: modelId, voice_settings: { speed } }),
     });
   } catch (e) {
     throw new ElevenLabsError(`ElevenLabs request failed: ${e.message}`);

@@ -111,6 +111,13 @@ module.exports = {
           outputFormat: process.env.ELEVENLABS_OUTPUT_FORMAT || 'mp3_44100_128',
           maxConcurrentChunks: parseInt(process.env.ELEVENLABS_MAX_CONCURRENT_CHUNKS || '2', 10),
           maxCharsPerReply: parseInt(process.env.ELEVENLABS_MAX_CHARS_PER_REPLY || '2000', 10),
+          // Playback pace — ElevenLabs defaults to 1.0 (their "natural" pace),
+          // which read as too fast in practice. Tunable without a code change.
+          speed: parseFloat(process.env.ELEVENLABS_SPEED || '0.92'),
+          // How long to wait for a real reply before playing a cached "thinking"
+          // filler (src/aida/voice/fillerPhrases.js) — only fires if the reply is
+          // actually slow; a fast reply is completely unaffected.
+          fillerDelayMs: parseInt(process.env.AIDA_VOICE_FILLER_DELAY_MS || '1200', 10),
         };
       })(),
       // Speech-to-text for POST /aida/voice-input (src/aida/voice/speechToText.js).

@@ -360,6 +360,52 @@ Also, `textChunker.js`'s abbreviation guard only catches single-word abbreviatio
 ("Dr.", "vs.") — multi-letter ones with internal dots ("e.g.", "i.e.") still split at
 their second dot, producing one harmless extra chunk boundary.
 
+### Voice UX tuning — speed, perceived latency, personality, barge-in
+
+Four follow-up refinements after voice went live, found by actually using it:
+
+- **Playback speed**: `elevenLabsClient.js` now sends `voice_settings: { speed }`
+  (`ELEVENLABS_SPEED`, default `0.92` — ElevenLabs' own default of `1.0` read as too
+  fast). Verified by comparing synthesized clip duration at `1.0` vs `0.92` for
+  identical text — the slower setting produced a measurably longer clip (4.86s vs
+  4.63s for the same sentence).
+- **Masking the gap before audio starts** (`src/aida/voice/fillerPhrases.js` +
+  `voiceSession.playFiller`): a small pool of short "thinking" lines ("Hmm, let me
+  check on that.", "One moment.", ...), picked at random, **synthesized once and
+  cached in memory** so playing one is instant — no live API call in the critical
+  path. `POST /chat` and `POST /voice-input` both generate `turnId` *before* calling
+  `runTurn()` now (previously after) and race a `setTimeout` (`AIDA_VOICE_FILLER_DELAY_MS`,
+  default `1200`) against it — if the real reply wins the race, the timer is cleared
+  and nothing changes; if the timer fires first, one cached filler plays immediately
+  (tagged `filler: true, seq: -1` on the same `chunkEvent` so the frontend can
+  distinguish it but still just queue-and-play it like any other chunk).
+  **Honest finding from testing**: with real LLM+network latency, most replies —
+  even a plain "hi" — take ~2s end to end, comfortably past the 1200ms default. In
+  practice the filler will play on most turns, not just rare slow ones. That's a
+  reasonable outcome (it's masking real, common latency, not a rare edge case), but
+  raise `AIDA_VOICE_FILLER_DELAY_MS` if you want it to feel rarer/more exceptional.
+- **Personality**: `engine.js`'s system prompt now asks the model to vary its
+  phrasing rather than reuse the same stock line every time. **Honest finding**:
+  this measurably helped but didn't fully fix it — 4 fresh sessions each saying "hi"
+  produced 3 distinct openers ("Hi there!", "Hello!", "Hello there!"), but all four
+  still ended with the identical tail phrase "How can I assist you today?" Prompting
+  is guidance, not a hard constraint — same class of limitation as the tool-calling
+  reliability note above, not something a bigger prompt tweak can fully guarantee.
+- **Barge-in (interrupt AIDA mid-reply)**: new `POST /aida/voice-cancel`,
+  body `{ turnId }`, on the same shared router as every other AIDA route (live for
+  tenant and master admin both). Marks that turn cancelled in `voiceSession.js`'s
+  in-memory map (swept hourly for stale entries); `speakReply`'s per-chunk loop
+  checks it before starting or emitting each chunk, so a cancelled turn stops making
+  further ElevenLabs calls and stops sending further audio immediately. Verified live
+  against a real long multi-sentence reply: cancelling right after the first chunk
+  arrived produced **zero** further chunks, despite the reply being long enough to
+  need several more. **Explicitly out of scope**: cancelling an in-flight `runTurn()`
+  itself (before any reply exists yet) — if the user interrupts that early, the
+  in-flight call simply finishes in the background and its result is just never
+  spoken; a real abort-signal-based cancellation of the LLM call itself would need
+  threading an `AbortSignal` through `engine.js` and both provider adapters, which
+  is a bigger change deliberately left for later.
+
 ### Voice input — `POST /aida/voice-input` (speech in, not just speech out)
 
 Mirrors `POST /chat`, but the "message" is a recorded audio clip instead of typed

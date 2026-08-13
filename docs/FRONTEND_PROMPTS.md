@@ -134,7 +134,41 @@ addition/reorganization, not a removal of anything that currently works.
 
 ---
 
-## 4. AIDA interface redesign — on hold
+## 4. Barge-in — spacebar interrupts AIDA mid-reply and starts listening
+
+**Status: backend is built and verified** — `POST /aida/voice-cancel` (see
+`README.md`'s "Voice UX tuning" section). Verified live: cancelling a real in-flight
+reply produced zero further audio chunks, even for a long multi-sentence answer.
+
+```
+Add a spacebar-triggered interrupt for AIDA's voice replies.
+
+1. Listen for a spacebar keydown, but only when focus is NOT inside the text input
+   box (check document.activeElement before acting) — otherwise this would hijack
+   normal typing.
+2. On trigger, while AIDA is currently speaking (audio is playing or chunks are still
+   arriving for the current turnId):
+   - Immediately stop local audio playback (clear/stop the Web Audio queue) — don't
+     wait for a server round trip for this part, it must feel instant.
+   - Call `POST /aida/voice-cancel` with `{ turnId }` for the turn that was just
+     interrupted, so the backend stops synthesizing/sending anything more for it.
+   - Immediately start a new voice recording — reuse the exact same function that
+     already starts recording for the microphone button, don't duplicate that logic.
+3. If spacebar is pressed while AIDA is NOT currently speaking, just start recording
+   directly (same as clicking the mic button) — no cancel call needed since there's
+   nothing to interrupt.
+
+Note: this does not cancel AIDA's "thinking" — if you interrupt before any reply has
+started arriving yet (still waiting on the very first chunk/filler), there's nothing
+to stop yet; just start recording as in step 3. Also note: some replies now play a
+short "thinking" filler clip before the real answer (tagged `filler: true` in the
+`aida:voice-chunk` payload) — treat it the same as real audio for interrupt purposes
+(stopping playback and cancelling mid-filler is fine and expected).
+```
+
+---
+
+## 5. AIDA interface redesign — on hold
 
 Not started. Waiting on you to provide the HTML file and implementation instructions.
 The integration surface it needs to hook into either way: `POST /chat`, `GET /history`,

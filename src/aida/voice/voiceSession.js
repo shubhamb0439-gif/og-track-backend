@@ -1,12 +1,67 @@
 const config = require('../../config');
 const { splitIntoSpeechChunks } = require('./textChunker');
 const { synthesizeChunkStream, mimeTypeForFormat } = require('./elevenLabsClient');
+const { getRandomFillerAudio } = require('./fillerPhrases');
 
 /** Drains one chunk's streamed audio into a single Buffer for that sentence. */
 async function synthesizeChunkFully(text) {
   const pieces = [];
   for await (const buf of synthesizeChunkStream(text)) pieces.push(buf);
   return Buffer.concat(pieces);
+}
+
+// ── Barge-in / cancellation ───────────────────────────────────────────────
+// A turn is cancelled by a client-side interrupt (POST /aida/voice-cancel).
+// Tracked here rather than per-request state since speakReply runs
+// fire-and-forget, well past the point where the original HTTP request
+// (or the POST /voice-cancel request) has already returned.
+const cancelledTurns = new Map(); // turnId -> cancelledAtMs
+
+function cancelTurn(turnId) {
+  cancelledTurns.set(turnId, Date.now());
+}
+
+function isCancelled(turnId) {
+  return cancelledTurns.has(turnId);
+}
+
+let sweepTimer = null;
+function startCancelSweeper() {
+  if (sweepTimer) return;
+  sweepTimer = setInterval(() => {
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const [id, ts] of cancelledTurns) if (ts < cutoff) cancelledTurns.delete(id);
+  }, 60 * 1000);
+  sweepTimer.unref?.();
+}
+startCancelSweeper();
+
+/**
+ * Plays one cached "thinking" filler line immediately — no live synthesis
+ * call in the critical path, since fillerPhrases.js caches each phrase after
+ * its first use. Called from routes/aida.js only when a reply is taking
+ * longer than config.aida.voice.fillerDelayMs; a fast reply never triggers
+ * this at all.
+ */
+async function playFiller({ io, room, chunkEvent, turnId }) {
+  try {
+    if (!io || !room || isCancelled(turnId)) return;
+    const { audio, mimeType } = await getRandomFillerAudio();
+    if (isCancelled(turnId)) return; // interrupted while the filler itself was loading
+    io.to(room).emit(chunkEvent, {
+      turnId,
+      seq: -1,
+      isFinal: false,
+      filler: true,
+      audioBase64: audio.toString('base64'),
+      mimeType,
+    });
+  } catch (e) {
+    // Best-effort only — the real reply's own pipeline still runs regardless
+    // of whether the filler played, so this is never worth surfacing as
+    // aida:voice-error.
+    console.error('[aida-voice] playFiller failed:', e);
+  }
 }
 
 /**
@@ -24,7 +79,7 @@ async function synthesizeChunkFully(text) {
 async function speakReply({ io, room, chunkEvent, errorEvent, turnId, text }) {
   try {
     const voice = config.aida.voice;
-    if (!voice.enabled || !io || !room || !text) return;
+    if (!voice.enabled || !io || !room || !text || isCancelled(turnId)) return;
 
     const truncated = text.length > voice.maxCharsPerReply ? text.slice(0, voice.maxCharsPerReply) : text;
     const chunks = splitIntoSpeechChunks(truncated);
@@ -42,15 +97,19 @@ async function speakReply({ io, room, chunkEvent, errorEvent, turnId, text }) {
     while (pending.length < concurrency && nextToStart < chunks.length) startOne();
 
     for (let seq = 0; seq < chunks.length; seq++) {
+      if (isCancelled(turnId)) break; // interrupted before this chunk's synthesis even started awaiting
+
       const result = await pending.shift();
-      if (nextToStart < chunks.length) startOne(); // keep the pipeline full as we consume
+      if (isCancelled(turnId)) break; // interrupted while that chunk was synthesizing — don't play it late
+
+      if (nextToStart < chunks.length && !isCancelled(turnId)) startOne(); // keep the pipeline full, unless already interrupted
 
       if (result && result.__error) {
         // Stop the whole reply on first failure rather than risk playing
         // later chunks after a silent gap — text was already delivered via
         // the normal chat response regardless, so nothing is lost.
         io.to(room).emit(errorEvent, { turnId, message: result.__error.message || 'Voice synthesis failed.' });
-        return;
+        break;
       }
 
       io.to(room).emit(chunkEvent, {
@@ -68,7 +127,9 @@ async function speakReply({ io, room, chunkEvent, errorEvent, turnId, text }) {
     try {
       if (io && room && errorEvent) io.to(room).emit(errorEvent, { turnId, message: 'Voice synthesis failed.' });
     } catch {}
+  } finally {
+    cancelledTurns.delete(turnId); // done with this turn either way — nothing left to check it against
   }
 }
 
-module.exports = { speakReply };
+module.exports = { speakReply, playFiller, cancelTurn, isCancelled };

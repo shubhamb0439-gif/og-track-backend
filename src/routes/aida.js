@@ -81,6 +81,7 @@ function createAidaRouter({ requireAuth, buildContext }) {
   // POST /chat — the one endpoint the conversation UI talks to.
   // Body: { message: string, pageContext?: { page, module, route, activeEntity } }
   router.post('/chat', async (req, res) => {
+    let fillerTimer = null;
     try {
       const { message, voice } = req.body || {};
       if (!message || typeof message !== 'string' || !message.trim()) {
@@ -89,7 +90,21 @@ function createAidaRouter({ requireAuth, buildContext }) {
       const context = buildContext(req);
       const history = sessionMemory.getHistory(context);
 
+      // turnId is generated BEFORE runTurn() (not after) so a "thinking"
+      // filler can be tagged with it and played the instant a reply is
+      // taking too long — without this, there's no id to correlate the
+      // filler audio to yet. Fast replies never trigger the timer at all.
+      const wantsVoice = voice === true && config.aida.voice.enabled;
+      const turnId = wantsVoice ? newTurnId() : null;
+      const target = wantsVoice ? voiceTargetFor(context) : null;
+      if (wantsVoice) {
+        fillerTimer = setTimeout(() => {
+          voiceSession.playFiller({ io: req.io, room: target.room, chunkEvent: target.chunkEvent, turnId });
+        }, config.aida.voice.fillerDelayMs);
+      }
+
       const { reply, toolCalls } = await runTurn(context, message.trim(), history);
+      clearTimeout(fillerTimer);
       sessionMemory.appendTurn(context, message.trim(), reply);
 
       const responseBody = { reply, toolCalls };
@@ -97,18 +112,31 @@ function createAidaRouter({ requireAuth, buildContext }) {
       // Voice is entirely additive: fire-and-forget, never awaited, and the
       // text response above is already complete and sent regardless of
       // whether speech synthesis succeeds, fails, or isn't configured at all.
-      if (voice === true && config.aida.voice.enabled) {
-        const turnId = newTurnId();
+      if (wantsVoice) {
         responseBody.turnId = turnId;
-        const { room, chunkEvent, errorEvent } = voiceTargetFor(context);
-        voiceSession.speakReply({ io: req.io, room, chunkEvent, errorEvent, turnId, text: reply });
+        voiceSession.speakReply({ io: req.io, room: target.room, chunkEvent: target.chunkEvent, errorEvent: target.errorEvent, turnId, text: reply });
       }
 
       res.json(responseBody);
     } catch (e) {
+      clearTimeout(fillerTimer);
       console.error('POST /aida/chat failed:', e);
       res.status(500).json({ error: e.message || 'AIDA could not process that request.' });
     }
+  });
+
+  // POST /voice-cancel — barge-in support: the frontend calls this the
+  // instant the user interrupts AIDA mid-speech, so speakReply's loop (which
+  // may still be running, well past this route's own response) stops
+  // synthesizing/emitting anything further for that turn. Does not (and
+  // cannot cheaply) abort an in-flight runTurn() itself — see voiceSession.js.
+  router.post('/voice-cancel', (req, res) => {
+    const { turnId } = req.body || {};
+    if (!turnId || typeof turnId !== 'string') {
+      return res.status(400).json({ error: 'turnId is required' });
+    }
+    voiceSession.cancelTurn(turnId);
+    res.json({ success: true });
   });
 
   // POST /voice-input — mirrors POST /chat, but the "message" arrives as a
@@ -121,6 +149,7 @@ function createAidaRouter({ requireAuth, buildContext }) {
   // JSON-encoded string, same shape /chat's pageContext already is once
   // express.json() has parsed it — parsed here for the same reason).
   router.post('/voice-input', handleAudioUpload, async (req, res) => {
+    let fillerTimer = null;
     try {
       if (!config.aida.speechToText.enabled) {
         return res.status(503).json({ error: 'Voice input is not configured on this server yet (missing OPENAI_API_KEY for transcription).' });
@@ -153,17 +182,29 @@ function createAidaRouter({ requireAuth, buildContext }) {
       const context = buildContext(req);
       const history = sessionMemory.getHistory(context);
 
+      // Same early-turnId + filler race as POST /chat (see there for why) —
+      // voice-input is a voice-in/voice-out flow, so this always wants voice
+      // whenever it's configured, not conditional on a request flag.
+      const wantsVoice = config.aida.voice.enabled;
+      const turnId = newTurnId();
+      const target = wantsVoice ? voiceTargetFor(context) : null;
+      if (wantsVoice) {
+        fillerTimer = setTimeout(() => {
+          voiceSession.playFiller({ io: req.io, room: target.room, chunkEvent: target.chunkEvent, turnId });
+        }, config.aida.voice.fillerDelayMs);
+      }
+
       const { reply, toolCalls } = await runTurn(context, transcript, history);
+      clearTimeout(fillerTimer);
       sessionMemory.appendTurn(context, transcript, reply);
 
-      const turnId = newTurnId();
-      if (config.aida.voice.enabled) {
-        const { room, chunkEvent, errorEvent } = voiceTargetFor(context);
-        voiceSession.speakReply({ io: req.io, room, chunkEvent, errorEvent, turnId, text: reply });
+      if (wantsVoice) {
+        voiceSession.speakReply({ io: req.io, room: target.room, chunkEvent: target.chunkEvent, errorEvent: target.errorEvent, turnId, text: reply });
       }
 
       res.json({ transcript, reply, turnId, toolCalls: toolCalls || null });
     } catch (e) {
+      clearTimeout(fillerTimer);
       console.error('POST /aida/voice-input failed:', e);
       res.status(500).json({ error: e.message || 'AIDA could not process that voice message.' });
     }
