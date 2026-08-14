@@ -63,6 +63,7 @@ CREATE TABLE dbo.sprints (
     start_date      DATE           NULL,
     end_date        DATE           NULL,
     status          NVARCHAR(20)   NOT NULL DEFAULT 'planned',  -- planned | active | completed
+    goal            NVARCHAR(MAX)  NULL,
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at      DATETIME2      NULL,
     extra_json      NVARCHAR(MAX)  NULL,
