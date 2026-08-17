@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const config = require('../config');
+const { requireAuth } = require('../utils/auth');
 const router = express.Router();
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
@@ -113,9 +114,40 @@ router.get('/user/:userId', async (req, res) => {
 });
 
 // ── Org-wide (last 300) ──────────────────────────────────────────────────────
-router.get('/all', async (req, res) => {
+// A Manager only sees attendance for their own team (the devs/testers on
+// projects they manage, per the managers[]/developers[]/testers[] arrays in
+// projects.extra_json — there's no dedicated teams table). This is derived
+// server-side from the authenticated user (req.auth.userId), never from a
+// client-supplied team/manager id, so a manager can't widen their own view
+// by tampering with the request. Superadmin still sees everyone.
+router.get('/all', requireAuth, async (req, res) => {
   try {
-    const rows = await req.db('attendance').orderBy('date', 'desc').limit(300);
+    if (req.auth.slug !== req.company.slug) {
+      return res.status(401).json({ error: 'Token is not valid for this company' });
+    }
+
+    let teamNames = null; // null = no restriction (superadmin)
+    if (req.auth.role === 'manager') {
+      const manager = await req.db('users').where({ id: req.auth.userId }).first();
+      if (!manager) return res.status(401).json({ error: 'User not found' });
+
+      const projects = await req.db('projects');
+      const names = new Set([manager.name]);
+      for (const p of projects) {
+        const extra = p.extra_json ? JSON.parse(p.extra_json) : {};
+        if ((extra.managers || []).includes(manager.name)) {
+          (extra.developers || []).forEach(n => names.add(n));
+          (extra.testers || []).forEach(n => names.add(n));
+        }
+      }
+      teamNames = [...names];
+    } else if (req.auth.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Not authorized to view organization-wide attendance' });
+    }
+
+    let q = req.db('attendance').orderBy('date', 'desc').limit(300);
+    if (teamNames) q = q.whereIn('user_name', teamNames);
+    const rows = await q;
     res.json(rows.map(mapAtt));
   } catch (e) { console.error('GET /all failed:', e); res.status(500).json({ error: 'Could not load attendance records. Please try again.' }); }
 });

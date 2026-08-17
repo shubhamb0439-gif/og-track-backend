@@ -5,7 +5,7 @@ const router = express.Router();
 const dOnly = (v) => { if (!v) return null; return (v instanceof Date) ? v.toISOString().slice(0,10) : String(v).slice(0,10); };
 const dTime = (v) => { if (!v) return null; return (v instanceof Date) ? v.toISOString() : new Date(v).toISOString(); };
 
-// Frontend expects: id, projectId, name, startDate, endDate, status, goal, createdAt
+// Frontend expects: id, projectId, name, startDate, endDate, status, goal, createdAt, completedAt
 const mapSprint = (r) => r && ({
   id: r.id,
   projectId: r.project_id,
@@ -15,6 +15,7 @@ const mapSprint = (r) => r && ({
   status: r.status,
   goal: r.goal || null,
   createdAt: dTime(r.created_at),
+  completedAt: dTime(r.completed_at),
   extra: r.extra_json ? JSON.parse(r.extra_json) : {},
 });
 
@@ -50,13 +51,14 @@ router.post('/', async (req, res) => {
 // PATCH /api/:slug/sprints/:id — frontend sends camelCase fields
 router.patch('/:id', async (req, res) => {
   try {
-    const { startDate, endDate, projectId, ...rest } = req.body;
+    const { startDate, endDate, projectId, completedAt, ...rest } = req.body;
     const upd = { ...rest, updated_at: new Date() };
     if (startDate !== undefined) upd.start_date = startDate;
     if (endDate !== undefined) upd.end_date = endDate;
     if (projectId !== undefined) upd.project_id = projectId;
+    if (completedAt !== undefined) upd.completed_at = completedAt;
     // remove camelCase keys that would hit unknown-column errors
-    delete upd.startDate; delete upd.endDate; delete upd.projectId; delete upd.createdAt; delete upd.extra;
+    delete upd.startDate; delete upd.endDate; delete upd.projectId; delete upd.createdAt; delete upd.completedAt; delete upd.extra;
     await req.db('sprints').where({ id: req.params.id }).update(upd);
     const row = await req.db('sprints').where({ id: req.params.id }).first();
     if (!row) return res.status(404).json({ error: 'Sprint not found' });

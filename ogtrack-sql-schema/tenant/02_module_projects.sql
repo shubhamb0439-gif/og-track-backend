@@ -65,6 +65,7 @@ CREATE TABLE dbo.sprints (
     status          NVARCHAR(20)   NOT NULL DEFAULT 'planned',  -- planned | active | completed
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at      DATETIME2      NULL,
+    completed_at    DATETIME2      NULL,
     extra_json      NVARCHAR(MAX)  NULL,
     CONSTRAINT CK_sprints_extra_json CHECK (extra_json IS NULL OR ISJSON(extra_json) = 1)
 );
