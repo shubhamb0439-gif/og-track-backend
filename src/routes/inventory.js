@@ -470,32 +470,43 @@ router.post('/purchases/:id/receive', async (req, res) => {
 
     const lines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
     const touchedItemIds = new Set();
-    for (const line of lines) {
-      const outstanding = Number(line.quantity_ordered) - Number(line.quantity_received || 0);
-      if (outstanding > 0) {
-        await req.db('inv_purchase_items').where({ id: line.id }).update({ quantity_received: line.quantity_ordered });
-        const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
-          + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
-          / Number(line.quantity_ordered);
-        await createLot(req.db, {
-          itemId: line.item_id,
-          lotRef: (lotRefs && lotRefs[line.id]) || `${purchase.po_number}-${line.id.slice(-6)}`,
-          vendorId: purchase.vendor_id, purchaseItemId: line.id,
-          quantity: outstanding, unitCost: landedUnitCost,
-          receivedDate: new Date(), source: 'purchase',
-        });
-        touchedItemIds.add(line.item_id);
+
+    // Receiving updates the line, creates its lot, and marks the purchase
+    // received together — if any step fails partway (e.g. a transient DB
+    // disconnect), the whole receipt rolls back instead of leaving a purchase
+    // marked "received" with a missing stock lot (the exact drift that
+    // required a manual reconciliation across 874 items previously).
+    await req.db.transaction(async (trx) => {
+      for (const line of lines) {
+        const outstanding = Number(line.quantity_ordered) - Number(line.quantity_received || 0);
+        if (outstanding > 0) {
+          await trx('inv_purchase_items').where({ id: line.id }).update({ quantity_received: line.quantity_ordered });
+          const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
+            + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
+            / Number(line.quantity_ordered);
+          await createLot(trx, {
+            itemId: line.item_id,
+            lotRef: (lotRefs && lotRefs[line.id]) || `${purchase.po_number}-${line.id.slice(-6)}`,
+            vendorId: purchase.vendor_id, purchaseItemId: line.id,
+            quantity: outstanding, unitCost: landedUnitCost,
+            receivedDate: new Date(), source: 'purchase',
+          });
+          touchedItemIds.add(line.item_id);
+        }
       }
-    }
+      for (const itemId of touchedItemIds) {
+        await recomputeItemStock(trx, itemId);
+      }
+      await trx('inv_purchases').where({ id: req.params.id }).update({
+        status: 'received', received_date: new Date(), updated_at: new Date(),
+        ...(invoiceNumber !== undefined ? { invoice_number: invoiceNumber } : {}),
+      });
+    });
+
     for (const itemId of touchedItemIds) {
-      await recomputeItemStock(req.db, itemId);
       const savedItem = await req.db('inv_items').where({ id: itemId }).first();
       req.io.to(req.company.slug).emit('inv:item_updated', mapItem(savedItem));
     }
-    await req.db('inv_purchases').where({ id: req.params.id }).update({
-      status: 'received', received_date: new Date(), updated_at: new Date(),
-      ...(invoiceNumber !== undefined ? { invoice_number: invoiceNumber } : {}),
-    });
     const saved = await req.db('inv_purchases').where({ id: req.params.id }).first();
     req.io.to(req.company.slug).emit('inv:purchase_updated', mapPurchase(saved));
     res.json(mapPurchase(saved));
@@ -520,49 +531,58 @@ router.post('/purchases/:id/receive-lines', async (req, res) => {
     const existingLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
     const touchedItemIds = new Set();
 
-    for (const update of lines) {
-      const line = existingLines.find(l => l.id === update.purchaseItemId);
-      if (!line) continue;
-      const newReceived = Math.max(0, Math.min(Number(line.quantity_ordered), Number(update.quantityReceived || 0)));
-      const delta = newReceived - Number(line.quantity_received || 0);
-      if (delta === 0) continue;
+    // Same atomicity guarantee as /receive above: line update, lot
+    // creation/consumption, and the purchase's resulting status all commit
+    // or roll back together.
+    await req.db.transaction(async (trx) => {
+      for (const update of lines) {
+        const line = existingLines.find(l => l.id === update.purchaseItemId);
+        if (!line) continue;
+        const newReceived = Math.max(0, Math.min(Number(line.quantity_ordered), Number(update.quantityReceived || 0)));
+        const delta = newReceived - Number(line.quantity_received || 0);
+        if (delta === 0) continue;
 
-      if (delta > 0) {
-        const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
-          + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
-          / Number(line.quantity_ordered);
-        await createLot(req.db, {
-          itemId: line.item_id,
-          lotRef: `${purchase.po_number || purchase.id}-${line.id.slice(-6)}`,
-          vendorId: purchase.vendor_id, purchaseItemId: line.id,
-          quantity: delta, unitCost: landedUnitCost,
-          receivedDate: new Date(), source: 'purchase',
-        });
-      } else {
-        // Receiving was reduced (e.g. correcting an over-receipt) — consume
-        // back out of that item's stock. This is a rare correction path, so
-        // we accept it may touch a different (newer) lot than the one this
-        // receipt originally created; recomputeItemStock keeps totals correct.
-        await consumeStockFIFO(req.db, line.item_id, Math.abs(delta));
+        if (delta > 0) {
+          const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
+            + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
+            / Number(line.quantity_ordered);
+          await createLot(trx, {
+            itemId: line.item_id,
+            lotRef: `${purchase.po_number || purchase.id}-${line.id.slice(-6)}`,
+            vendorId: purchase.vendor_id, purchaseItemId: line.id,
+            quantity: delta, unitCost: landedUnitCost,
+            receivedDate: new Date(), source: 'purchase',
+          });
+        } else {
+          // Receiving was reduced (e.g. correcting an over-receipt) — consume
+          // back out of that item's stock. This is a rare correction path, so
+          // we accept it may touch a different (newer) lot than the one this
+          // receipt originally created; recomputeItemStock keeps totals correct.
+          await consumeStockFIFO(trx, line.item_id, Math.abs(delta));
+        }
+        await trx('inv_purchase_items').where({ id: line.id }).update({ quantity_received: newReceived });
+        touchedItemIds.add(line.item_id);
       }
-      await req.db('inv_purchase_items').where({ id: line.id }).update({ quantity_received: newReceived });
-      touchedItemIds.add(line.item_id);
-    }
 
+      for (const itemId of touchedItemIds) {
+        await recomputeItemStock(trx, itemId);
+      }
+
+      const refreshedLines = await trx('inv_purchase_items').where({ purchase_id: req.params.id });
+      const totalOrdered = refreshedLines.reduce((s, l) => s + Number(l.quantity_ordered), 0);
+      const totalReceived = refreshedLines.reduce((s, l) => s + Number(l.quantity_received || 0), 0);
+      const newStatus = totalReceived <= 0 ? 'pending' : (totalReceived >= totalOrdered ? 'received' : 'partial');
+      await trx('inv_purchases').where({ id: req.params.id }).update({
+        status: newStatus, updated_at: new Date(),
+        ...(newStatus === 'received' ? { received_date: new Date() } : {}),
+      });
+    });
+
+    const refreshedLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
     for (const itemId of touchedItemIds) {
-      await recomputeItemStock(req.db, itemId);
       const savedItem = await req.db('inv_items').where({ id: itemId }).first();
       req.io.to(req.company.slug).emit('inv:item_updated', mapItem(savedItem));
     }
-
-    const refreshedLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
-    const totalOrdered = refreshedLines.reduce((s, l) => s + Number(l.quantity_ordered), 0);
-    const totalReceived = refreshedLines.reduce((s, l) => s + Number(l.quantity_received || 0), 0);
-    const newStatus = totalReceived <= 0 ? 'pending' : (totalReceived >= totalOrdered ? 'received' : 'partial');
-    await req.db('inv_purchases').where({ id: req.params.id }).update({
-      status: newStatus, updated_at: new Date(),
-      ...(newStatus === 'received' ? { received_date: new Date() } : {}),
-    });
 
     const saved = await req.db('inv_purchases').where({ id: req.params.id }).first();
     req.io.to(req.company.slug).emit('inv:purchase_updated', mapPurchase(saved));
