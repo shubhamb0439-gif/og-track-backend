@@ -11,9 +11,11 @@ function mapTestCase(row) {
     projectId: row.project_id,
     title: row.title,
     description: row.description,
+    precondition: row.precondition,
     expectedResult: row.expected_result,
     actualResult: row.actual_result,
     status: row.status,
+    isBugged: !!row.is_bugged,
     createdBy: row.created_by,
     updatedBy: row.updated_by,
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : (row.created_at || null),
@@ -43,7 +45,7 @@ router.get('/:id', async (req, res) => {
 // POST /api/:slug/test-cases — Tester only
 router.post('/', requireRole('tester'), async (req, res) => {
   try {
-    const { projectId, title, description, expectedResult, actualResult, status, ...rest } = req.body;
+    const { projectId, title, description, precondition, expectedResult, actualResult, status, isBugged, ...rest } = req.body;
     if (!projectId || !title) return res.status(400).json({ error: 'projectId and title are required' });
 
     const project = await req.db('projects').where({ id: projectId }).first();
@@ -59,9 +61,11 @@ router.post('/', requireRole('tester'), async (req, res) => {
       project_id: projectId,
       title,
       description: description || null,
+      precondition: precondition || null,
       expected_result: expectedResult || null,
       actual_result: actualResult || null,
       status: status || 'Not Run',
+      is_bugged: !!isBugged,
       created_by: req.auth.userId,
       created_at: now,
       extra_json: Object.keys(rest).length ? JSON.stringify(rest) : null,
@@ -80,13 +84,15 @@ router.patch('/:id', requireRole('tester'), async (req, res) => {
     const existing = await req.db('test_cases').where({ id }).first();
     if (!existing) return res.status(404).json({ error: 'Test case not found' });
 
-    const { title, description, expectedResult, actualResult, status } = req.body;
+    const { title, description, precondition, expectedResult, actualResult, status, isBugged } = req.body;
     const updates = { updated_at: new Date(), updated_by: req.auth.userId };
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
+    if (precondition !== undefined) updates.precondition = precondition;
     if (expectedResult !== undefined) updates.expected_result = expectedResult;
     if (actualResult !== undefined) updates.actual_result = actualResult;
     if (status !== undefined) updates.status = status;
+    if (isBugged !== undefined) updates.is_bugged = !!isBugged;
 
     await req.db('test_cases').where({ id }).update(updates);
     const row = mapTestCase(await req.db('test_cases').where({ id }).first());
