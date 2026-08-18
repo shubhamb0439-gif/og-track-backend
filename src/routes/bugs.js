@@ -4,6 +4,7 @@ const { nextCounter, formatCode } = require('../utils/counters');
 const router = express.Router();
 
 const CLOSED_STATUSES = new Set(['Resolved', 'Fixed', 'Closed', "Won't Fix", 'Wont Fix', 'Not a Bug', 'Expected Behavior', 'NAB']);
+const ALLOWED_FOUND_BY = new Set(['Automation', 'Manual']);
 
 // Rehydrate a DB row into the shape the frontend expects (parse JSON columns).
 function rowToBug(row) {
@@ -53,6 +54,13 @@ router.post('/', async (req, res) => {
     const silent = body._silent === true;
     delete body._silent;
     delete body.companyId; // legacy field from old multi-tenant model — no longer used
+
+    if (!ALLOWED_FOUND_BY.has(body.foundBy)) {
+      // Excel-imported bugs (_silent) predate this field and don't collect it per row —
+      // default rather than reject so bulk import doesn't start failing every row.
+      if (silent) body.foundBy = 'Manual';
+      else return res.status(400).json({ error: 'foundBy is required and must be "Automation" or "Manual"' });
+    }
 
     // Frontend sends 'default' (or nothing) when no real project is selected.
     // project_id is a FK to projects(id), so coerce anything non-existent to NULL.
