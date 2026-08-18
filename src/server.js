@@ -7,6 +7,7 @@ const coreDb = require('./db/core');
 
 const resolveTenant = require('./middleware/resolveTenant');
 const requireModule = require('./middleware/requireModule');
+const { requireAuth } = require('./utils/auth');
 
 const companiesRoutes = require('./routes/companies');
 const masteradminRoutes = require('./routes/masteradmin');
@@ -15,6 +16,7 @@ const projectsRoutes = require('./routes/projects');
 const bugsRoutes = require('./routes/bugs');
 const sprintsRoutes = require('./routes/sprints');
 const storiesRoutes = require('./routes/stories');
+const testCasesRoutes = require('./routes/testCases');
 const subTicketsRoutes = require('./routes/sub_tickets');
 const rolesRoutes = require('./routes/roles');
 const attendanceRoutes = require('./routes/attendance');
@@ -79,6 +81,9 @@ app.use('/api/:slug/projects', resolveTenant, requireModule('projects'), project
 app.use('/api/:slug/bugs', resolveTenant, requireModule('bugs'), bugsRoutes);
 app.use('/api/:slug/sprints', resolveTenant, requireModule('sprints'), sprintsRoutes);
 app.use('/api/:slug/stories', resolveTenant, requireModule('sprints'), storiesRoutes);
+// Test Cases — GET is open to any authenticated tenant user; POST/PATCH/DELETE
+// are further gated to the 'tester' role inside testCasesRoutes via requireRole.
+app.use('/api/:slug/test-cases', resolveTenant, requireModule('test_cases'), requireAuth, testCasesRoutes);
 app.use('/api/:slug/sub-tickets', resolveTenant, requireModule('sub_tickets'), subTicketsRoutes);
 app.use('/api/:slug/roles', resolveTenant, rolesRoutes);
 app.use('/api/:slug/attendance', resolveTenant, requireModule('attendance'), attendanceRoutes);

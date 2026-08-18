@@ -38,6 +38,7 @@ const MODULE_TO_SCRIPT = {
   inventory:      '09_module_inventory.sql',
   manufacturing:  '10_module_manufacturing.sql',
   sales:          '11_module_sales.sql',
+  test_cases:     '12_module_test_cases.sql',
 };
 
 // Some modules' tables have foreign keys into another module's tables (e.g.
@@ -134,7 +135,7 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   const orderedScripts = ['01_core_tenant.sql','02_module_projects.sql',
     '03_module_requests.sql','04_module_attendance.sql','05_module_messaging.sql',
     '06_module_accounting.sql','07_module_hr.sql','08_module_crm.sql','09_module_inventory.sql',
-    '10_module_manufacturing.sql','11_module_sales.sql'].filter(s => scriptsNeeded.has(s));
+    '10_module_manufacturing.sql','11_module_sales.sql','12_module_test_cases.sql'].filter(s => scriptsNeeded.has(s));
 
   for (const scriptFile of orderedScripts) {
     const step = `run_${scriptFile}`;
