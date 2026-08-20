@@ -55,8 +55,8 @@ Requirements:
 
 **Status: backend is built and verified** — `src/aida/voice/` (chunked, low-latency
 TTS via ElevenLabs, delivered over the existing socket.io connection). See
-`README.md`'s "Voice — ElevenLabs TTS" section for the full backend design if you want
-the context; this prompt only needs the contract below.
+`README.md`'s "Voice — streaming, personality, interruption" section for the full
+backend design if you want the context; this prompt only needs the contract below.
 
 ```
 Wire up AIDA voice playback using a new socket.io event, and enable the existing
@@ -137,8 +137,9 @@ addition/reorganization, not a removal of anything that currently works.
 ## 4. Barge-in — spacebar interrupts AIDA mid-reply and starts listening
 
 **Status: backend is built and verified** — `POST /aida/voice-cancel` (see
-`README.md`'s "Voice UX tuning" section). Verified live: cancelling a real in-flight
-reply produced zero further audio chunks, even for a long multi-sentence answer.
+`README.md`'s "Interruption / barge-in" section). Verified live: cancelling a real
+in-flight reply produced zero further audio chunks, even for a long multi-sentence
+answer — and, per prompt 6 below, can now also abort the LLM call generating it.
 
 ```
 Add a spacebar-triggered interrupt for AIDA's voice replies.
@@ -174,3 +175,174 @@ Not started. Waiting on you to provide the HTML file and implementation instruct
 The integration surface it needs to hook into either way: `POST /chat`, `GET /history`,
 `DELETE /session`, `GET /tools` (all documented in `README.md`), plus the voice event
 contract in prompt 2 above.
+
+---
+
+## 6. Real-time voice upgrade (streaming, personality, interruption) — ONE required fix
+
+**Status: backend upgraded and verified — FRONTEND CHANGE REQUIRED: YES, one specific fix
+(see below).** I originally wrote this section saying no frontend change was needed —
+that was wrong, found from your own browser console log. Read the "REQUIRED FIX" block
+first; the rest of this section is background/optional.
+
+**REQUIRED FIX — paste this to your frontend session as-is:**
+
+```
+Fix a real bug in how the AIDA voice chat screen accepts incoming aida:voice-chunk
+events, found from this exact console log pattern:
+
+  [AIDA voice] chunk received  {turnId: 'voice_...', seq: -1, ..., currentTurn: null}
+  [AIDA voice] dropped — turnId does not match the current turn
+  [AIDA voice] chunk received  {turnId: 'voice_...', seq: 0, ..., currentTurn: null}
+  [AIDA voice] dropped — turnId does not match the current turn
+  ... (repeats for several more chunks) ...
+  [AIDA voice] chunk received  {turnId: 'voice_...', seq: 8, ..., currentTurn: 'voice_...'}
+  (finally accepted, seq 8 onward plays)
+
+Root cause: `currentTurn` is currently only ever set from the POST /chat (or
+/voice-input) HTTP response body's `turnId` field. AIDA's backend now streams audio
+while the LLM is still generating text, so `aida:voice-chunk` events (and the filler
+event, seq: -1) can legitimately arrive over the socket BEFORE that HTTP response ever
+comes back — especially for a longer reply. Every chunk that arrives before the HTTP
+response is currently being silently dropped, because `currentTurn` is still null at
+that point and the code only accepts a chunk whose turnId matches it exactly.
+
+Find wherever `currentTurn` is compared against an incoming chunk's `turnId` (the code
+that logs "dropped — turnId does not match the current turn") and change the ADOPTION
+rule: if `currentTurn` is currently null/unset (no turn is being tracked yet), ADOPT the
+incoming chunk's turnId as the new `currentTurn` instead of dropping it — then continue
+handling that chunk normally (play its audio, don't just adopt-and-discard it). Once
+`currentTurn` is set, later chunks compared against a DIFFERENT turnId should still be
+dropped exactly as today — that part of the logic is correct and is what makes barge-in
+work; only the "reject because currentTurn happens to still be null" case needs to
+become "adopt instead of reject."
+
+Also make sure whatever code currently sets `currentTurn = turnId` from the HTTP
+response body still runs — it becomes a harmless no-op re-assignment to the same value
+once a chunk has already set it, and is still needed as a fallback for the case where
+the HTTP response genuinely does arrive first (e.g. a very short reply).
+
+Do not change anything else about chunk playback, ordering, or the barge-in/interrupt
+logic — only this adoption rule.
+```
+
+**Why this matters**: this single bug was silently dropping BOTH real audio chunks for
+any reply long enough that TTS starts before the LLM finishes, AND the filler line
+(`seq: -1`) on every single turn — meaning it looked like "no filler ever plays" and "no
+audio on long replies" were two separate bugs, when they were actually the same one, on
+the frontend, not the backend. Short replies mostly hid it, since the HTTP response
+usually still won that particular race for those.
+
+---
+
+The rest of this section (background, unchanged from the original write-up): none of the
+above changes the wire contract prompt 2 already documented — `aida:voice-chunk`
+(`{ turnId, seq, isFinal, audioBase64, mimeType }`), `aida:voice-error`
+(`{ turnId, message }`), and `POST /aida/voice-cancel` (`{ turnId }`) are byte-for-byte
+the same shape as before. The existing chunk-queue playback (played in strict `seq`
+order, not waiting for `isFinal`) already handles this correctly once the fix above is
+in — it just now receives chunks sooner and possibly more of them for a longer reply,
+which it was already built to handle (multiple ordered chunks per turn) once they
+aren't being dropped at the door.
+
+Two *optional* enhancements this now makes possible, only worth doing if you want to
+polish the barge-in experience further — skip entirely if the current spacebar-interrupt
+behavior (prompt 4) already feels good enough:
+
+```
+Optional AIDA voice UX polish — only pursue this if the current barge-in (spacebar
+interrupt, prompt 4 above) doesn't already feel responsive enough for real usage.
+
+Context: previously, a turnId only became known to the frontend once the full chat
+reply arrived (embedded in the same event as the first audio/filler chunk). AIDA's
+backend now streams the reply and can start sending audio chunks for a turn WHILE the
+LLM is still generating the rest of it — meaning the interrupt affordance could be made
+available slightly earlier for a snappier feel, though the existing "AIDA is speaking"
+state already covers the common case.
+
+1. If there's any UI state that gates showing the "interrupt AIDA" affordance (e.g. a
+   visible stop button, not just the spacebar shortcut) on the full chat response having
+   returned, consider gating it on the FIRST `aida:voice-chunk` (or filler) event for a
+   turnId instead — that event can now arrive noticeably earlier. Not required if the
+   affordance is already keyed off "AIDA is speaking" audio state rather than the HTTP
+   response.
+2. The `/chat` and `/voice-input` JSON responses may now additionally include
+   `interrupted: true` (the turn was cut short by a barge-in) or `degraded: true` (a
+   transient LLM/TTS error occurred but AIDA still returned a partial/fallback reply).
+   Both are purely additive — safe to ignore — but if you want, render a subtle
+   indicator (e.g. a small "cut short" tag on that message bubble) when `interrupted` is
+   present. Do not treat `degraded` as an error state — the reply is still valid and
+   should display normally either way.
+
+Do not change the core audio-chunk playback logic, the turnId-binding logic, or
+anything else already built for prompt 2/4 above — none of that needs to change.
+```
+
+---
+
+## 7. Instant local "thinking" sound on recording-stop (zero network latency)
+
+**Status: backend built and verified — new static files + endpoint, frontend change
+required.** Even with the backend's own filler mechanism (prompt 2/6) starting as early
+as physically possible on the server side, it can never be truly instant — it still
+needs the recording to finish uploading and the server to receive it first. The only way
+to get a genuinely zero-latency "AIDA heard you and is thinking" reaction is to play a
+short pre-recorded sound **locally, from a cached file, the instant recording stops** —
+before the upload even begins.
+
+New static endpoint: `GET /aida-fillers/manifest.json` (no auth — these are generic,
+non-tenant audio clips) returns:
+```json
+{
+  "thinking": [
+    { "file": "thinking/0.mp3", "text": "[sighs] Ummmmm, let me check on that...", "bytes": 55633 },
+    { "file": "thinking/1.mp3", "text": "Hmmm... one second...", "bytes": 28884 },
+    { "file": "thinking/2.mp3", "text": "Okay, let me look into that...", "bytes": 32645 },
+    ... 52 more (55 total) ...
+  ],
+  "acknowledgement": [ ... ], "surprise": [ ... ], "amusement": [ ... ], "empathy": [ ... ]
+}
+```
+Each listed file is fetchable directly at `GET /aida-fillers/<file>` (e.g.
+`/aida-fillers/thinking/0.mp3`), real MP3 audio, ready to play as-is. The full
+`thinking` category is ~2MB total (55 short clips) — see the sizing note in step 1
+below for when to fetch it.
+
+```
+Add instant, zero-latency local filler playback for AIDA voice input, using pre-recorded
+audio files the backend now serves — no network call needed at the moment it plays.
+
+1. Fetch GET /aida-fillers/manifest.json once and cache the response, then prefetch the
+   audio files listed under the "thinking" category specifically (55 short clips, e.g.
+   "Ummmmm, let me check on that...", "Hmmm... one second...") — these are the only ones
+   relevant here, since at record-stop time AIDA doesn't know what the user said yet, so
+   only a generic "thinking" reaction makes sense. The whole category is ~2MB, which is
+   fine as a one-time app-load cost relying on normal browser HTTP caching for repeat
+   visits, but if you'd rather avoid that upfront hit, fetch/cache it lazily the moment
+   the user STARTS recording (mic press) rather than on app load — each file is small
+   (20-55KB) and will finish downloading well within the time the user is still talking,
+   so it's still ready the instant they stop. Either timing works; just don't defer the
+   fetch until AFTER recording stops, or it defeats the point. Preloading them (e.g. via `Audio`
+   objects with `preload="auto"`, or fetching as blobs up front) avoids any decode delay
+   on first playback.
+2. The INSTANT the user finishes speaking (spacebar release / stop-recording, whichever
+   currently ends the recording and starts the upload to POST /voice-input), before
+   that upload even starts: pick one of the cached "thinking" clips at random (avoid
+   repeating the same one twice in a row) and play it immediately, locally — this must
+   not wait on the recording upload, transcription, or anything server-side.
+3. AIDA's backend ALSO still sends its own filler over the socket (the existing
+   aida:voice-chunk event with filler: true) as a fallback/general-purpose mechanism —
+   it's not being removed. To avoid hearing two overlapping "thinking" reactions back to
+   back for the same turn, track whether a local filler already played for the turn
+   currently in flight; if the incoming aida:voice-chunk event has filler: true AND a
+   local filler already played for this turn, skip PLAYING that particular event's
+   audio — but still process it normally for everything else (in particular, still
+   adopt its turnId as the current turn if one isn't set yet, per the fix in prompt 6 —
+   don't skip that part, only skip the audio playback for this one event).
+4. Reset the "local filler already played" flag at the start of each new recording, so
+   it's evaluated fresh per turn.
+
+Do not change how real (non-filler) audio chunks are handled, the turnId adoption logic
+from prompt 6, or the existing server-triggered filler mechanism itself — this is purely
+additive, a faster reaction layered on top of what already exists.
+```

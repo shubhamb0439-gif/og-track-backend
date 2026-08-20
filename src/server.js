@@ -112,6 +112,16 @@ app.use('/api/:slug/aida', resolveTenant, tenantAidaRouter);
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));
 
+// Pre-generated AIDA filler audio (src/aida/voice/fillerPhrases.js's
+// FILLERS_BY_CATEGORY, synthesized once via the generation script — see
+// docs/FRONTEND_PROMPTS.md prompt 7) — static, non-tenant, non-sensitive
+// audio clips, so no auth/resolveTenant gate like the rest of the API.
+// The frontend fetches manifest.json once, caches the files locally, and
+// plays one INSTANTLY (no server round trip) the moment the user finishes
+// speaking/typing, rather than waiting on the existing socket-emitted
+// filler (which still exists as the server-side fallback/general case).
+app.use('/aida-fillers', express.static(require('path').join(__dirname, '..', 'public', 'aida-fillers')));
+
 // ── Fallback error handler ────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err);

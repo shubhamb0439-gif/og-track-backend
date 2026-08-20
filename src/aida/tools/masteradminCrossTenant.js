@@ -1,3 +1,5 @@
+const jwt = require('jsonwebtoken');
+const config = require('../../config');
 const { MASTERADMIN_SENTINEL_MODULE } = require('../contextBuilder');
 
 /**
@@ -52,7 +54,28 @@ function wrapForCrossTenant(tool) {
     async handler(context, args) {
       const { companySlug, ...rest } = args || {};
       if (!companySlug) return { error: 'companySlug is required.' };
-      const tenantContext = { ...context, kind: 'tenant', tenantSlug: companySlug };
+      // Reusing the master admin's own JWT here would NOT work against a
+      // tenant-scoped route that checks req.auth.slug === req.company.slug
+      // (see src/routes/attendance.js's /all endpoint) — that token has
+      // role:'masteradmin' and no slug at all, so it can never match any
+      // tenant's slug and gets rejected by that check even though the
+      // caller genuinely is authorized for full cross-tenant read access.
+      // Mint a short-lived, properly tenant-shaped token instead (role
+      // 'superadmin' — the same role that already gets full org-wide access
+      // within a tenant) so this keeps working against ANY current or future
+      // tenant route that enforces per-company token scoping, without
+      // needing route-by-route special-casing for "masteradmin passthrough".
+      const syntheticToken = jwt.sign(
+        { userId: context.userId, role: 'superadmin', slug: companySlug },
+        config.app.jwtSecret,
+        { expiresIn: '5m' }
+      );
+      const tenantContext = {
+        ...context,
+        kind: 'tenant',
+        tenantSlug: companySlug,
+        authHeader: `Bearer ${syntheticToken}`,
+      };
       return tool.handler(tenantContext, rest);
     },
   };

@@ -1,0 +1,352 @@
+{
+  "thinking": [
+    {
+      "file": "thinking/0.mp3",
+      "text": "[sighs] Ummmmm, let me check on that...",
+      "bytes": 53125
+    },
+    {
+      "file": "thinking/1.mp3",
+      "text": "Hmmm... one second...",
+      "bytes": 31391
+    },
+    {
+      "file": "thinking/2.mp3",
+      "text": "Okay, let me look into that...",
+      "bytes": 28884
+    },
+    {
+      "file": "thinking/3.mp3",
+      "text": "Give me just a moment...",
+      "bytes": 28884
+    },
+    {
+      "file": "thinking/4.mp3",
+      "text": "Let's see here...",
+      "bytes": 18435
+    },
+    {
+      "file": "thinking/5.mp3",
+      "text": "Hold on, let me pull that up...",
+      "bytes": 26376
+    },
+    {
+      "file": "thinking/6.mp3",
+      "text": "Okay, hang on a sec...",
+      "bytes": 22614
+    },
+    {
+      "file": "thinking/7.mp3",
+      "text": "Right, let me think...",
+      "bytes": 28884
+    },
+    {
+      "file": "thinking/8.mp3",
+      "text": "Hmm... give me a beat...",
+      "bytes": 26376
+    },
+    {
+      "file": "thinking/9.mp3",
+      "text": "One sec, let me check...",
+      "bytes": 31391
+    },
+    {
+      "file": "thinking/10.mp3",
+      "text": "[sighs] Okay, let's see...",
+      "bytes": 46856
+    },
+    {
+      "file": "thinking/11.mp3",
+      "text": "Alright, let me dig into that...",
+      "bytes": 26376
+    },
+    {
+      "file": "thinking/12.mp3",
+      "text": "Umm, okay, one moment...",
+      "bytes": 48110
+    },
+    {
+      "file": "thinking/13.mp3",
+      "text": "Let me take a look...",
+      "bytes": 23868
+    },
+    {
+      "file": "thinking/14.mp3",
+      "text": "Hmmm, checking on that now...",
+      "bytes": 38915
+    },
+    {
+      "file": "thinking/15.mp3",
+      "text": "Okay... let me see what I've got...",
+      "bytes": 37661
+    },
+    {
+      "file": "thinking/16.mp3",
+      "text": "Give me a second here...",
+      "bytes": 22614
+    },
+    {
+      "file": "thinking/17.mp3",
+      "text": "Right, one moment...",
+      "bytes": 22614
+    },
+    {
+      "file": "thinking/18.mp3",
+      "text": "Hmm, let's find out...",
+      "bytes": 27630
+    },
+    {
+      "file": "thinking/19.mp3",
+      "text": "Okay, pulling that up now...",
+      "bytes": 38915
+    },
+    {
+      "file": "thinking/20.mp3",
+      "text": "Umm... let me think about that...",
+      "bytes": 44348
+    },
+    {
+      "file": "thinking/21.mp3",
+      "text": "Hold on a moment...",
+      "bytes": 19689
+    },
+    {
+      "file": "thinking/22.mp3",
+      "text": "Let's see what's going on...",
+      "bytes": 25122
+    },
+    {
+      "file": "thinking/23.mp3",
+      "text": "Okay, give me a sec...",
+      "bytes": 23868
+    },
+    {
+      "file": "thinking/24.mp3",
+      "text": "Hmmm... let me look...",
+      "bytes": 28884
+    },
+    {
+      "file": "thinking/25.mp3",
+      "text": "Alright, one second...",
+      "bytes": 20942
+    },
+    {
+      "file": "thinking/26.mp3",
+      "text": "[exhales] Okay, let's check...",
+      "bytes": 59395
+    },
+    {
+      "file": "thinking/27.mp3",
+      "text": "Right, let me see...",
+      "bytes": 23868
+    },
+    {
+      "file": "thinking/28.mp3",
+      "text": "Umm, hang on...",
+      "bytes": 30138
+    },
+    {
+      "file": "thinking/29.mp3",
+      "text": "Okay, checking now...",
+      "bytes": 31391
+    },
+    {
+      "file": "thinking/30.mp3",
+      "text": "Let me take a quick look...",
+      "bytes": 23868
+    },
+    {
+      "file": "thinking/31.mp3",
+      "text": "Hmm, one moment please...",
+      "bytes": 27630
+    },
+    {
+      "file": "thinking/32.mp3",
+      "text": "Alright, give me a second...",
+      "bytes": 25122
+    },
+    {
+      "file": "thinking/33.mp3",
+      "text": "Okay so, let me check...",
+      "bytes": 37661
+    },
+    {
+      "file": "thinking/34.mp3",
+      "text": "Hold on, checking that now...",
+      "bytes": 27630
+    },
+    {
+      "file": "thinking/35.mp3",
+      "text": "Umm, let's see...",
+      "bytes": 32645
+    },
+    {
+      "file": "thinking/36.mp3",
+      "text": "Right, hang on a second...",
+      "bytes": 23868
+    },
+    {
+      "file": "thinking/37.mp3",
+      "text": "Okay, let me have a look...",
+      "bytes": 25122
+    },
+    {
+      "file": "thinking/38.mp3",
+      "text": "Hmmm, thinking...",
+      "bytes": 35153
+    },
+    {
+      "file": "thinking/39.mp3",
+      "text": "One moment, please...",
+      "bytes": 19689
+    },
+    {
+      "file": "thinking/40.mp3",
+      "text": "Let me get that for you...",
+      "bytes": 22614
+    },
+    {
+      "file": "thinking/41.mp3",
+      "text": "Okay, just a sec...",
+      "bytes": 23868
+    },
+    {
+      "file": "thinking/42.mp3",
+      "text": "Hmm, let's dig in...",
+      "bytes": 30138
+    },
+    {
+      "file": "thinking/43.mp3",
+      "text": "Alright, checking on it...",
+      "bytes": 30138
+    },
+    {
+      "file": "thinking/44.mp3",
+      "text": "Umm, one second, please...",
+      "bytes": 28884
+    },
+    {
+      "file": "thinking/45.mp3",
+      "text": "Okay, let's take a look...",
+      "bytes": 28884
+    },
+    {
+      "file": "thinking/46.mp3",
+      "text": "Right, give me a moment...",
+      "bytes": 30138
+    },
+    {
+      "file": "thinking/47.mp3",
+      "text": "Hmmm... okay, let's see...",
+      "bytes": 37661
+    },
+    {
+      "file": "thinking/48.mp3",
+      "text": "Hold on, let me see...",
+      "bytes": 26376
+    },
+    {
+      "file": "thinking/49.mp3",
+      "text": "Umm, checking that for you...",
+      "bytes": 45602
+    },
+    {
+      "file": "thinking/50.mp3",
+      "text": "Okay... one sec...",
+      "bytes": 28884
+    },
+    {
+      "file": "thinking/51.mp3",
+      "text": "[sighs] Let me look into that...",
+      "bytes": 33899
+    },
+    {
+      "file": "thinking/52.mp3",
+      "text": "Alright, let's see what we've got...",
+      "bytes": 35153
+    },
+    {
+      "file": "thinking/53.mp3",
+      "text": "Hmm, give me just a sec...",
+      "bytes": 36407
+    },
+    {
+      "file": "thinking/54.mp3",
+      "text": "Okay, let me pull it up...",
+      "bytes": 26376
+    }
+  ],
+  "acknowledgement": [
+    {
+      "file": "acknowledgement/0.mp3",
+      "text": "Mmhm, got it.",
+      "bytes": 26376
+    },
+    {
+      "file": "acknowledgement/1.mp3",
+      "text": "Okay, I'm with you.",
+      "bytes": 22614
+    },
+    {
+      "file": "acknowledgement/2.mp3",
+      "text": "Right, that makes sense.",
+      "bytes": 27630
+    },
+    {
+      "file": "acknowledgement/3.mp3",
+      "text": "Ahh, okay.",
+      "bytes": 15927
+    }
+  ],
+  "surprise": [
+    {
+      "file": "surprise/0.mp3",
+      "text": "[gasps] Oh!",
+      "bytes": 22614
+    },
+    {
+      "file": "surprise/1.mp3",
+      "text": "Huh, interesting...",
+      "bytes": 27630
+    },
+    {
+      "file": "surprise/2.mp3",
+      "text": "Wait, really?",
+      "bytes": 17181
+    }
+  ],
+  "amusement": [
+    {
+      "file": "amusement/0.mp3",
+      "text": "[laughs softly] Okay, that is fair.",
+      "bytes": 31391
+    },
+    {
+      "file": "amusement/1.mp3",
+      "text": "Heh, alright, you got me.",
+      "bytes": 27630
+    },
+    {
+      "file": "amusement/2.mp3",
+      "text": "Ha, fair enough.",
+      "bytes": 25122
+    }
+  ],
+  "empathy": [
+    {
+      "file": "empathy/0.mp3",
+      "text": "[sighs] Yeah, I hear you.",
+      "bytes": 35153
+    },
+    {
+      "file": "empathy/1.mp3",
+      "text": "Okay, let's sort this out.",
+      "bytes": 27630
+    },
+    {
+      "file": "empathy/2.mp3",
+      "text": "Understood, one second.",
+      "bytes": 22614
+    }
+  ]
+}

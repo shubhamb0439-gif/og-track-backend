@@ -80,6 +80,13 @@ module.exports = {
       maxToolIterations: parseInt(process.env.AIDA_MAX_TOOL_ITERATIONS || '4', 10),
       sessionTtlMs: parseInt(process.env.AIDA_SESSION_TTL_MINUTES || '120', 10) * 60 * 1000,
       maxHistoryMessages: parseInt(process.env.AIDA_MAX_HISTORY_MESSAGES || '20', 10),
+      // Real-time voice pipeline toggles — all default to the new behavior,
+      // but every one of these can be flipped back to the legacy behavior
+      // via env var with no code change (see docs/AIDA_VOICE_UPGRADE.md).
+      streamingEnabled: (process.env.AIDA_STREAMING_ENABLED || 'true') === 'true',
+      interruptionEnabled: (process.env.AIDA_INTERRUPTION_ENABLED || 'true') === 'true',
+      emotionEnabled: (process.env.AIDA_EMOTION_ENABLED || 'true') === 'true',
+      debugLatency: (process.env.AIDA_DEBUG_LATENCY || 'false') === 'true',
       // Internal loopback base URL AIDA uses to call OG Track's OWN REST API —
       // this is what makes "never touch the DB directly" real: every tool
       // executes as a normal HTTP call through the same Express app, so it
@@ -108,16 +115,45 @@ module.exports = {
           apiKey,
           voiceId,
           modelId: process.env.ELEVENLABS_MODEL_ID || 'eleven_flash_v2_5',
+          // Fillers are pre-cached (synthesized once, at server startup or on
+          // first use — never live, on the critical path of a real reply), so
+          // they're the one place a slower, more expressive model costs
+          // nothing in real-time latency. Defaults to eleven_v3 (confirmed
+          // live: it accepts bracket audio tags like [sighs]/[gasps] — 1.7s
+          // vs. the realtime model's 0.3s per phrase, fine for a one-time
+          // warm-up, would be a real problem for a live reply chunk, which is
+          // why the live reply path stays on `modelId` above, untouched).
+          fillerModelId: process.env.ELEVENLABS_FILLER_MODEL_ID || 'eleven_v3',
           outputFormat: process.env.ELEVENLABS_OUTPUT_FORMAT || 'mp3_44100_128',
           maxConcurrentChunks: parseInt(process.env.ELEVENLABS_MAX_CONCURRENT_CHUNKS || '2', 10),
           maxCharsPerReply: parseInt(process.env.ELEVENLABS_MAX_CHARS_PER_REPLY || '2000', 10),
           // Playback pace — ElevenLabs defaults to 1.0 (their "natural" pace),
           // which read as too fast in practice. Tunable without a code change.
           speed: parseFloat(process.env.ELEVENLABS_SPEED || '0.92'),
-          // How long to wait for a real reply before playing a cached "thinking"
-          // filler (src/aida/voice/fillerPhrases.js) — only fires if the reply is
-          // actually slow; a fast reply is completely unaffected.
-          fillerDelayMs: parseInt(process.env.AIDA_VOICE_FILLER_DELAY_MS || '1200', 10),
+          // How long to wait for real speech to start before playing a cached
+          // "thinking" filler (src/aida/voice/fillerPhrases.js). Measured
+          // live against the real OpenAI+ElevenLabs path: first-token time
+          // alone is typically 1100-2400ms, so a filler threshold has to sit
+          // well below that to actually mask the wait rather than trail it —
+          // 400ms means the filler wins the race on nearly every turn, which
+          // is the intended behavior (see "CRITICAL FILLER TIMING" — the
+          // goal is AIDA saying *something* almost immediately, not silence
+          // followed eventually by the real answer).
+          fillerDelayMs: parseInt(process.env.AIDA_FILLER_DELAY_MS || process.env.AIDA_VOICE_FILLER_DELAY_MS || '400', 10),
+          fillerEnabled: (process.env.AIDA_FILLER_ENABLED || 'true') === 'true',
+          // Minimum gap between two fillers in the SAME session (keyed by
+          // the per-user voice-chunk event name, so it persists across the
+          // whole session, not just one conversation) — short enough that a
+          // normal conversational back-and-forth still hears one occasionally,
+          // long enough that two messages sent seconds apart don't both get one.
+          fillerCooldownMs: parseInt(process.env.AIDA_FILLER_COOLDOWN_MS || '6000', 10),
+          // Hard ceiling on ONE chunk's ElevenLabs round trip (connect through
+          // full body read). Found live in production testing: a stalled
+          // connection with no error and no data ever arriving left a turn
+          // hanging forever — no audio, no error event, nothing. Real
+          // synthesis for one sentence-chunk was consistently well under 4s
+          // in testing, so this should never fire under normal conditions.
+          ttsTimeoutMs: parseInt(process.env.AIDA_TTS_TIMEOUT_MS || '15000', 10),
         };
       })(),
       // Speech-to-text for POST /aida/voice-input (src/aida/voice/speechToText.js).
@@ -130,7 +166,13 @@ module.exports = {
         return {
           enabled: !!apiKey,
           apiKey,
-          model: process.env.AIDA_STT_MODEL || 'whisper-1',
+          // gpt-4o-mini-transcribe measured live (self-generated sample audio,
+          // repeated calls) at ~2.2x faster than whisper-1 (~930ms vs ~2100ms
+          // average) with identical transcription output in testing — a real,
+          // unconditional win for voice-input latency. Override to whisper-1
+          // (or gpt-4o-transcribe, in between the two on both speed and cost)
+          // if you need whisper-1's specific behavior for some reason.
+          model: process.env.AIDA_STT_MODEL || 'gpt-4o-mini-transcribe',
         };
       })(),
     };

@@ -114,4 +114,109 @@ function splitIntoSpeechChunks(text) {
   return chunks.filter(Boolean);
 }
 
-module.exports = { splitIntoSpeechChunks };
+// ── Streaming variant ────────────────────────────────────────────────────
+// Same sentence-boundary rules as splitIntoSpeechChunks, but stateful: text
+// arrives incrementally from the LLM stream (see providers/openai.js), and
+// each complete chunk needs to be handed to TTS as soon as it's safe to do
+// so — instead of waiting for the whole reply like the non-streaming path
+// above (still used verbatim when AIDA_STREAMING_ENABLED=false).
+
+// An unpunctuated run this long is forced out anyway, so one slow/rambling
+// clause never blocks time-to-first-audio indefinitely.
+const STREAM_FORCE_FLUSH_CHARS = 220;
+
+/** Index of the last position in `buffer` at/after which a sentence boundary is trustworthy (has lookahead), or -1. */
+function findSafeBoundary(buffer) {
+  const boundaryRe = /[.!?]+["')\]]?(?=\s|$)/g;
+  let match;
+  let lastGood = -1;
+  while ((match = boundaryRe.exec(buffer))) {
+    const idx = match.index;
+    const punctChar = buffer[idx];
+    const boundaryEnd = idx + match[0].length;
+    if (boundaryEnd >= buffer.length) break; // no lookahead yet — more text might still change the verdict
+
+    const charBefore = buffer[idx - 1];
+    const nextChar = buffer.slice(boundaryEnd).trimStart()[0];
+    if (!nextChar) break;
+
+    const isDecimal = punctChar === '.' && charBefore && /\d/.test(charBefore) && /\d/.test(nextChar);
+    if (isDecimal) continue;
+
+    if (punctChar === '.') {
+      const wordBefore = buffer.slice(0, idx).match(/([A-Za-z]+)$/);
+      if (wordBefore && ABBREVIATIONS.has(wordBefore[1].toLowerCase())) continue;
+      const lineStart = buffer.lastIndexOf('\n', idx) + 1;
+      const linePrefix = buffer.slice(lineStart, idx);
+      if (/^\s*\d+$/.test(linePrefix)) continue;
+    }
+
+    lastGood = boundaryEnd;
+  }
+  return lastGood;
+}
+
+function findWordBoundaryNear(buffer, target) {
+  const idx = buffer.lastIndexOf(' ', target);
+  return idx > 0 ? idx : target;
+}
+
+/**
+ * Incremental sentence chunker for streamed LLM text. `onChunk(text)` fires
+ * once per speech-ready chunk (merged past MIN_CHUNK_CHARS, same as the
+ * batch splitter). Call `push()` for every text delta as it arrives, and
+ * `flush()` exactly once when the stream ends to emit whatever remains.
+ */
+function createStreamingChunker(onChunk) {
+  let buffer = '';
+  let pendingMerge = '';
+
+  function emit(piece) {
+    const trimmed = (piece || '').trim();
+    if (trimmed) onChunk(trimmed);
+  }
+
+  function drain({ force = false } = {}) {
+    while (true) {
+      const boundaryEnd = findSafeBoundary(buffer);
+      if (boundaryEnd === -1) break;
+      const sentence = buffer.slice(0, boundaryEnd).trim();
+      buffer = buffer.slice(boundaryEnd);
+      pendingMerge = pendingMerge ? `${pendingMerge} ${sentence}` : sentence;
+      if (pendingMerge.length >= MIN_CHUNK_CHARS) {
+        emit(pendingMerge);
+        pendingMerge = '';
+      }
+    }
+
+    if (buffer.length >= STREAM_FORCE_FLUSH_CHARS) {
+      const cut = findWordBoundaryNear(buffer, STREAM_FORCE_FLUSH_CHARS);
+      const piece = buffer.slice(0, cut).trim();
+      buffer = buffer.slice(cut);
+      pendingMerge = pendingMerge ? `${pendingMerge} ${piece}` : piece;
+      emit(pendingMerge);
+      pendingMerge = '';
+    }
+
+    if (force) {
+      const rest = `${pendingMerge} ${buffer}`.trim();
+      buffer = '';
+      pendingMerge = '';
+      emit(rest);
+    }
+  }
+
+  function push(delta) {
+    if (!delta) return;
+    buffer += delta;
+    drain();
+  }
+
+  function flush() {
+    drain({ force: true });
+  }
+
+  return { push, flush };
+}
+
+module.exports = { splitIntoSpeechChunks, createStreamingChunker };
