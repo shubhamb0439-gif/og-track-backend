@@ -346,3 +346,65 @@ Do not change how real (non-filler) audio chunks are handled, the turnId adoptio
 from prompt 6, or the existing server-triggered filler mechanism itself — this is purely
 additive, a faster reaction layered on top of what already exists.
 ```
+
+---
+
+## 8. Manufacturing Assembly — remove the single-vendor stock gate
+
+**Status: backend fixed and verified — frontend change required.** The Create Assembly
+screen's "Vendor Source" dropdown currently requires ONE vendor/lot to cover a
+component's entire requirement, and flags the line unavailable if none does — even when
+the item's total stock (summed across every lot: opening stock, PO A, PO B, ...) is more
+than enough. This was never actually true on the backend: `POST /assemblies` has always
+consumed stock FIFO across ALL lots for a component regardless of vendor, opening-stock
+lots included. The bug was the frontend gating on the wrong signal.
+
+Root cause, now fixed on the backend: `GET /api/:slug/manufacturing/boms/:id/vendor-check?quantity=N`
+used to return `anyVendorSufficient` — true only if some SINGLE vendor's lots alone
+covered the requirement. That field has been **removed**. Each line in the response now
+looks like:
+```json
+{
+  "componentItemId": "...", "componentName": "...",
+  "required": 120, "totalAvailable": 150, "sufficient": true,
+  "vendors": [
+    { "vendorId": "v1", "vendorName": "Vendor A", "available": 80, "sufficient": false },
+    { "vendorId": null, "vendorName": "Unassigned stock", "available": 40, "sufficient": false },
+    { "vendorId": "v2", "vendorName": "Vendor B", "available": 30, "sufficient": false }
+  ]
+}
+```
+and the response now also has a top-level `canBuild` (= every line's `sufficient` is
+true), matching the shape `GET /api/:slug/manufacturing/boms/:id/check?quantity=N`
+already used.
+
+```
+Fix the Manufacturing Assembly screen's stock-availability check and remove the
+single-vendor requirement — the backend already supports pooling stock across every
+vendor/lot for a component, this was purely a frontend gating bug.
+
+1. Find wherever the "Vendor Source" dropdown / per-component availability check lives
+   (likely calls GET /api/:slug/manufacturing/boms/:id/vendor-check?quantity=N, and/or
+   GET /api/:slug/manufacturing/boms/:id/check?quantity=N). Find the logic that reads
+   `anyVendorSufficient` (or loops over `vendors` checking if any single one covers the
+   requirement) to decide whether a component/line is "available" — that field no
+   longer exists in the API response and must not be the basis for this decision.
+2. Replace it with the line's own `sufficient` field (`totalAvailable >= required`,
+   already computed server-side) — or equivalently use the `canBuild` field on the
+   response as a whole. A component is available if the pooled total across all its
+   lots covers the requirement, full stop; no single vendor/lot needs to cover it alone.
+3. Remove the "Vendor Source" dropdown as a required selection. Replace it with a
+   read-only summary of which vendors/lots will actually be drawn from — the `vendors`
+   array (sorted by `available` descending) already tells you this; something like
+   "Will draw from: Vendor A (80), Unassigned stock (40)" is enough. The user is not
+   choosing anymore — consumption is automatic FIFO across lots (oldest first) — this
+   is purely informational, similar in spirit to how the assembly detail page already
+   shows a read-only "Source" column for completed builds.
+4. When a line is genuinely insufficient (totalAvailable < required, i.e. `sufficient:
+   false` / not in `canBuild`), keep showing it as unavailable/blocking — that part of
+   the behavior was correct, only the false-positive case (enough pooled stock, no
+   single vendor alone) needs to stop being flagged.
+
+Do not change anything about how the actual build request (POST /assemblies) is called
+or its request body — only the pre-build availability check and the Vendor Source UI.
+```

@@ -66,6 +66,52 @@ async function consumeStockFIFO(db, itemId, quantity) {
   return consumed;
 }
 
+// Below this tolerance, a remaining quantity is treated as zero — needed
+// because these are floating-point JS numbers (DECIMAL(14,2) columns can
+// carry fractional units, e.g. kg/m), and without it a run of many units
+// could drift into an infinite loop chasing a residue like 1e-13.
+const QTY_EPSILON = 1e-6;
+
+/**
+ * Splits a component's total FIFO consumption (the array consumeStockFIFO
+ * returned) across the individual units being built, in the same oldest-lot-
+ * first order — so each unit's own traceability reflects the lot(s) it
+ * ACTUALLY drew from, not a re-guessed "oldest lot with any history" (the bug
+ * this replaces: manufacturing.js used to ignore consumeStockFIFO's real
+ * result and just re-query for `consumed[0]`, which didn't even check
+ * quantity_remaining > 0).
+ *
+ * Returns an array of length `unitCount`; each entry is an array of
+ * { lotId, quantity } — usually one entry, but more than one whenever that
+ * unit's own quantityPerUnit share happens to straddle a lot boundary.
+ *
+ * `consumed` must sum to quantityPerUnit * unitCount (true by construction —
+ * it's exactly what consumeStockFIFO(itemId, quantityPerUnit * unitCount)
+ * returned for this same requirement).
+ */
+function distributeConsumptionAcrossUnits(consumed, quantityPerUnit, unitCount) {
+  const perUnit = [];
+  let lotIdx = 0;
+  let lotRemaining = consumed.length ? Number(consumed[0].quantityConsumed) : 0;
+
+  for (let u = 0; u < unitCount; u++) {
+    let need = Number(quantityPerUnit);
+    const rows = [];
+    while (need > QTY_EPSILON && lotIdx < consumed.length) {
+      const take = Math.min(need, lotRemaining);
+      if (take > QTY_EPSILON) rows.push({ lotId: consumed[lotIdx].lotId, quantity: take });
+      need -= take;
+      lotRemaining -= take;
+      if (lotRemaining <= QTY_EPSILON) {
+        lotIdx++;
+        lotRemaining = lotIdx < consumed.length ? Number(consumed[lotIdx].quantityConsumed) : 0;
+      }
+    }
+    perUnit.push(rows);
+  }
+  return perUnit;
+}
+
 /**
  * Creates a new lot for an item (received stock, opening balance, or a
  * manual positive correction) and returns the created row's id.
@@ -88,4 +134,4 @@ async function createLot(db, { itemId, lotRef, vendorId, purchaseItemId, quantit
   return id;
 }
 
-module.exports = { recomputeItemStock, consumeStockFIFO, createLot };
+module.exports = { recomputeItemStock, consumeStockFIFO, createLot, distributeConsumptionAcrossUnits };

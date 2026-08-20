@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { recomputeItemStock, consumeStockFIFO, createLot } = require('../utils/stockLots');
+const { recomputeItemStock, consumeStockFIFO, createLot, distributeConsumptionAcrossUnits } = require('../utils/stockLots');
 
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapBom = (r) => r && ({
@@ -170,12 +170,18 @@ router.get('/boms/:id/check', async (req, res) => {
 // ── Assemblies ────────────────────────────────────────────────────────────────
 
 // GET /api/:slug/manufacturing/boms/:id/vendor-check?quantity=N
-// Per-component breakdown of which vendors currently have enough lot stock
-// remaining to cover this build — a DISPLAY HINT for the "Vendor Source"
-// picker in Create Assembly. Consumption itself stays FIFO-pooled across all
-// vendors (see POST /assemblies below); this endpoint doesn't change that,
-// it only tells the user where the stock they're about to consume actually
-// came from, so they can flag a preferred/known-good batch if it matters.
+// Per-component breakdown of which vendors currently have lot stock remaining
+// — informational only (which vendor's batch this build would draw from),
+// NOT a gate on whether the build can proceed. Consumption itself stays
+// FIFO-pooled across ALL vendors' lots regardless of any single one's
+// coverage (see POST /assemblies below); this endpoint doesn't change that.
+// The line-level `sufficient`/top-level `canBuild` fields (based on
+// totalAvailable, the same pooled total POST /assemblies actually enforces)
+// are the ones that answer "can this be built" — each vendor's own
+// `sufficient` flag inside `vendors[]` describes only that one vendor's
+// lots and must never be used to gate the build (that was the bug: the
+// frontend's "Vendor Source" picker was requiring ONE vendor to cover the
+// whole line, when the real requirement only needs the pooled total to).
 router.get('/boms/:id/vendor-check', async (req, res) => {
   try {
     const bom = await req.db('mfg_boms').where({ id: req.params.id }).first();
@@ -196,21 +202,31 @@ router.get('/boms/:id/vendor-check', async (req, res) => {
       }
       const vendorRows = await req.db('inv_vendors').whereIn('id', Object.keys(byVendor).filter(k => k !== '__unassigned__'));
       const vendorName = (id) => vendorRows.find(v => v.id === id)?.name;
+      // vendors[].sufficient describes ONLY that one vendor's own lot(s) —
+      // informational, e.g. "prefer sourcing this build from Vendor A's
+      // batch." It is NOT whether the build can proceed; a component can be
+      // fully available by pooling several vendors' partial lots even when
+      // no single one covers it alone. `sufficient` at the top level (based
+      // on totalAvailable, matching what POST /assemblies actually enforces)
+      // is the one that answers that — this endpoint used to also expose
+      // anyVendorSufficient (single-vendor coverage) at the top level, which
+      // invited exactly that confusion and has been removed.
       const vendors = Object.entries(byVendor).map(([vendorId, available]) => ({
         vendorId: vendorId === '__unassigned__' ? null : vendorId,
         vendorName: vendorId === '__unassigned__' ? 'Unassigned stock' : (vendorName(vendorId) || 'Unknown vendor'),
         available, sufficient: available >= required,
       })).sort((a, b) => b.available - a.available);
+      const totalAvailable = Number(item?.stock || 0);
       results.push({
         componentItemId: line.component_item_id,
         componentName: item?.name || 'Unknown',
         required,
-        totalAvailable: Number(item?.stock || 0),
+        totalAvailable,
+        sufficient: totalAvailable >= required,
         vendors,
-        anyVendorSufficient: vendors.some(v => v.sufficient),
       });
     }
-    res.json({ quantity, lines: results });
+    res.json({ quantity, canBuild: results.every((r) => r.sufficient), lines: results });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -331,13 +347,19 @@ router.post('/assemblies', async (req, res) => {
 
     await req.db.transaction(async (trx) => {
       let totalComponentCost = 0;
+      const distributionByComponent = {}; // item.id -> per-unit [{lotId, quantity}] arrays
 
-      // Consume stock FIFO for each component and record traceability
-      for (const { item, required } of requirements) {
+      // Consume stock FIFO for each component, then work out — from that
+      // SAME result, not a re-guessed re-query — exactly which lot(s) each
+      // individual unit's share actually came from (see
+      // distributeConsumptionAcrossUnits's doc comment for why this replaced
+      // the old "just grab the oldest lot" placeholder).
+      for (const { item, required, quantityPerUnit } of requirements) {
         const consumed = await consumeStockFIFO(trx, item.id, required);
         for (const c of consumed) {
           totalComponentCost += c.quantityConsumed * c.unitCost;
         }
+        distributionByComponent[item.id] = distributeConsumptionAcrossUnits(consumed, quantityPerUnit, Number(quantityBuilt));
         await recomputeItemStock(trx, item.id);
         updatedItemIds.push(item.id);
       }
@@ -385,22 +407,19 @@ router.post('/assemblies', async (req, res) => {
           output_lot_id: outputLotId, sold: 0,
         });
 
-        // Per-unit component traceability: distribute each component's
-        // consumed lots evenly across units
-        for (const { item, quantityPerUnit } of requirements) {
-          const consumed = await trx('inv_stock_lots')
-            .where({ item_id: item.id })
-            .orderBy('received_date', 'asc').orderBy('created_at', 'asc');
-          // For traceability, record the first available lot as the source
-          // (in a full implementation, you'd split by lot across units)
-          const sourceLot = consumed[0];
-          if (sourceLot) {
+        // Per-unit component traceability: use this unit's actual share of
+        // the FIFO consumption recorded above — one row per lot it was
+        // really drawn from, which may be more than one if its share
+        // straddled a lot boundary.
+        for (const { item } of requirements) {
+          const rowsForThisUnit = distributionByComponent[item.id][i - 1] || [];
+          for (const [rowIdx, { lotId, quantity }] of rowsForThisUnit.entries()) {
             await trx('mfg_assembly_items').insert({
-              id: 'ai_' + unitId + '_' + item.id.slice(-6),
+              id: 'ai_' + unitId + '_' + item.id.slice(-6) + '_' + rowIdx,
               assembly_id: assemblyId, assembly_unit_id: unitId,
               component_item_id: item.id,
-              consumed_lot_id: sourceLot.id,
-              quantity: quantityPerUnit,
+              consumed_lot_id: lotId,
+              quantity,
             });
           }
         }
@@ -464,9 +483,11 @@ router.patch('/assemblies/:id', async (req, res) => {
           if (shortfalls.length) throw new Error('Not enough stock to increase quantity: ' + shortfalls.join('; '));
 
           let addedComponentCost = 0;
-          for (const { item, required } of requirements) {
+          const distributionByComponent = {}; // item.id -> per-unit [{lotId, quantity}] arrays, indexed 0..delta-1
+          for (const { item, required, quantityPerUnit } of requirements) {
             const consumed = await consumeStockFIFO(trx, item.id, required);
             for (const c of consumed) addedComponentCost += c.quantityConsumed * c.unitCost;
+            distributionByComponent[item.id] = distributeConsumptionAcrossUnits(consumed, quantityPerUnit, delta);
             await recomputeItemStock(trx, item.id);
           }
           const addedOutputLotId = await createLot(trx, {
@@ -481,13 +502,16 @@ router.patch('/assemblies/:id', async (req, res) => {
           for (let i = 0; i < delta; i++) {
             const unitId = 'unit_' + req.params.id + '_' + nextUnitNum;
             await trx('mfg_assembly_units').insert({ id: unitId, assembly_id: req.params.id, unit_number: nextUnitNum, output_lot_id: addedOutputLotId, sold: 0 });
-            for (const { item, quantityPerUnit } of requirements) {
-              const lot = await trx('inv_stock_lots').where({ item_id: item.id }).orderBy('received_date', 'asc').first();
-              if (lot) {
+            // Same real-distribution fix as POST /assemblies — one row per
+            // lot this unit's share actually came from, not a re-guessed
+            // "oldest lot" (which also never checked quantity_remaining > 0).
+            for (const { item } of requirements) {
+              const rowsForThisUnit = distributionByComponent[item.id][i] || [];
+              for (const [rowIdx, { lotId, quantity }] of rowsForThisUnit.entries()) {
                 await trx('mfg_assembly_items').insert({
-                  id: 'ai_' + unitId + '_' + item.id.slice(-6),
+                  id: 'ai_' + unitId + '_' + item.id.slice(-6) + '_' + rowIdx,
                   assembly_id: req.params.id, assembly_unit_id: unitId,
-                  component_item_id: item.id, consumed_lot_id: lot.id, quantity: quantityPerUnit,
+                  component_item_id: item.id, consumed_lot_id: lotId, quantity,
                 });
               }
             }
