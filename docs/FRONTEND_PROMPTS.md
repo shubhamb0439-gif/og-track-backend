@@ -408,3 +408,47 @@ vendor/lot for a component, this was purely a frontend gating bug.
 Do not change anything about how the actual build request (POST /assemblies) is called
 or its request body — only the pre-build availability check and the Vendor Source UI.
 ```
+
+---
+
+## 9. Local instant filler still not firing on spacebar release — likely an autoplay/user-gesture bug
+
+**Status: backend verified healthy (manifest, files, CORS, caching all correct) —
+frontend bug, diagnosis needed.** Prompt 7 was applied (fetches the manifest, plays a
+local file), but it's reportedly still not firing right when recording stops. The
+leading cause: browsers only allow `audio.play()` without restriction when it's tied
+closely enough to a real user gesture (a keyup counts) — and that link breaks if there's
+ANY async gap between the gesture and the `.play()` call, including doing
+`await fetch(...)` for the manifest INSIDE the keyup/stop-recording handler itself,
+rather than ahead of time.
+
+```
+Local instant filler playback (built per an earlier prompt: fetch /aida-fillers/
+manifest.json, play a cached "thinking" clip locally the instant recording stops) isn't
+actually firing. Diagnose and fix.
+
+1. Reproduce it and check the browser console at the exact moment recording stops.
+   Look specifically for an error resembling:
+     NotAllowedError: play() failed because the user didn't interact with the document first
+   or any other rejected promise from an `.play()` call. This happens when too much
+   async work (even a fast one) sits between the user gesture (keyup / stop-recording
+   click) and the `.play()` call — browsers can decide the gesture no longer "counts."
+2. If that's the error: make sure the manifest fetch and Audio object construction/
+   preload happen AHEAD OF TIME — on app load, or at latest on mic-press (recording
+   START, not stop) — not inside the same handler that calls `.play()`. At the moment
+   recording actually stops, there should be ZERO `await`/async work between reading the
+   already-cached Audio object and calling `.play()` on it synchronously.
+3. If that's NOT the error (playback is being attempted with no console error, just
+   silently not audible, or not being attempted at all): check whether the manifest
+   fetch itself is failing or resolving after the fact — confirm in the Network tab that
+   GET /aida-fillers/manifest.json succeeds (200, JSON body with a "thinking" array) well
+   before the recording-stop event, and that the audio file URLs constructed from it
+   (e.g. /aida-fillers/thinking/3.mp3) are correct and also fetched successfully.
+4. Also confirm the flag from prompt 7 step 3/4 (suppressing the server's own filler
+   once a local one played) isn't accidentally suppressing the LOCAL one too, or getting
+   set before the local playback actually succeeded — if `.play()`'s promise rejected
+   (case 1 above), that flag should NOT be set, since nothing actually played.
+
+Report back what you find in the console/network tab if the fix in step 2 doesn't fully
+resolve it — there may be more than one issue here.
+```

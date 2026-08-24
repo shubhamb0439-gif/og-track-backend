@@ -120,7 +120,17 @@ app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public
 // plays one INSTANTLY (no server round trip) the moment the user finishes
 // speaking/typing, rather than waiting on the existing socket-emitted
 // filler (which still exists as the server-side fallback/general case).
-app.use('/aida-fillers', express.static(require('path').join(__dirname, '..', 'public', 'aida-fillers')));
+// maxAge: without it express.static defaults to Cache-Control: max-age=0,
+// which forces the browser to revalidate (a real network round trip, even
+// if it comes back 304) on every fetch — defeating "instant, no server
+// round trip" for exactly the files this exists to make instant. These are
+// static, content-fixed files regenerated only by
+// scripts/generate-aida-fillers.js, never mutated in place, so caching them
+// hard for a year is safe.
+app.use('/aida-fillers', express.static(require('path').join(__dirname, '..', 'public', 'aida-fillers'), {
+  maxAge: '365d',
+  immutable: true,
+}));
 
 // ── Fallback error handler ────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {

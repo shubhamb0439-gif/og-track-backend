@@ -663,17 +663,26 @@ an additional verbose line per individual mark as it's hit (useful when diagnosi
 a specific turn's time went; noisy for normal operation, hence off by default). Never
 logs API keys, tokens, or conversation content — only turn ids and millisecond timings.
 
-**Measured, real, NOT yet acted on — master admin pays a real latency tax on every
-single turn**: master admin's context sends **33 tool schemas (~18KB / ~4,500+ tokens)**
-to the LLM on every message, regardless of whether the question needs any tool at all
-(a fully-loaded tenant sends ~21, ~6KB). This is the full cross-tenant tool list
-(`masteradminCrossTenant.js` wraps every readable tenant tool automatically) plus master
-admin's own tools, and it's a real, measured contributor to first-token latency — every
-master-admin screenshot tested during this upgrade showed the worst latency numbers,
-which lines up. Not changed here because reducing it means either trimming tool
-descriptions (small win) or being more selective about which tools get attached per turn
-(bigger win, but a functional trade-off against "master admin can always call anything" —
-worth a deliberate decision, not a silent change).
+**Measured, real, partially fixed — master admin pays a latency tax on every single
+turn.** Master admin's context sends every tool schema to the LLM on every message,
+regardless of whether the question needs one — a fully-loaded tenant sends ~21 tools
+(~6KB); master admin sent 33 (~18KB / ~4,500+ tokens), and every master-admin screenshot
+tested during this upgrade showed the worst latency numbers, which lines up.
+
+`masteradminCrossTenant.js`'s `wrapForCrossTenant()` was appending the same ~195-character
+sentence ("Master-admin cross-tenant view — pass companySlug... call
+masteradmin_list_companies first...") to all ~27 wrapped tools' descriptions — pure
+duplication, since that exact guidance is already stated once, globally, in `engine.js`'s
+masteradmin system-prompt line, and `companySlug`'s purpose is already covered by its own
+`inputSchema` property description. Removed it — **13,129 bytes (~3,282 tokens) down from
+18,253 (~4,563 tokens), a ~28% reduction, for zero guidance the model didn't already
+have.** Live-verified this didn't degrade anything: asking about a company by name
+("How is Skyoil doing...") still correctly calls `masteradmin_list_companies` first to
+resolve it, exactly as before.
+
+Remaining, NOT done: being more selective about which tools get attached per turn at all
+(a bigger win than trimming description text, but a real functional trade-off against
+"master admin can always call anything" — worth a deliberate decision, not a silent one).
 
 ### Rollback
 

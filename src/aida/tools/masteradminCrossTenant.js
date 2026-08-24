@@ -39,9 +39,16 @@ function wrapForCrossTenant(tool) {
 
   return {
     name: `masteradmin_${tool.name}`,
-    description:
-      `${tool.description} Master-admin cross-tenant view — pass companySlug to target a specific ` +
-      "company. If the user names a company rather than its slug, call masteradmin_list_companies first to resolve it.",
+    // Deliberately just the base tool's own description — the "pass
+    // companySlug, resolve a company NAME via masteradmin_list_companies
+    // first" guidance used to be repeated verbatim in every one of these
+    // ~27 wrapped tools' description, but it's already stated once, globally,
+    // in engine.js's masteradmin system-prompt line, and companySlug's own
+    // purpose is already covered by its own inputSchema property description
+    // below. That was pure duplication — real measured cost on every single
+    // masteradmin turn (see the "tool schema size" finding in README.md),
+    // for zero guidance the model didn't already have.
+    description: tool.description,
     requiredModules: [MASTERADMIN_SENTINEL_MODULE],
     inputSchema: {
       type: 'object',
