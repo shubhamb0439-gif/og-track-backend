@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   openPullRequest, getCombinedStatus, mergePullRequest, closePullRequest,
-  authenticatedRemoteUrl, GitHubApiError,
+  GitHubApiError,
 } = require('../src/aida/codingAgent/github');
 
 function mockFetch(handler) {
@@ -10,11 +10,6 @@ function mockFetch(handler) {
   global.fetch = async (url, opts) => handler(url, opts);
   return () => { global.fetch = originalFetch; };
 }
-
-test('authenticatedRemoteUrl embeds the token in x-access-token form, never as a bare credential', () => {
-  const url = authenticatedRemoteUrl('acme', 'widgets', 'ghp_secret123');
-  assert.equal(url, 'https://x-access-token:ghp_secret123@github.com/acme/widgets.git');
-});
 
 test('openPullRequest posts the correct endpoint, method, auth header, and body', async () => {
   let captured = null;

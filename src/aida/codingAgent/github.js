@@ -1,71 +1,51 @@
-const fs = require('fs');
-const { execFile } = require('child_process');
+const { commitChanges, updateBranchRef } = require('./githubApi');
 
 /**
  * Git/GitHub operations for the coding agent's fix flow — separate from
- * sandbox.js (which only clones+preps a sandbox) and tools.js (the agent's
- * own read/write/list/run tools). Everything here is called by the job kind
- * AFTER the agent loop has already finished editing files, never by the
- * agent itself — the agent doesn't get direct git/GitHub tools, so it can't
- * push or open a PR on its own; only the job orchestration layer does that,
- * after the agent has already called `finish`.
+ * sandbox.js (which only materializes+preps a sandbox) and tools.js (the
+ * agent's own read/write/list/run tools). Everything here is called by the
+ * job kind AFTER the agent loop has already finished editing files, never by
+ * the agent itself — the agent doesn't get direct git/GitHub tools, so it
+ * can't push or open a PR on its own; only the job orchestration layer does
+ * that, after the agent has already called `finish`.
+ *
+ * createBranch/commitAll/pushBranch are built on GitHub's REST/Git Data API
+ * (see githubApi.js), not a local `git` binary — confirmed live that `git`
+ * isn't installed in Azure App Service's default Node runtime
+ * (`spawn git ENOENT`), which is where this needs to actually run for a
+ * request against the deployed backend, not just a dev machine that happens
+ * to have git installed. All three now take the `sandbox` object
+ * createSandbox() returns (not a bare directory path) since the diffing
+ * this approach needs (no local git history to lean on) requires the
+ * materialization-time snapshot and base commit/tree SHAs carried on it.
  */
 
-// No shell here, on any platform: unlike npm (a .cmd wrapper on Windows,
-// hence tools.js's conditional shell:true), `git` is a real executable on
-// every platform including Windows — adding a shell only broke multi-word
-// arguments (confirmed live: `-m "fix: add x"` got word-split by cmd.exe
-// into separate pathspec arguments, since Node doesn't re-quote array-form
-// args for a Windows shell the way it does without one).
-function execFileP(command, args, opts) {
-  return new Promise((resolve, reject) => {
-    execFile(command, args, opts, (error, stdout, stderr) => {
-      if (error) {
-        const err = new Error(`${command} ${args.join(' ')} failed: ${error.message}\n${stderr || ''}`.trim());
-        err.stdout = stdout;
-        err.stderr = stderr;
-        return reject(err);
-      }
-      resolve({ stdout, stderr });
-    });
-  });
-}
-
-/** Builds an authenticated HTTPS URL for push, without ever writing the token into .git/config (which would persist it on disk even after the sandbox is otherwise inert). */
-function authenticatedRemoteUrl(owner, repo, token) {
-  return `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
-}
-
-/** Creates and checks out a new branch in the sandbox. Assumes the sandbox is already on some base branch (createSandbox clones the default branch). */
-async function createBranch(sandboxDir, branchName) {
-  await execFileP('git', ['checkout', '-b', branchName], { cwd: fs.realpathSync(sandboxDir) });
+/** No API call needed yet — the branch ref is only actually created once there's something to commit (see pushBranch). Just records the intended name. */
+async function createBranch(sandbox, branchName) {
+  sandbox.branch = branchName;
 }
 
 /**
- * Stages everything (respecting .gitignore, so the sandbox's own dummy .env
- * never gets staged) and commits with a fixed author identity — a fresh
- * sandbox clone has no inherited git identity to rely on, and this
- * shouldn't be attributed to whatever identity happens to be configured on
- * the host machine anyway.
+ * Diffs the sandbox's current files against its materialization-time
+ * snapshot and, if anything changed, creates a new commit on top of the
+ * sandbox's base commit (attributed to "AIDA" — a fresh sandbox has no
+ * git identity of its own to inherit, and this shouldn't be credited to
+ * whatever identity happens to be configured on the host machine anyway).
+ * Does NOT move any branch yet — see pushBranch for that half.
  */
-async function commitAll(sandboxDir, message) {
-  const cwd = fs.realpathSync(sandboxDir);
-  await execFileP('git', ['config', 'user.name', 'AIDA'], { cwd });
-  await execFileP('git', ['config', 'user.email', 'aida@ogtrack.local'], { cwd });
-  await execFileP('git', ['add', '-A'], { cwd });
-  const status = await execFileP('git', ['status', '--porcelain'], { cwd });
-  if (!status.stdout.trim()) {
-    return { committed: false, reason: 'Nothing to commit — the agent made no file changes.' };
-  }
-  await execFileP('git', ['commit', '-m', message], { cwd });
-  return { committed: true };
+async function commitAll(sandbox, message) {
+  const result = await commitChanges({
+    owner: sandbox.owner, repo: sandbox.repo, token: sandbox.token, dir: sandbox.dir,
+    originalFiles: sandbox.originalFiles, baseCommitSha: sandbox.baseCommitSha, baseTreeSha: sandbox.baseTreeSha,
+    message,
+  });
+  if (result.committed) sandbox.newCommitSha = result.commitSha;
+  return result;
 }
 
-/** Pushes the current branch to `owner/repo` on GitHub using a token passed directly on the push URL — never written to the sandbox's own .git/config. */
-async function pushBranch(sandboxDir, { owner, repo, token, branchName }) {
-  const cwd = fs.realpathSync(sandboxDir);
-  const url = authenticatedRemoteUrl(owner, repo, token);
-  await execFileP('git', ['push', url, `HEAD:refs/heads/${branchName}`], { cwd });
+/** Points sandbox.branch at the commit commitAll just created. */
+async function pushBranch(sandbox) {
+  await updateBranchRef({ owner: sandbox.owner, repo: sandbox.repo, token: sandbox.token, branch: sandbox.branch, commitSha: sandbox.newCommitSha });
 }
 
 class GitHubApiError extends Error {}
@@ -110,5 +90,5 @@ async function closePullRequest({ owner, repo, token, pullNumber }) {
 
 module.exports = {
   createBranch, commitAll, pushBranch, openPullRequest, getCombinedStatus,
-  mergePullRequest, closePullRequest, authenticatedRemoteUrl, GitHubApiError,
+  mergePullRequest, closePullRequest, GitHubApiError,
 };

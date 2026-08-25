@@ -10,7 +10,7 @@ const { runCodingAgent } = config.aida.codingAgent.provider === 'anthropic'
   : require('../../codingAgent/providers/openai');
 const {
   createBranch, commitAll, pushBranch, openPullRequest,
-  mergePullRequest, closePullRequest, authenticatedRemoteUrl,
+  mergePullRequest, closePullRequest,
 } = require('../../codingAgent/github');
 
 /**
@@ -69,7 +69,7 @@ module.exports = {
 
     let sandbox;
     try {
-      sandbox = await createSandbox(authenticatedRemoteUrl(owner, repoName, ca.githubToken));
+      sandbox = await createSandbox(owner, repoName, ca.githubToken);
       await appendEvent(job.id, 'cloned', { repo });
 
       await appendEvent(job.id, 'installing');
@@ -89,7 +89,7 @@ module.exports = {
       await appendEvent(job.id, 'installed', { skipped: !hasPackageJson });
 
       const branchName = `aida/fix-${job.id}`;
-      await createBranch(sandbox.dir, branchName);
+      await createBranch(sandbox, branchName);
 
       await appendEvent(job.id, 'agent_started');
       const toolLog = [];
@@ -114,7 +114,7 @@ module.exports = {
         return;
       }
 
-      const commitResult = await commitAll(sandbox.dir, `AIDA: ${effectiveTask.slice(0, 72).replace(/\s+/g, ' ')}`);
+      const commitResult = await commitAll(sandbox, `AIDA: ${effectiveTask.slice(0, 72).replace(/\s+/g, ' ')}`);
       if (!commitResult.committed) {
         // The agent succeeded but made no file changes — nothing to review or push.
         await updateStatus(job.id, 'completed', {
@@ -124,7 +124,7 @@ module.exports = {
         return;
       }
 
-      await pushBranch(sandbox.dir, { owner, repo: repoName, token: ca.githubToken, branchName });
+      await pushBranch(sandbox);
       await appendEvent(job.id, 'pushed', { branch: branchName });
 
       const pr = await openPullRequest({

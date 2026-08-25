@@ -14,7 +14,7 @@ const { runModuleBuilderAgent } = config.aida.codingAgent.provider === 'anthropi
 const { runSqlFileAgainstPool } = require('../../../utils/provisioning');
 const {
   createBranch, commitAll, pushBranch, openPullRequest,
-  mergePullRequest, closePullRequest, authenticatedRemoteUrl,
+  mergePullRequest, closePullRequest,
 } = require('../../codingAgent/github');
 const { startPreview, stopPreview } = require('../../codingAgent/preview');
 
@@ -133,8 +133,8 @@ module.exports = {
     let backendSandbox, frontendSandbox;
     let reachedAwaitingApproval = false;
     try {
-      backendSandbox = await createSandbox(authenticatedRemoteUrl(backendOwner, backendRepoName, ca.githubToken));
-      frontendSandbox = await createSandbox(authenticatedRemoteUrl(frontendOwner, frontendRepoName, ca.githubToken));
+      backendSandbox = await createSandbox(backendOwner, backendRepoName, ca.githubToken);
+      frontendSandbox = await createSandbox(frontendOwner, frontendRepoName, ca.githubToken);
       await appendEvent(job.id, 'cloned', { backendRepo: mb.backendRepo, frontendRepo: mb.frontendRepo });
 
       await appendEvent(job.id, 'installing');
@@ -167,8 +167,8 @@ module.exports = {
       await appendEvent(job.id, 'installed', { backendSkipped: !backendHasPkg, frontendSkipped: !frontendHasPkg });
 
       const branchName = `aida/module-${slug}-${job.id}`;
-      await createBranch(backendSandbox.dir, branchName);
-      await createBranch(frontendSandbox.dir, branchName);
+      await createBranch(backendSandbox, branchName);
+      await createBranch(frontendSandbox, branchName);
 
       const existingFiles = { backend: snapshotExistingFiles(backendSandbox.dir), frontend: snapshotExistingFiles(frontendSandbox.dir) };
       const originalContents = { backend: new Map(), frontend: new Map() };
@@ -212,8 +212,8 @@ module.exports = {
       }
 
       const [backendCommit, frontendCommit] = await Promise.all([
-        commitAll(backendSandbox.dir, `AIDA: add ${slug} module (backend)`),
-        commitAll(frontendSandbox.dir, `AIDA: add ${slug} module (frontend)`),
+        commitAll(backendSandbox, `AIDA: add ${slug} module (backend)`),
+        commitAll(frontendSandbox, `AIDA: add ${slug} module (frontend)`),
       ]);
 
       if (!backendCommit.committed && !frontendCommit.committed) {
@@ -226,7 +226,7 @@ module.exports = {
 
       let backendPr = null, frontendPr = null;
       if (backendCommit.committed) {
-        await pushBranch(backendSandbox.dir, { owner: backendOwner, repo: backendRepoName, token: ca.githubToken, branchName });
+        await pushBranch(backendSandbox);
         backendPr = await openPullRequest({
           owner: backendOwner, repo: backendRepoName, token: ca.githubToken,
           head: branchName, base: 'main',
@@ -236,7 +236,7 @@ module.exports = {
         await appendEvent(job.id, 'backend_pr_opened', { prNumber: backendPr.number, prUrl: backendPr.html_url });
       }
       if (frontendCommit.committed) {
-        await pushBranch(frontendSandbox.dir, { owner: frontendOwner, repo: frontendRepoName, token: ca.githubToken, branchName });
+        await pushBranch(frontendSandbox);
         frontendPr = await openPullRequest({
           owner: frontendOwner, repo: frontendRepoName, token: ca.githubToken,
           head: branchName, base: 'main',
