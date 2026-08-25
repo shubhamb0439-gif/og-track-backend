@@ -40,6 +40,7 @@ const MODULE_TO_SCRIPT = {
   sales:          '11_module_sales.sql',
   test_cases:     '12_module_test_cases.sql',
   to_do_list:     '13_module_to_do_list.sql',
+  token:          '14_module_token.sql',
 };
 
 // Some modules' tables have foreign keys into another module's tables (e.g.
@@ -141,6 +142,7 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   // literal above never needs to be modified — see MODULE_TO_SCRIPT for the
   // module -> script mapping.
   if (scriptsNeeded.has('13_module_to_do_list.sql')) orderedScripts.push('13_module_to_do_list.sql');
+  if (scriptsNeeded.has('14_module_token.sql')) orderedScripts.push('14_module_token.sql');
 
   for (const scriptFile of orderedScripts) {
     const step = `run_${scriptFile}`;
