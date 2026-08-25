@@ -102,6 +102,83 @@ module.exports = {
       githubToken: process.env.AIDA_GITHUB_TOKEN || null,
       authorizedRepos: (process.env.AIDA_AUTHORIZED_REPOS || '')
         .split(',').map((s) => s.trim()).filter(Boolean),
+      // Coding agent (src/aida/codingAgent/) — the "AIDA writes and tests
+      // actual code" capability (phase 1: weekly self-diagnose-and-fix; see
+      // docs/AIDA_PHASE1_SELF_FIX_PLAN.md). Deliberately its OWN provider
+      // setting, independent of `provider`/`apiKey` above (AIDA's normal
+      // chat) — starts on OpenAI (temporary, reuses the existing
+      // OPENAI_API_KEY) and is meant to move to Anthropic later via
+      // AIDA_CODING_AGENT_PROVIDER=anthropic + ANTHROPIC_API_KEY alone, no
+      // code change, once that key exists. githubToken here is separately
+      // write-scoped (Contents + Pull requests only) — never reuses
+      // AIDA_GITHUB_TOKEN above, which stays read-only for dev_repo_diagnose.
+      codingAgent: (() => {
+        const provider = (process.env.AIDA_CODING_AGENT_PROVIDER || 'openai').toLowerCase();
+        const apiKey = provider === 'openai' ? (process.env.OPENAI_API_KEY || null) : (process.env.ANTHROPIC_API_KEY || null);
+        const defaultModel = provider === 'openai' ? 'gpt-4o' : 'claude-sonnet-5';
+        return {
+          provider,
+          enabled: !!apiKey,
+          apiKey,
+          model: process.env.AIDA_CODING_AGENT_MODEL || defaultModel,
+          githubToken: process.env.AIDA_CODING_AGENT_GITHUB_TOKEN || null,
+        };
+      })(),
+      // Phase 2 of the power-tier plan — "AIDA, create me a module." Builds
+      // across the SAME two repos every time (unlike dev_repo_fix, which
+      // takes a repo per chat call), so they're configured once here rather
+      // than passed in chat. insertOnlyFiles are the narrow, named
+      // exceptions to "new files only" (see moduleGuardrails.js) — files the
+      // agent may ADD lines to (a new require, a new app.use(...), a new
+      // MODULE_TO_SCRIPT map entry) but never change or remove a line from.
+      // frontendInsertOnlyFiles starts empty because the frontend repo's own
+      // registration point (routing/nav config) isn't confirmed yet — until
+      // it's added here, the agent describes that step in its summary for a
+      // human to do by hand instead of touching it directly.
+      moduleBuilder: (() => {
+        // Staging DB reuses the SAME Azure SQL server/user/password already
+        // configured above for the real app (AZURE_SQL_*) by default — it's
+        // one more database on that server, not a separate credential to
+        // provision and manage. Override the individual pieces only if the
+        // staging DB should live somewhere else entirely.
+        const stagingDb = {
+          server: process.env.AIDA_STAGING_SQL_SERVER || process.env.AZURE_SQL_SERVER || null,
+          port: parseInt(process.env.AIDA_STAGING_SQL_PORT || process.env.AZURE_SQL_PORT || '1433', 10),
+          user: process.env.AIDA_STAGING_SQL_USER || process.env.AZURE_SQL_USER || null,
+          password: process.env.AIDA_STAGING_SQL_PASSWORD || process.env.AZURE_SQL_PASSWORD || null,
+          database: process.env.AIDA_STAGING_SQL_DATABASE || null, // the one value that MUST be its own — never reuse OGCore's own database name here
+        };
+        const backendRepo = process.env.AIDA_MODULE_BACKEND_REPO || null; // "owner/repo"
+        const frontendRepo = process.env.AIDA_MODULE_FRONTEND_REPO || null; // "owner/repo"
+        // Must match scripts/provisionStagingDb.js's AIDA_STAGING_COMPANY_SLUG
+        // default — createModule.js auto-enables each new module for this one
+        // company (never a real tenant) so a preview doesn't need a manual
+        // "enable this module" step every single time, on top of the manual
+        // frontend-wiring step that already exists.
+        const previewCompanySlug = process.env.AIDA_STAGING_COMPANY_SLUG || 'aida-preview';
+        return {
+          previewCompanySlug,
+          backendRepo,
+          frontendRepo,
+          frontendStartCommand: process.env.AIDA_MODULE_FRONTEND_START_CMD || 'node serve.js',
+          // Confirmed: the frontend has no API-base-URL env var and no build
+          // step at all (plain static HTML, serve.js just serves it as-is).
+          // Its inline script instead hardcodes http://localhost:3000
+          // whenever it detects it's being viewed from localhost — so the
+          // preview backend MUST bind to this exact port for the frontend
+          // preview to be able to reach it; only frontend gets a dynamically
+          // picked free port (via FRONTEND_PORT, which serve.js does read).
+          previewBackendPort: parseInt(process.env.AIDA_MODULE_PREVIEW_BACKEND_PORT || '3000', 10),
+          frontendPortEnvVar: process.env.AIDA_MODULE_FRONTEND_PORT_ENV_VAR || 'FRONTEND_PORT',
+          stagingDb,
+          insertOnlyFiles: {
+            backend: ['src/server.js', 'src/utils/provisioning.js'],
+            frontend: (process.env.AIDA_MODULE_FRONTEND_INSERT_ONLY_FILES || '')
+              .split(',').map((s) => s.trim()).filter(Boolean),
+          },
+          enabled: !!(backendRepo && frontendRepo && stagingDb.server && stagingDb.database),
+        };
+      })(),
       // Voice (src/aida/voice/) — ElevenLabs TTS, chunked over the existing
       // socket.io connection. Soft-optional like the rest of this block:
       // enabled only when both an API key AND a voice id are set, so a

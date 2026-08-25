@@ -14,6 +14,7 @@ const { transcribeAudio } = require('../aida/voice/speechToText');
 const { warmFillerCache } = require('../aida/voice/fillerPhrases');
 const { createTurnTimer } = require('../aida/latency');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
+const { getCombinedStatus } = require('../aida/codingAgent/github');
 
 registerAllTools();
 sessionMemory.startSweeper();
@@ -87,7 +88,16 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre 
   // the filler can mask STT latency too, not just LLM/TTS latency.
   const turnId = pre?.turnId ?? (wantsVoice ? newTurnId() : null);
   const target = pre?.target ?? (wantsVoice ? voiceTargetFor(context) : null);
-  const timer = pre?.timer ?? (wantsVoice ? createTurnTimer(turnId, { provider: config.aida.provider, streaming: useStreaming }) : null);
+  // A timer now exists for EVERY turn, not just voice ones — a plain text
+  // chat was previously invisible to AIDA_LATENCY entirely, which meant a
+  // "text chat feels slow" report had no real numbers to check, only
+  // isolated synthetic ones that couldn't reflect whatever's actually
+  // happening on the live server (session load, DB latency from tool calls,
+  // etc.). logTurnId is turnId when there is one (voice), otherwise an
+  // internal-only id never exposed in the response — the response contract
+  // for non-voice chat is unchanged, this is purely for the server log.
+  const logTurnId = turnId ?? `text_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const timer = pre?.timer ?? createTurnTimer(logTurnId, { provider: config.aida.provider, streaming: useStreaming, voice: wantsVoice });
   // Computed for EVERY turn now, not just voice ones — the emotion classification
   // also shapes word choice/tone in the actual text reply (see engine.js's
   // system prompt), not just TTS delivery, so a text-only chat benefits too.
@@ -159,13 +169,20 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre 
     throw e;
   }
   clearTimeout(fillerTimer);
-  timer?.mark('llmDone');
+  timer.mark('llmDone');
 
   if (speaker) {
     speaker.finish().then(() => timer.logSummary()).catch((e) => console.error('[aida-voice] streaming speaker failed:', e));
   } else if (wantsVoice) {
     voiceSession.speakReply({ io: req.io, room: target.room, chunkEvent: target.chunkEvent, errorEvent: target.errorEvent, turnId, text: result.reply });
-    timer?.logSummary();
+    timer.logSummary();
+  } else {
+    // Plain text chat, no voice involved — still worth a latency line (see
+    // logTurnId above for why this didn't exist before): total_response_ms
+    // here is the WHOLE thing this request was waiting on, tool calls and
+    // all, since a text turn has no streaming/TTS stages to break it down
+    // further.
+    timer.logSummary();
   }
 
   if (result.reply && result.reply.trim()) sessionMemory.appendTurn(context, userMessage, result.reply);
@@ -384,13 +401,54 @@ const masterAdminAidaRouter = createAidaRouter({ requireAuth: requireMasterAdmin
 // there's no per-admin ownership restriction, matching "master admin has
 // full access" elsewhere in that plan.
 
-// GET /jobs/:id — poll a job's current state + its event timeline.
+// GET /jobs?kind=dev_repo_fix&status=awaiting_approval&limit=20 — browse jobs
+// without already knowing an id. This is what the "AIDA Job" panel (long-
+// press-logo menu, master admin) lists from — without it, a weekly
+// scheduler-triggered job (no human around to hand out its id) would be
+// invisible until someone happened to ask AIDA about it by guessing an id.
+masterAdminAidaRouter.get('/jobs', async (req, res) => {
+  try {
+    const { kind, status, limit } = req.query;
+    const jobs = await jobStore.listJobs({ kind, status, limit: limit ? parseInt(limit, 10) : undefined });
+    res.json({ jobs });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+async function fetchCiStatus(repo, ref) {
+  try {
+    const [owner, repoName] = repo.split('/');
+    const status = await getCombinedStatus({ owner, repo: repoName, token: config.aida.codingAgent.githubToken, ref });
+    return { state: status.state, description: status.statuses?.[0]?.description || null };
+  } catch {
+    return { state: 'unknown', description: 'Could not reach GitHub for CI status.' };
+  }
+}
+
+// GET /jobs/:id — poll a job's current state + its event timeline. For a
+// dev_repo_fix job with an open PR, also fetches LIVE CI status from GitHub
+// and includes it as ciStatus — so the frontend never needs its own GitHub
+// access or token; this is the one place that's fetched from. A create_module
+// job has TWO repos/PRs, so its ciStatus is shaped { backend, frontend }
+// instead of dev_repo_fix's flat { state, description } — see
+// docs/FRONTEND_PROMPTS.md for the exact contract.
 masterAdminAidaRouter.get('/jobs/:id', async (req, res) => {
   try {
     const job = await jobStore.getJob(req.params.id);
     if (!job) return res.status(404).json({ error: 'Job not found' });
     const events = await jobStore.listEventsForJob(job.id);
-    res.json({ job, events });
+
+    let ciStatus = null;
+    if (job.kind === 'dev_repo_fix' && job.result?.repo && job.result?.branch) {
+      ciStatus = await fetchCiStatus(job.result.repo, job.result.branch);
+    } else if (job.kind === 'create_module' && job.result?.branch) {
+      const { backendRepo, frontendRepo, backendPr, frontendPr, branch } = job.result;
+      ciStatus = {
+        backend: backendPr ? await fetchCiStatus(backendRepo, branch) : null,
+        frontend: frontendPr ? await fetchCiStatus(frontendRepo, branch) : null,
+      };
+    }
+
+    res.json({ job, events, ciStatus });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -411,7 +469,11 @@ masterAdminAidaRouter.post('/jobs/:id/approve', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /jobs/:id/reject — stops the job dead; no kind-specific code runs.
+// POST /jobs/:id/reject — stops the job dead. Most kinds have no
+// kind-specific cleanup (jobRunner.runOnReject is a no-op for them); a kind
+// that left something real in flight (dev_repo_fix's open PR) gets a chance
+// to clean it up before the job itself is marked rejected — see
+// jobKinds/index.js's onReject doc.
 masterAdminAidaRouter.post('/jobs/:id/reject', async (req, res) => {
   try {
     const job = await jobStore.getJob(req.params.id);
@@ -419,6 +481,7 @@ masterAdminAidaRouter.post('/jobs/:id/reject', async (req, res) => {
     if (job.status !== 'awaiting_approval') {
       return res.status(400).json({ error: `Job is not awaiting approval (status: ${job.status})` });
     }
+    await jobRunner.runOnReject(job);
     const rejected = await jobStore.updateJobStatus(job.id, 'rejected');
     await jobStore.appendEvent(job.id, 'rejected', { rejectedBy: req.admin.adminId });
     jobRunner.emitJobUpdate(rejected);

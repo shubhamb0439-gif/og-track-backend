@@ -39,6 +39,9 @@ const MODULE_TO_SCRIPT = {
   manufacturing:  '10_module_manufacturing.sql',
   sales:          '11_module_sales.sql',
   test_cases:     '12_module_test_cases.sql',
+  to_do_list:     '13_module_to_do_list.sql',
+  token:          '14_module_token.sql',
+  notes:          '15_module_notes.sql',
 };
 
 // Some modules' tables have foreign keys into another module's tables (e.g.
@@ -136,6 +139,12 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
     '03_module_requests.sql','04_module_attendance.sql','05_module_messaging.sql',
     '06_module_accounting.sql','07_module_hr.sql','08_module_crm.sql','09_module_inventory.sql',
     '10_module_manufacturing.sql','11_module_sales.sql','12_module_test_cases.sql'].filter(s => scriptsNeeded.has(s));
+  // New modules appended here (rather than inlined above) so the original
+  // literal above never needs to be modified — see MODULE_TO_SCRIPT for the
+  // module -> script mapping.
+  if (scriptsNeeded.has('13_module_to_do_list.sql')) orderedScripts.push('13_module_to_do_list.sql');
+  if (scriptsNeeded.has('14_module_token.sql')) orderedScripts.push('14_module_token.sql');
+  if (scriptsNeeded.has('15_module_notes.sql')) orderedScripts.push('15_module_notes.sql');
 
   for (const scriptFile of orderedScripts) {
     const step = `run_${scriptFile}`;
@@ -145,29 +154,42 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
       await log(companyId, step, 'failed', `File not found: ${scriptPath}`);
       continue;
     }
-    const sqlText = fs.readFileSync(scriptPath, 'utf8');
-    const batches = sqlText.split(/^\s*GO\s*$/im).map(b => b.trim()).filter(Boolean);
-    let skipped = 0, failed = 0;
-    const failureMessages = [];
-    for (const batch of batches) {
-      try {
-        await tenantPool.request().query(batch);
-      } catch (e) {
-        if (isAlreadyExistsError(e)) { skipped++; continue; } // already there — fine
-        failed++;
-        failureMessages.push(e.message);
-        console.error(`[provisioning] ${slug}: ${scriptFile} statement failed:`, e.message);
-      }
-    }
+    const { skipped, failed, failureMessages, totalBatches } = await runSqlFileAgainstPool(tenantPool, scriptPath);
     if (failed > 0) {
       await log(companyId, step, 'failed', `${failed} statement(s) failed, ${skipped} already existed — ${failureMessages.join(' | ')}`);
-    } else if (skipped === batches.length) {
+    } else if (skipped === totalBatches) {
       await log(companyId, step, 'success', 'Already up to date — nothing new to create');
     } else {
       await log(companyId, step, 'success', skipped ? `${skipped} object(s) already existed, rest created` : undefined);
     }
     console.log(`[provisioning] ${slug}: ${scriptFile} done (skipped ${skipped}, failed ${failed})`);
   }
+}
+
+/**
+ * Runs one .sql file's GO-separated batches against an already-connected
+ * pool, skipping "already exists" failures exactly like runSchemaScripts
+ * above (extracted so a single ad-hoc file — e.g. a module-builder agent's
+ * brand-new, not-yet-merged schema file — can be run the same safe way
+ * without needing a companyId/provisioning_log entry, which is what
+ * runSchemaScripts itself needs since it's always logging progress for a
+ * real company's provisioning run).
+ */
+async function runSqlFileAgainstPool(pool, absPath) {
+  const sqlText = fs.readFileSync(absPath, 'utf8');
+  const batches = sqlText.split(/^\s*GO\s*$/im).map(b => b.trim()).filter(Boolean);
+  let skipped = 0, failed = 0;
+  const failureMessages = [];
+  for (const batch of batches) {
+    try {
+      await pool.request().query(batch);
+    } catch (e) {
+      if (isAlreadyExistsError(e)) { skipped++; continue; }
+      failed++;
+      failureMessages.push(e.message);
+    }
+  }
+  return { skipped, failed, failureMessages, totalBatches: batches.length };
 }
 
 async function provisionTenant(company, enabledModules, adminInfo = null) {
@@ -314,4 +336,7 @@ async function provisionModulesForExistingCompany(company, moduleKeys) {
   }
 }
 
-module.exports = { provisionTenant, provisionModulesForExistingCompany, MODULE_TO_SCRIPT, MODULE_DEPENDENCIES };
+module.exports = {
+  provisionTenant, provisionModulesForExistingCompany, MODULE_TO_SCRIPT, MODULE_DEPENDENCIES,
+  runSqlFileAgainstPool, isAlreadyExistsError, generateTempPassword, SQL_DIR,
+};

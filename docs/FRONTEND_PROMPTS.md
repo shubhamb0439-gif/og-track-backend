@@ -452,3 +452,155 @@ actually firing. Diagnose and fix.
 Report back what you find in the console/network tab if the fix in step 2 doesn't fully
 resolve it — there may be more than one issue here.
 ```
+
+---
+
+## 10. "AIDA Job" panel — master admin, on the long-press-logo quick-action menu
+
+**Status: backend built and verified — frontend change required, new UI.** Phase 1 of
+AIDA's coding-agent capability (see `docs/AIDA_PHASE1_SELF_FIX_PLAN.md`) — AIDA can now
+actually diagnose and fix real bugs in an authorized repo, push a branch, and open a real
+GitHub PR for review. Nothing merges without a human clicking Approve. This is the panel
+that surfaces that.
+
+**Confirmed placement**: a new button, **"AIDA Job"**, added to the existing long-press-
+the-center-logo quick-action menu on the master-admin AIDA page (the same menu that
+already shows a few other action buttons there) — not a new page.
+
+**Endpoints** (all master-admin auth, same pattern as every other masteradmin AIDA call):
+```
+GET  /api/masteradmin/aida/jobs?kind=dev_repo_fix&status=awaiting_approval&limit=20
+     -> { jobs: [ { id, kind, status, payload, result, errorMessage, createdAt, updatedAt }, ... ] }
+     kind/status/limit are all optional filters — omit any/all to get everything, most recent first.
+
+GET  /api/masteradmin/aida/jobs/:id
+     -> { job, events, ciStatus }
+     - job.result for a dev_repo_fix job that found something to fix:
+         { repo, task, agentSummary, changed: true, branch, prNumber, prUrl, toolLog }
+       for a run that found nothing to fix (the common case — most weeks nothing's broken):
+         { repo, task, agentSummary, changed: false, toolLog }
+       job.status is one of: queued | running | awaiting_approval | approved | rejected | completed | failed
+     - events: the full timeline, e.g. [{ event: "started" }, { event: "cloned" }, { event: "installed" },
+       { event: "agent_started" }, { event: "agent_finished" }, { event: "pushed" }, { event: "pr_opened" },
+       { event: "awaiting_approval" }, ...] — each with a createdAt and sometimes a detail object.
+     - ciStatus: { state: "success"|"failure"|"pending"|"unknown", description } or null if there's no PR
+       yet to check — fetched live from GitHub server-side, so you never need your own GitHub access here.
+
+POST /api/masteradmin/aida/jobs/:id/approve  -> { job }   (merges the real PR)
+POST /api/masteradmin/aida/jobs/:id/reject   -> { job }   (closes the real PR without merging)
+     Both only valid while job.status === "awaiting_approval".
+```
+
+Also available, for triggering a fix on demand instead of waiting for the weekly run —
+this already works today as a normal AIDA chat tool call (say something like "AIDA, look
+into the attendance clock-out bug" to master admin's chat), no new endpoint needed for
+that part.
+
+Live updates: the existing `aida:job` socket event (same `masteradmin:<userId>` room
+convention already used for other real-time AIDA events) fires on every status change —
+listening for it is optional (polling `GET /jobs` on an interval works fine too), but
+avoids needing to poll if you want it snappier.
+
+```
+Add an "AIDA Job" panel for master admin.
+
+1. Add a new button labeled "AIDA Job" to the existing long-press-center-logo
+   quick-action menu on the master-admin AIDA page, alongside whatever buttons are
+   already there.
+2. Clicking it opens a panel/modal that lists jobs via GET /api/masteradmin/aida/jobs
+   (default to kind=dev_repo_fix, no status filter, so both pending-review and
+   historical jobs show). For each job in the list show: a status badge, when it was
+   created, and — if present — job.result.agentSummary as a one-line preview. Sort by
+   newest first (the endpoint already returns them that way).
+3. Clicking a job in the list opens its detail (GET /api/masteradmin/aida/jobs/:id):
+   - The full agentSummary (plain language — this is meant to be read, not a raw diff).
+   - If job.result.prUrl exists, a link that opens it in a new tab (the actual code
+     review happens on GitHub — do not build a diff viewer here).
+   - The ciStatus (success/failure/pending/unknown) as a colored badge — make failure
+     stand out visually, since that's the case that should give a reviewer pause before
+     approving.
+   - If job.status === "awaiting_approval": Approve and Reject buttons, calling the
+     corresponding POST endpoints. After either, refresh the job (or just optimistically
+     update its status) and show a brief confirmation.
+   - If job.status is anything else (completed/failed/rejected/running/queued), no
+     Approve/Reject buttons — just show the current state. A "completed" job with
+     result.changed === false means AIDA looked and found nothing to fix — display that
+     as a normal, positive outcome, not as an error.
+   - Optionally, the event timeline (the `events` array) as a simple chronological list
+     — useful for seeing progress on a still-running job, not required for MVP.
+4. Handle the empty state (no jobs yet) and loading states reasonably.
+
+Do not build a custom diff viewer, do not add any direct GitHub API calls from the
+frontend (the backend already proxies CI status), and do not change anything about the
+existing chat UI — this is purely a new, additive panel.
+```
+
+---
+
+## 11. "AIDA Job" panel — extend it for `create_module` jobs (Phase 2)
+
+**Status: backend built — small extension to the existing panel from prompt 10, not a
+new panel.** Phase 2 of AIDA's coding-agent capability
+(`docs/AIDA_PHASE2_MODULE_BUILDER_PLAN.md`) lets master admin ask AIDA to build a whole
+new module (e.g. "create me a module called Attendance: ..."). It reuses every endpoint
+from prompt 10 — same job list, same detail call, same Approve/Reject buttons — just with
+a new `kind`, `"create_module"`, whose `job.result` and `ciStatus` are shaped differently
+because it involves TWO repos, not one.
+
+**Two things need to change:**
+
+1. **The job list should include `create_module` jobs, not just `dev_repo_fix`.** If your
+   `GET /jobs` call currently hardcodes `?kind=dev_repo_fix`, either drop the `kind` filter
+   entirely (shows every job kind, newest first) or fetch both kinds and merge — either is
+   fine, this doesn't need to be a toggle/tab for v1.
+
+2. **`job.result` and `ciStatus` have a different shape for `kind === "create_module"`:**
+   ```
+   job.result (once it has something to review):
+     {
+       moduleName, slug, agentSummary, changed: true,
+       branch,
+       backendRepo, frontendRepo,        // "owner/repo" strings
+       backendPr:  { number, url } | null,   // null only if the agent made no backend changes
+       frontendPr: { number, url } | null,   // null only if the agent made no frontend changes
+       previewUrls: {
+         backendUrl, frontendUrl,        // e.g. "http://localhost:4113"
+         backendReady, frontendReady,    // booleans — false means it didn't come up within the timeout
+       } | null,                          // null if booting the preview itself failed (rare)
+       toolLog
+     }
+   // a run that found nothing to change: { moduleName, slug, agentSummary, changed: false, toolLog }
+
+   ciStatus (only present/non-null for create_module once at least one PR exists):
+     { backend: {state, description} | null, frontend: {state, description} | null }
+   // null entry means that side had no changes/no PR to check — not a failure, don't show it as one.
+   ```
+
+3. **In the job detail view**, when `job.kind === "create_module"`:
+   - Show both PR links (whichever of `backendPr`/`frontendPr` is non-null) instead of the
+     single `prUrl` prompt 10 used for `dev_repo_fix` — label them "Backend PR" / "Frontend
+     PR".
+   - Show both CI badges from `ciStatus.backend`/`ciStatus.frontend` the same way prompt
+     10 showed one, skipping any side that's `null`.
+   - **New**: if `previewUrls` is present, show a prominent "Open Live Preview" button/link
+     using `previewUrls.frontendUrl` (that's the actual app UI to click through — the
+     backend URL is just its API, not meant to be opened directly). If
+     `previewUrls.frontendReady === false`, show a small note ("still starting up, try
+     again in a moment") instead of hiding the link — it may just need a few more seconds.
+   - Approve/Reject buttons work exactly as prompt 10 already built them — same two
+     endpoints, no change needed there; the backend now merges/closes both PRs and tears
+     down the preview internally.
+   - Everything else (status badges, agentSummary display, event timeline, empty/loading
+     states) is unchanged from prompt 10.
+
+Do not build anything new for triggering this — "AIDA, create me a module called X with
+these features: ..." already works today as a normal chat message to master admin's chat,
+same as prompt 10's on-demand trigger note.
+
+**One more small fix, applies to prompt 10's panel too, not just this one**: a job that
+fails before producing any `job.result` (e.g. npm install failing in the sandbox) has a
+real `job.errorMessage` string, but the panel currently only ever displays
+`job.result.agentSummary` — so a job like this shows "No summary yet" with literally no
+way to see what actually went wrong. Fix: when `job.status === "failed"` and there's no
+`job.result.agentSummary` to show, display `job.errorMessage` instead (plain text, it can
+be long — a raw stack/log excerpt — so don't truncate it, just let it wrap/scroll).

@@ -61,6 +61,23 @@ async function listQueuedJobs(limit = 5) {
   return rows.map(mapJob);
 }
 
+/**
+ * General-purpose job listing for a human to browse (the "AIDA Job" panel)
+ * — every prior job endpoint required already knowing a specific job id,
+ * which only ever worked for jobs a human personally triggered in chat. A
+ * job the WEEKLY SCHEDULER starts has no human around to hand an id to, so
+ * without this there was no way to even discover it existed. Master admin
+ * only for now — every job kind today is masteradmin-scoped (see
+ * jobRunner.js's roomForJob), so this deliberately isn't tenant-filtered.
+ */
+async function listJobs({ kind, status, limit = 20 } = {}) {
+  let q = coreDb('aida_jobs');
+  if (kind) q = q.where({ kind });
+  if (status) q = q.where({ status });
+  const rows = await q.orderBy('created_at', 'desc').limit(limit);
+  return rows.map(mapJob);
+}
+
 async function listEventsForJob(jobId) {
   const rows = await coreDb('aida_job_events').where({ job_id: jobId }).orderBy('created_at', 'asc');
   return rows.map(mapEvent);
@@ -83,4 +100,4 @@ async function appendEvent(jobId, event, detail) {
   });
 }
 
-module.exports = { createJob, getJob, listQueuedJobs, listEventsForJob, updateJobStatus, appendEvent };
+module.exports = { createJob, getJob, listJobs, listQueuedJobs, listEventsForJob, updateJobStatus, appendEvent };
