@@ -87,9 +87,26 @@ needs to register this module in a shared navigation/router file you were not gi
 file, do NOT edit it — describe the exact line(s) needed in your finish summary instead.`;
 }
 
+/** A "page" request is frontend-only — no backend route, no schema, no server.js/provisioning.js edits, no sidebar entry. Just one new self-contained HTML file. */
+function buildPageTask({ moduleName, slug, features }) {
+  return `Build a standalone, self-contained HTML page called "${moduleName}" at ${slug}.html.
+
+What it should contain:
+${formatFeatures(features)}
+
+This is a public/standalone page, NOT an integrated OG Track feature — do NOT touch the backend repo at
+all (no route file, no database schema, no server.js/provisioning.js changes), and do NOT add a sidebar
+entry or touch the app's navigation in index.html/masteradmin.html. Just one new file, ${slug}.html, with
+its own inline <style> (match the general visual feel of the existing site if you can infer it from
+index.html — colors, fonts — but this page does not need to share its layout or depend on its login/API
+adapter). Any form on the page can be non-functional UI only (no real backend to submit to) unless the
+requested features say otherwise.`;
+}
+
 module.exports = {
   async run(job, { appendEvent, updateStatus }) {
-    const { moduleName, features } = job.payload || {};
+    const { moduleName, features, kind } = job.payload || {};
+    const isPage = kind === 'page';
     if (!moduleName || !String(moduleName).trim()) {
       await updateStatus(job.id, 'failed', { errorMessage: 'Missing moduleName in job payload.' });
       return;
@@ -163,7 +180,9 @@ module.exports = {
       }
 
       const nextNumber = nextSchemaScriptNumber(backendSandbox.dir);
-      const task = buildTask({ moduleName, slug, features, nextNumber });
+      const task = isPage
+        ? buildPageTask({ moduleName, slug, features })
+        : buildTask({ moduleName, slug, features, nextNumber });
 
       await appendEvent(job.id, 'agent_started');
       const toolLog = [];

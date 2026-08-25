@@ -84,38 +84,48 @@ module.exports = [
   {
     name: 'create_module',
     description:
-      'Ask AIDA to build a brand-new OG Track module from scratch, across BOTH the backend and frontend ' +
-      'repos — e.g. "create me a module called Attendance with these features: ...". Clones both repos into ' +
-      'disposable sandboxes, writes the new backend routes/schema and frontend screens, and if successful, ' +
-      'pushes matching branches, opens a PR in each repo, and boots a LIVE local preview (both apps running ' +
-      'against a shared staging database) for a human to click through before approving. Never merges or ' +
-      'goes to production automatically. Runs as a background job — returns a job id immediately; check the ' +
-      'AIDA Job panel once it reaches awaiting_approval for the preview links.',
+      'Ask AIDA to build brand-new frontend/backend code from scratch and open a real PR for review — this ' +
+      'covers TWO different kinds of requests, set via `kind`: (1) "module" — a new integrated OG Track ' +
+      'feature with its own backend routes/database table, e.g. "create me a module called Attendance with ' +
+      'these features: ...". (2) "page" — a standalone, self-contained HTML page with NO backend/database ' +
+      'involved, e.g. "build me a landing page for a coffee shop" or "make me a Coming Soon page". Always use ' +
+      'this tool (not dev_repo_fix) for either kind of "build me something new" request. Clones the repo(s) ' +
+      'into disposable sandboxes, writes the code, and if successful, pushes a branch and opens a PR (both ' +
+      'repos\' PRs for a module, frontend-only for a page), and boots a LIVE local preview for a human to ' +
+      'click through before approving. Never merges or goes to production automatically. Runs as a background ' +
+      'job — returns a job id immediately; check the AIDA Job panel once it reaches awaiting_approval for the ' +
+      'preview link.',
     requiredModules: [MASTERADMIN_SENTINEL_MODULE],
     inputSchema: {
       type: 'object',
       properties: {
-        moduleName: { type: 'string', description: 'Human-readable module name, e.g. "Attendance" or "Vendor Scorecards".' },
+        kind: {
+          type: 'string',
+          enum: ['module', 'page'],
+          description: '"module" for a new integrated feature with its own backend/database; "page" for a standalone page with no backend involved (a landing page, a "coming soon" page, etc). Defaults to "module" if omitted.',
+        },
+        moduleName: { type: 'string', description: 'Human-readable name, e.g. "Attendance" or "Coming Soon".' },
         features: {
           type: 'array',
           items: { type: 'string' },
-          description: 'The feature list, in plain language, one item per feature (e.g. ["Clock in/out with GPS", "Weekly timesheet export"]).',
+          description: 'For a module: the feature list, one item per feature (e.g. ["Clock in/out with GPS", "Weekly timesheet export"]). For a page: what it should contain/say, one item per section or requirement (e.g. ["Title and short description", "Email signup form"]).',
         },
       },
       required: ['moduleName', 'features'],
     },
-    async handler(context, { moduleName, features }) {
+    async handler(context, { moduleName, features, kind }) {
       if (!config.aida.moduleBuilder.enabled) {
         return { error: 'The module builder is not fully configured on this server yet (missing repo names or the staging database connection).' };
       }
       if (!config.aida.codingAgent.enabled) {
         return { error: 'The coding agent is not configured on this server yet (missing its provider API key).' };
       }
-      const job = await jobStore.createJob({ kind: 'create_module', createdByUserId: context.userId, payload: { moduleName, features } });
+      const effectiveKind = kind === 'page' ? 'page' : 'module';
+      const job = await jobStore.createJob({ kind: 'create_module', createdByUserId: context.userId, payload: { moduleName, features, kind: effectiveKind } });
       return {
         jobId: job.id,
         status: job.status,
-        message: `Started building the "${moduleName}" module (job ${job.id}) across both repos. This runs in the background and can take a while — ask me to check on it, or watch the AIDA Job panel for the live preview link once it's ready for review.`,
+        message: `Started building the "${moduleName}" ${effectiveKind} (job ${job.id}). This runs in the background and can take a while — ask me to check on it, or watch the AIDA Job panel for the live preview link once it's ready for review.`,
       };
     },
   },
