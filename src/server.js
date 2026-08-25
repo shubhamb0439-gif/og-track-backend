@@ -30,6 +30,7 @@ const salesRoutes = require('./routes/sales');
 const uploadRoutes = require('./routes/upload');
 const { tenantAidaRouter, masterAdminAidaRouter } = require('./routes/aida');
 const aidaJobRunner = require('./aida/jobs/jobRunner');
+const super_admin_todo_listRoutes = require('./routes/super_admin_todo_list');
 
 const app = express();
 const server = http.createServer(app);
@@ -108,6 +109,7 @@ app.use('/api/:slug/upload', resolveTenant, uploadRoutes);
 // Not gated by requireModule: it's not a module, it's a layer over every
 // module. Each individual tool self-gates against req.company.enabled_modules.
 app.use('/api/:slug/aida', resolveTenant, tenantAidaRouter);
+app.use('/api/:slug/super_admin_todo_list', resolveTenant, requireModule('super_admin_todo_list'), super_admin_todo_listRoutes);
 
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));
