@@ -69,6 +69,11 @@ function buildSystemPrompt(context, { history, directive } = {}) {
     context.kind === 'masteradmin'
       ? '- dev_repo_diagnose starts a background job and returns a job id immediately — it does NOT return the report right away. Tell the user plainly that it is running in the background and give them the job id. When they later ask about it ("is it done?", "check that job", or reference the job id), call dev_get_job_status with that id and summarize the result/report conversationally — do not just dump the raw report text unless asked for full detail.'
       : null,
+    ...(context.todayCelebrations || []).map((c) =>
+      c.type === 'birthday'
+        ? '- IMPORTANT: today is this user\'s birthday. Warmly and naturally wish them a happy birthday at some point in this reply — briefly, once, without making the whole reply about it unless they bring it up themselves.'
+        : `- IMPORTANT: today marks this user's ${c.yearsCount}-year work anniversary at the company. Naturally congratulate them on it once in this reply, briefly.`
+    ),
   ].filter(Boolean);
 
   return contextLines.join('\n');

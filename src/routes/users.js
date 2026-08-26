@@ -1,5 +1,6 @@
 const express = require('express');
 const { hashPassword, verifyPassword, issueToken, requireAuth } = require('../utils/auth');
+const { matchTodayCelebrations } = require('../aida/celebrations');
 
 const router = express.Router();
 
@@ -23,15 +24,6 @@ function parseDateOnly(input) {
   // otherwise silently roll over into March).
   if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
   return { dateStr: s, year, month, day };
-}
-
-// Extracts { year, month, day } from whatever a DATE column comes back as
-// (a JS Date instance or a string), or null if the value is empty/invalid.
-function dateParts(v) {
-  if (!v) return null;
-  const d = (v instanceof Date) ? v : new Date(v);
-  if (isNaN(d.getTime())) return null;
-  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
 }
 
 // GET /api/:slug/users
@@ -80,21 +72,11 @@ router.post('/register', async (req, res) => {
 // scoping: every logged-in user in the company should see today's list.
 router.get('/today-celebrations', async (req, res) => {
   try {
-    const now = new Date();
-    const todayMonth = now.getUTCMonth() + 1;
-    const todayDay = now.getUTCDate();
-    const currentYear = now.getUTCFullYear();
-
     const rows = await req.db('users').select('id', 'name', 'date_of_birth', 'joining_date');
     const results = [];
     for (const row of rows) {
-      const dob = dateParts(row.date_of_birth);
-      if (dob && dob.month === todayMonth && dob.day === todayDay) {
-        results.push({ userId: row.id, name: row.name, type: 'birthday', yearsCount: null });
-      }
-      const joined = dateParts(row.joining_date);
-      if (joined && joined.month === todayMonth && joined.day === todayDay && joined.year !== currentYear) {
-        results.push({ userId: row.id, name: row.name, type: 'anniversary', yearsCount: currentYear - joined.year });
+      for (const c of matchTodayCelebrations(row.date_of_birth, row.joining_date)) {
+        results.push({ userId: row.id, name: row.name, type: c.type, yearsCount: c.yearsCount ?? null });
       }
     }
     res.json(results);
