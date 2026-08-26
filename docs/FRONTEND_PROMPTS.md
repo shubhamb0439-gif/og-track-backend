@@ -604,3 +604,63 @@ real `job.errorMessage` string, but the panel currently only ever displays
 way to see what actually went wrong. Fix: when `job.status === "failed"` and there's no
 `job.result.agentSummary` to show, display `job.errorMessage` instead (plain text, it can
 be long — a raw stack/log excerpt — so don't truncate it, just let it wrap/scroll).
+
+---
+
+## 12. Birthday / work-anniversary tracking — registration field + popups
+
+**Status: backend built (PR open, pending approval) — frontend change required, new UI.**
+Employees can now have a date of birth and a joining date on file; once merged, the app
+should surface that as a fun, low-key celebration — not gate anything behind it.
+
+**Endpoints** (live once the backend PR merges):
+```
+POST /api/:slug/users/register
+  Body now optionally accepts: dateOfBirth ("YYYY-MM-DD" string). Everything else about
+  this endpoint is unchanged. joining_date is stamped automatically server-side — nothing
+  to send for that.
+
+GET /api/:slug/users/today-celebrations
+  -> [ { userId, name, type: "birthday" | "anniversary", yearsCount }, ... ]
+  yearsCount is only meaningful (and present) for type "anniversary" — years since joining.
+  Empty array on a normal day with nothing to celebrate. No special auth beyond the normal
+  logged-in request — every user in the company can see this.
+
+PATCH /api/:slug/users/me/dob
+  Body: { dateOfBirth: "YYYY-MM-DD" }
+  Sets the CURRENTLY LOGGED IN user's own date_of_birth (validated server-side: must be a
+  real date, not in the future). Uses the same auth as any other authenticated request.
+
+Note: the existing GET /api/:slug/users (or wherever the frontend already reads the logged-
+in user's own row) will include date_of_birth/joining_date automatically once the backend
+PR merges — no new endpoint needed just to check whether the current user already has a
+DOB on file.
+```
+
+```
+Add birthday/work-anniversary tracking to the frontend.
+
+1. Registration form: add an optional "Date of Birth" date picker. If filled in, include it
+   in the POST /register body as dateOfBirth ("YYYY-MM-DD"); if left blank, omit it — it's
+   optional at registration time (people can fill it in later via step 3 below).
+
+2. On login/page load, once per day per user (track "already shown today" in localStorage,
+   keyed by today's date + the user's id, so it doesn't repeat on every navigation — just
+   once when they first open the app that day), call GET /api/:slug/users/today-celebrations.
+   If it returns any entries:
+   - For each "birthday" entry: show a celebratory popup/toast visible to everyone in the
+     company — something like "🎉 Today is <name>'s birthday! Wish them well."
+   - For each "anniversary" entry: similar, e.g. "🎊 Today marks <name>'s <yearsCount>-year
+     work anniversary!"
+   - If there are multiple entries the same day, show all of them (stacked toasts, or one
+     combined popup listing everyone) — don't just show the first and drop the rest.
+
+3. If the currently logged-in user has no date_of_birth on file (check their own user row,
+   per the note above), show a one-time popup (once per session is fine, or track
+   "dismissed" in localStorage if you want it less naggy) asking them to enter their date of
+   birth, saving it via PATCH /api/:slug/users/me/dob. Let them dismiss/skip it — this
+   should never block using the app.
+
+Keep this purely additive — don't change any existing registration/login behavior beyond
+what's described here.
+```
