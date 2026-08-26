@@ -115,13 +115,23 @@ ${frontendRegistration}
    read/edit specific line ranges) to make the actual targeted edit. This works and has been done
    successfully before — attempt it before concluding a manual step is required. Delete any scratch/temp
    files you create this way before calling finish; they must not end up in the PR.
-5. Before calling finish: run the backend's test suite (run_command repo:"backend" npm test) and the
+5. HARD REQUIREMENT before calling finish with success: true, for a module (not a standalone page): if
+   index.html and/or masteradmin.html appear in your insert-only list above, you MUST have already made
+   BOTH of these edits yourself — a sidebar/in-page entry in index.html (rule 3b), AND a checkbox entry in
+   masteradmin.html's module list (the same ALL_MODULES-style array pattern used for every other module,
+   so a human can actually enable this module for a company) — before finishing. Writing "add this
+   manually" in your summary for a file you had insert-only access to is a FAILURE to complete the task,
+   not an acceptable shortcut — a human should never need to hand-edit either file for a module you had
+   the access to wire up yourself. The ONLY acceptable reason to describe a manual step in your summary is
+   a file you were NOT given insert-only access to at all.
+6. Before calling finish: run the backend's test suite (run_command repo:"backend" npm test) and the
    frontend's build (run_command repo:"frontend", whatever its build script is — check package.json
    first). If either fails, keep iterating; if you truly cannot get both green, call finish anyway with
    success: false and explain what failed and why.
-6. Call finish exactly once. Its summary is read directly by a human deciding whether to approve a live
+7. Call finish exactly once. Its summary is read directly by a human deciding whether to approve a live
    preview and push this to production — write it for that audience: what the module does, what you
-   built on each side, and any manual step still genuinely needed (after actually attempting rule 4).`;
+   built on each side, and any manual step still genuinely needed (only for files outside your insert-only
+   access — see rule 5).`;
 }
 
 /** Same contract as providers/moduleBuilder.js's runModuleBuilderAgent — see that file for parameter/return shape. */

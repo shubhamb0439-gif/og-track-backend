@@ -192,12 +192,12 @@ module.exports = {
         existingFiles,
         insertOnlyFiles: mb.insertOnlyFiles,
         originalContents,
-        // Raised from 40, then 60 — the agent now (a) attempts the large-file
-        // (index.html) workaround instead of giving up, AND (b) has to find
-        // and hook into the SPA's own in-page view-dispatch mechanism rather
-        // than just appending a sidebar array entry, both of which cost
-        // real iterations on top of building both repos.
-        maxIterations: 80,
+        // Raised from 40, then 60, then 80 — wiring BOTH index.html (in-page
+        // view dispatch, past read_file's size cap) AND masteradmin.html
+        // (ALL_MODULES checkbox) is now a hard requirement in the same run
+        // (no more "add this manually" shortcut — see the system prompt's
+        // rule 5), on top of building both repos' actual module code.
+        maxIterations: 100,
         onEvent: (e) => toolLog.push(e),
       });
       await appendEvent(job.id, 'agent_finished', { success: agentResult.success, toolCallCount: agentResult.toolLog.length });
