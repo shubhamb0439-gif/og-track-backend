@@ -31,9 +31,6 @@ const uploadRoutes = require('./routes/upload');
 const { tenantAidaRouter, masterAdminAidaRouter } = require('./routes/aida');
 const aidaJobRunner = require('./aida/jobs/jobRunner');
 const to_do_listRoutes = require('./routes/to_do_list');
-const tokenRoutes = require('./routes/token');
-const notesRoutes = require('./routes/notes');
-const birthdayRoutes = require('./routes/birthday');
 
 const app = express();
 const server = http.createServer(app);
@@ -113,9 +110,6 @@ app.use('/api/:slug/upload', resolveTenant, uploadRoutes);
 // module. Each individual tool self-gates against req.company.enabled_modules.
 app.use('/api/:slug/aida', resolveTenant, tenantAidaRouter);
 app.use('/api/:slug/to_do_list', resolveTenant, requireModule('to_do_list'), to_do_listRoutes);
-app.use('/api/:slug/token', resolveTenant, requireModule('token'), tokenRoutes);
-app.use('/api/:slug/notes', resolveTenant, requireModule('notes'), notesRoutes);
-app.use('/api/:slug/birthday', resolveTenant, requireModule('birthday'), birthdayRoutes);
 
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));
