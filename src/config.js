@@ -254,4 +254,40 @@ module.exports = {
       })(),
     };
   })(),
+  // WhatsApp Business Cloud API bridge (src/routes/whatsapp.js) — lets an
+  // allowlisted phone number chat with AIDA's master-admin context over
+  // WhatsApp instead of the web app. Deliberately NOT validated via
+  // required() — same reasoning as `aida` above, the app must keep booting
+  // even before this is configured; the route itself no-ops until enabled.
+  whatsapp: (() => {
+    const accessToken = process.env.WHATSAPP_ACCESS_TOKEN || null;
+    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID || null;
+    // Optional: map a specific allowed phone number to a specific
+    // platform_admins row by email, e.g. {"8310066102":"masteradmin@ogplus.com"}
+    // — so the AIDA reply/audit trail (job approve/reject) reflects who
+    // actually messaged. A number with no entry here falls back to the
+    // first active platform admin at request time (see routes/whatsapp.js).
+    let adminMap = {};
+    if (process.env.WHATSAPP_ADMIN_MAP) {
+      try { adminMap = JSON.parse(process.env.WHATSAPP_ADMIN_MAP); }
+      catch (e) { console.error('[config] WHATSAPP_ADMIN_MAP is not valid JSON, ignoring:', e.message); }
+    }
+    return {
+      enabled: !!(accessToken && phoneNumberId),
+      // Arbitrary secret YOU pick and enter into Meta's webhook setup form —
+      // proves the GET verification handshake request actually came from
+      // your own Meta app config, not a guess.
+      verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || null,
+      accessToken,
+      phoneNumberId,
+      // Meta app's "App Secret" — used to verify the X-Hub-Signature-256
+      // header on every incoming POST, so a forged request can't impersonate
+      // an allowed number. Strongly recommended; POSTs are rejected outright
+      // once this is set.
+      appSecret: process.env.WHATSAPP_APP_SECRET || null,
+      allowedNumbers: (process.env.WHATSAPP_ALLOWED_NUMBERS || '')
+        .split(',').map((s) => s.trim()).filter(Boolean),
+      adminMap,
+    };
+  })(),
 };

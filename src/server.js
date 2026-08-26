@@ -29,6 +29,7 @@ const manufacturingRoutes = require('./routes/manufacturing');
 const salesRoutes = require('./routes/sales');
 const uploadRoutes = require('./routes/upload');
 const { tenantAidaRouter, masterAdminAidaRouter } = require('./routes/aida');
+const whatsappRoutes = require('./routes/whatsapp');
 const aidaJobRunner = require('./aida/jobs/jobRunner');
 const to_do_listRoutes = require('./routes/to_do_list');
 const tokenRoutes = require('./routes/token');
@@ -40,7 +41,11 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'] } });
 
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+// `verify` stashes the raw request bytes on req.rawBody alongside the parsed
+// req.body — needed by routes/whatsapp.js to check Meta's X-Hub-Signature-256
+// header (HMAC is computed over the exact raw bytes, not the re-serialized
+// JSON, which can differ in whitespace/key order). No effect on any other route.
+app.use(express.json({ limit: '5mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // Make io available to every route via req.io.
 app.use((req, _res, next) => { req.io = io; next(); });
@@ -76,6 +81,9 @@ app.use('/api/companies', companiesRoutes);
 app.use('/api/masteradmin', masteradminRoutes);
 // AIDA for master admin (domain.com/master-admin/aida) — cross-company tools only.
 app.use('/api/masteradmin/aida', masterAdminAidaRouter);
+// WhatsApp Business Cloud API bridge to AIDA's master-admin context — see
+// routes/whatsapp.js. No-ops (200 with nothing done) until fully configured.
+app.use('/api/whatsapp', whatsappRoutes);
 
 // ── Tenant-scoped routes — every path carries the :slug segment ───────────────
 // resolveTenant runs first (attaches req.db + req.company), then each module's
