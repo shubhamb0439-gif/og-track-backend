@@ -15,6 +15,7 @@ const { warmFillerCache } = require('../aida/voice/fillerPhrases');
 const { createTurnTimer } = require('../aida/latency');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
 const { getCombinedStatus } = require('../aida/codingAgent/github');
+const { matchTodayCelebrations } = require('../aida/celebrations');
 
 registerAllTools();
 sessionMemory.startSweeper();
@@ -81,6 +82,23 @@ function voiceTargetFor(context) {
 async function runConversationTurn({ req, context, userMessage, wantsVoice, pre }) {
   const history = sessionMemory.getHistory(context);
   const useStreaming = wantsVoice && config.aida.streamingEnabled;
+
+  // First turn of a fresh conversation ("the user just opened/activated
+  // AIDA") — check once whether today is this user's birthday or work
+  // anniversary so engine.js can have AIDA work a natural wish into its
+  // reply. Deliberately not re-checked on every later turn in the same
+  // conversation (that would mean AIDA repeating the wish on every message).
+  // Nice-to-have only: any failure here must never break or delay a normal
+  // chat reply.
+  if (context.kind === 'tenant' && history.length === 0) {
+    try {
+      const user = await req.db('users').where({ id: context.userId }).first();
+      const celebrations = user ? matchTodayCelebrations(user.date_of_birth, user.joining_date) : [];
+      if (celebrations.length) context.todayCelebrations = celebrations;
+    } catch (e) {
+      console.error('[aida] today-celebration lookup failed (non-fatal):', e);
+    }
+  }
 
   // `pre` lets a caller start the turn (and its filler-delay clock) BEFORE
   // userMessage is even known — see POST /voice-input, which starts this
