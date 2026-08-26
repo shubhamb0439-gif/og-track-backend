@@ -1,11 +1,37 @@
 const express = require('express');
-const { hashPassword, verifyPassword, issueToken } = require('../utils/auth');
+const { hashPassword, verifyPassword, issueToken, requireAuth } = require('../utils/auth');
 
 const router = express.Router();
 
 function stripPassword(u) {
   const { password_hash, ...safe } = u;
   return safe;
+}
+
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+// Parses a 'YYYY-MM-DD' (or ISO datetime prefix) string into its date parts,
+// or returns null if it isn't a real, parseable calendar date.
+function parseDateOnly(input) {
+  if (!input) return null;
+  const s = String(input).slice(0, 10);
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]);
+  const d = new Date(Date.UTC(year, month - 1, day));
+  // Catches calendar-invalid dates like 2024-02-30 (which JS Date would
+  // otherwise silently roll over into March).
+  if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
+  return { dateStr: s, year, month, day };
+}
+
+// Extracts { year, month, day } from whatever a DATE column comes back as
+// (a JS Date instance or a string), or null if the value is empty/invalid.
+function dateParts(v) {
+  if (!v) return null;
+  const d = (v instanceof Date) ? v : new Date(v);
+  if (isNaN(d.getTime())) return null;
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
 }
 
 // GET /api/:slug/users
@@ -19,22 +45,85 @@ router.get('/', async (req, res) => {
 // POST /api/:slug/users/register
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, role, dateOfBirth } = req.body;
     if (!name || !email || !password || !role) {
       return res.status(400).json({ error: 'name, email, password, and role are required' });
     }
+
+    // dateOfBirth is optional at registration — plenty of people fill it in
+    // later via the "please enter your DOB" prompt instead.
+    let date_of_birth = null;
+    if (dateOfBirth) {
+      const parsed = parseDateOnly(dateOfBirth);
+      if (!parsed) return res.status(400).json({ error: 'dateOfBirth must be a valid date (YYYY-MM-DD)' });
+      date_of_birth = parsed.dateStr;
+    }
+
     const emailLower = email.toLowerCase();
     const existing = await req.db('users').where({ email: emailLower }).first();
     if (existing) return res.status(400).json({ error: 'Email already registered.' });
 
     const password_hash = await hashPassword(password);
     const id = 'u' + Date.now();
-    const user = { id, name, email: emailLower, password_hash, role, status: 'pending' };
+    // joining_date is always today — it's literally this person's onboarding date.
+    const user = { id, name, email: emailLower, password_hash, role, status: 'pending', date_of_birth, joining_date: todayStr() };
     await req.db('users').insert(user);
 
     const safe = stripPassword(user);
     req.io.to(req.company.slug).emit('user:registered', safe);
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/:slug/users/today-celebrations — everyone in this tenant having a
+// birthday or work anniversary today. No extra auth beyond normal tenant
+// scoping: every logged-in user in the company should see today's list.
+router.get('/today-celebrations', async (req, res) => {
+  try {
+    const now = new Date();
+    const todayMonth = now.getUTCMonth() + 1;
+    const todayDay = now.getUTCDate();
+    const currentYear = now.getUTCFullYear();
+
+    const rows = await req.db('users').select('id', 'name', 'date_of_birth', 'joining_date');
+    const results = [];
+    for (const row of rows) {
+      const dob = dateParts(row.date_of_birth);
+      if (dob && dob.month === todayMonth && dob.day === todayDay) {
+        results.push({ userId: row.id, name: row.name, type: 'birthday', yearsCount: null });
+      }
+      const joined = dateParts(row.joining_date);
+      if (joined && joined.month === todayMonth && joined.day === todayDay && joined.year !== currentYear) {
+        results.push({ userId: row.id, name: row.name, type: 'anniversary', yearsCount: currentYear - joined.year });
+      }
+    }
+    res.json(results);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/:slug/users/me/dob — the calling (authenticated) user sets
+// their own date_of_birth.
+router.patch('/me/dob', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.slug !== req.company.slug) {
+      return res.status(401).json({ error: 'Token is not valid for this company' });
+    }
+    const parsed = parseDateOnly(req.body.dateOfBirth);
+    if (!parsed) return res.status(400).json({ error: 'dateOfBirth is required and must be a valid date (YYYY-MM-DD)' });
+
+    const now = new Date();
+    const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    const givenUtc = Date.UTC(parsed.year, parsed.month - 1, parsed.day);
+    if (givenUtc > todayUtc) return res.status(400).json({ error: 'dateOfBirth cannot be in the future' });
+
+    const user = await req.db('users').where({ id: req.auth.userId }).first();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    await req.db('users').where({ id: req.auth.userId }).update({ date_of_birth: parsed.dateStr, updated_at: new Date() });
+    const updated = await req.db('users').where({ id: req.auth.userId }).first();
+    const safe = stripPassword(updated);
+    req.io.to(req.company.slug).emit('user:updated', safe);
+    res.json(safe);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
