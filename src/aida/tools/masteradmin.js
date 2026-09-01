@@ -125,10 +125,12 @@ module.exports = [
     description:
       "Saves a durable fact to your long-term memory — persists across every future conversation with this " +
       "master admin, not just this one. Only for things worth remembering long-term: a standing preference " +
-      "('always keep replies terse'), a correction to how you should work going forward, or real context about " +
-      "an ongoing project/decision. Do NOT save ephemeral task details, one-off requests, or anything already " +
-      "obvious from the code/data itself. Categorize as 'user' (their role/preferences), 'feedback' (a " +
-      "correction on how you should work), 'project' (ongoing initiative/decision context), or 'reference' " +
+      "('always keep replies terse'), a correction to how you should work going forward, real context about an " +
+      "ongoing project/decision, or a genuinely personal fact about them (birthday, family, things they've " +
+      "mentioned about themselves) — 'user' is not limited to work-related facts, save real personal context too " +
+      "when they share it. Do NOT save ephemeral task details, one-off requests, or anything already obvious " +
+      "from the code/data itself. Categorize as 'user' (their role, preferences, or personal facts), 'feedback' " +
+      "(a correction on how you should work), 'project' (ongoing initiative/decision context), or 'reference' " +
       "(a pointer to an external system, e.g. \"bugs are tracked in Linear project X\").",
     requiredModules: ['__masteradmin__'],
     inputSchema: {
