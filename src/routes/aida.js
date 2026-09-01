@@ -17,6 +17,7 @@ const { buildDirective, safeDirective } = require('../aida/responseDirector');
 const { getCombinedStatus } = require('../aida/codingAgent/github');
 const { matchTodayCelebrations } = require('../aida/celebrations');
 const { tryResolvePreviewUrl } = require('../aida/jobs/previewResolver');
+const memory = require('../aida/memory');
 
 registerAllTools();
 sessionMemory.startSweeper();
@@ -98,6 +99,19 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre 
       if (celebrations.length) context.todayCelebrations = celebrations;
     } catch (e) {
       console.error('[aida] today-celebration lookup failed (non-fatal):', e);
+    }
+  }
+
+  // Long-term memory (see src/aida/memory.js) — loaded every masteradmin
+  // turn, not just the first (unlike the birthday check above, this should
+  // always be current — memories can be added/forgotten mid-conversation via
+  // their own tools). Cheap: master-admin-only, a small table. Nice-to-have
+  // only: any failure here must never break or delay a normal chat reply.
+  if (context.kind === 'masteradmin' && config.aida.memory.enabled) {
+    try {
+      context.memories = await memory.getActiveMemories();
+    } catch (e) {
+      console.error('[aida] memory lookup failed (non-fatal):', e);
     }
   }
 

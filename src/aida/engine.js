@@ -72,6 +72,13 @@ function buildSystemPrompt(context, { history, directive } = {}) {
     context.kind === 'masteradmin'
       ? '- CRITICAL SAFETY RULE: some tools (send_message_to_user, dev_approve_job, dev_reject_job, and any future tool with a `confirmed` parameter) take real, visible, hard-to-reverse actions. Calling one of these WITHOUT confirmed:true returns a preview, not the real action — nothing happens yet. When you get a result with status: "needs_confirmation", you MUST stop, read the preview back to the user in plain language, and wait for their explicit yes in their NEXT message. Only call the SAME tool again with confirmed: true after that explicit confirmation — never infer consent from the original request alone, never set confirmed: true in the same turn you first called it.'
       : null,
+    context.kind === 'masteradmin'
+      ? '- You have a persistent long-term memory (below, if anything is saved) for durable facts about this master admin — standing preferences, corrections to how you should work, ongoing project/decision context, or pointers to external systems. Save something with save_memory ONLY when it is genuinely worth remembering in every future conversation, not for ephemeral task details or one-off requests. If asked to forget something, call forget_memory with its id.'
+      : null,
+    context.kind === 'masteradmin' && context.memories?.length
+      ? `- Memory (things you already know from past conversations with this master admin — treat as established, don't re-ask):\n` +
+        context.memories.map((m) => `  [${m.id}] (${m.category}) ${m.content}`).join('\n')
+      : null,
     ...(context.todayCelebrations || []).map((c) =>
       c.type === 'birthday'
         ? '- IMPORTANT: today is this user\'s birthday. Warmly and naturally wish them a happy birthday at some point in this reply — briefly, once, without making the whole reply about it unless they bring it up themselves.'

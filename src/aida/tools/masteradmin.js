@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const config = require('../../config');
 const { callPlatformApi, callTenantApi } = require('../apiClient');
+const memory = require('../memory');
 
 /**
  * Master-admin-only tools (domain.com/master-admin/aida). These operate on
@@ -116,6 +117,47 @@ module.exports = [
         return { error: `Failed to send message: ${e.message}` };
       }
       return { success: true, to: recipient.name, company: companySlug };
+    },
+  },
+
+  {
+    name: 'save_memory',
+    description:
+      "Saves a durable fact to your long-term memory — persists across every future conversation with this " +
+      "master admin, not just this one. Only for things worth remembering long-term: a standing preference " +
+      "('always keep replies terse'), a correction to how you should work going forward, or real context about " +
+      "an ongoing project/decision. Do NOT save ephemeral task details, one-off requests, or anything already " +
+      "obvious from the code/data itself. Categorize as 'user' (their role/preferences), 'feedback' (a " +
+      "correction on how you should work), 'project' (ongoing initiative/decision context), or 'reference' " +
+      "(a pointer to an external system, e.g. \"bugs are tracked in Linear project X\").",
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', enum: memory.CATEGORIES },
+        content: { type: 'string' },
+      },
+      required: ['category', 'content'],
+    },
+    async handler(context, { category, content }) {
+      if (!config.aida.memory.enabled) return { error: 'Long-term memory is not enabled on this server.' };
+      const saved = await memory.saveMemory({ category, content });
+      return { success: true, memory: saved };
+    },
+  },
+
+  {
+    name: 'forget_memory',
+    description: 'Deletes a saved memory by its id (shown alongside every memory in your system context) — use when the master admin explicitly asks you to forget something.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+    },
+    async handler(context, { id }) {
+      const found = await memory.forgetMemory(id);
+      return found ? { success: true } : { error: `No memory found with id "${id}".` };
     },
   },
 ];

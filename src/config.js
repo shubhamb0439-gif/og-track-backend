@@ -250,6 +250,22 @@ module.exports = {
           model: process.env.AIDA_STT_MODEL || 'gpt-4o-mini-transcribe',
         };
       })(),
+      // Master-admin-only long-term memory (src/aida/memory.js) — distilled
+      // facts AIDA saves/recalls across conversations, backed by OGCore's
+      // aida_memories table. AIDA_MEMORY_RETENTION picks a global tier:
+      // '1y' | '2y' | 'lifetime' | 'none' (default — feature fully off,
+      // matches every existing deployment until this is deliberately turned
+      // on). retentionDays is null for 'lifetime' (no cutoff, keep forever).
+      memory: (() => {
+        const tier = (process.env.AIDA_MEMORY_RETENTION || 'none').toLowerCase();
+        const TIERS = { '1y': 365, '2y': 730, lifetime: null };
+        const recognized = Object.prototype.hasOwnProperty.call(TIERS, tier);
+        if (tier !== 'none' && !recognized) {
+          console.error(`[config] AIDA_MEMORY_RETENTION="${tier}" is not a recognized tier (1y, 2y, lifetime, none) — memory stays disabled.`);
+        }
+        const enabled = tier !== 'none' && recognized;
+        return { enabled, tier, retentionDays: enabled ? TIERS[tier] : null };
+      })(),
     };
   })(),
   // WhatsApp Business Cloud API bridge (src/routes/whatsapp.js) — lets an
