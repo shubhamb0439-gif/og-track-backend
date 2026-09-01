@@ -1,0 +1,72 @@
+# Deploys every non-main branch to the "preview" deployment slot, so an
+# AIDA-authored branch (or anything you're working on locally) gets a real,
+# live URL to click and test — without merging to main first. Runs the exact
+# same build/test steps as the production workflow (main_og-track-backend.yml)
+# but targets slot-name: 'preview' instead of 'Production', using a separate
+# publish profile scoped to that slot (see AZUREAPPSERVICE_PUBLISHPROFILE_PREVIEW
+# below — must be added as its own repo secret; the production workflow's
+# publish-profile secret only has access to the Production slot).
+#
+# The preview slot's own Application Settings should mirror production's
+# (same AZURE_SQL_SERVER/CORE_DB etc.) — safety comes from testing under the
+# 'aida-preview' tenant specifically, which already points at an isolated
+# staging database (see config.js's moduleBuilder.stagingDb / createModule.js),
+# not from the preview slot using different infrastructure.
+
+name: Deploy preview branches to Azure staging slot
+
+on:
+  push:
+    branches-ignore:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js version
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22.x'
+
+      - name: npm install, build, and test
+        env:
+          AZURE_SQL_SERVER: ci-dummy.database.windows.net
+          AZURE_SQL_USER: ci-dummy
+          AZURE_SQL_PASSWORD: ci-dummy-password-not-real
+          JWT_SECRET: ci-dummy-jwt-secret-not-real
+        run: |
+          npm install
+          npm run build --if-present
+          npm run test --if-present
+
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app-preview
+          path: .
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: node-app-preview
+
+      - name: 'Deploy to Azure Web App preview slot'
+        id: deploy-to-webapp-preview
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'og-track-backend'
+          slot-name: 'preview'
+          package: .
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_PREVIEW }}
