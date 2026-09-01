@@ -88,7 +88,27 @@ async function closePullRequest({ owner, repo, token, pullNumber }) {
   return githubRequest(token, 'PATCH', `/repos/${owner}/${repo}/pulls/${pullNumber}`, { state: 'closed' });
 }
 
+/**
+ * Azure Static Web Apps' per-PR preview hostnames include a region and a
+ * revision number (e.g. polite-ground-0d0cadb00-13.eastasia.7.azurestaticapps.net)
+ * that aren't derivable from the PR number alone — the only place the real
+ * URL shows up is the comment github-actions[bot] posts once the
+ * Azure/static-web-apps-deploy build finishes (1-3 minutes after the PR
+ * opens), reading "Azure Static Web Apps: Your stage site is ready! Visit it
+ * here: <url>". Returns null if that comment hasn't appeared yet — expected
+ * and normal for a PR that was just opened; try again on a later poll.
+ */
+async function getSwaPreviewUrl({ owner, repo, token, pullNumber }) {
+  const comments = await githubRequest(token, 'GET', `/repos/${owner}/${repo}/issues/${pullNumber}/comments`);
+  for (const c of comments || []) {
+    if (c.user?.login !== 'github-actions[bot]') continue;
+    const m = /Visit it here:\s*(https:\/\/\S+)/.exec(c.body || '');
+    if (m) return m[1];
+  }
+  return null;
+}
+
 module.exports = {
   createBranch, commitAll, pushBranch, openPullRequest, getCombinedStatus,
-  mergePullRequest, closePullRequest, GitHubApiError,
+  mergePullRequest, closePullRequest, getSwaPreviewUrl, GitHubApiError,
 };

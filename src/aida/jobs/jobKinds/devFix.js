@@ -135,10 +135,21 @@ module.exports = {
       });
       await appendEvent(job.id, 'pr_opened', { prNumber: pr.number, prUrl: pr.html_url });
 
+      // The backend repo's preview URL is a FIXED, always-known value (the
+      // "preview" deployment slot auto-deploys any non-main branch push —
+      // see config.aida.previewBackendUrl) — no need to wait or poll for it.
+      // The frontend repo's Azure Static Web Apps preview hostname is
+      // per-PR/unpredictable and only appears in a bot comment once its build
+      // finishes (1-3 min later), so it starts null here and gets filled in
+      // by GET /jobs/:id once that comment shows up (see routes/aida.js).
+      const previewUrl = repo === config.aida.moduleBuilder.backendRepo
+        ? config.aida.previewBackendUrl
+        : null;
+
       await updateStatus(job.id, 'awaiting_approval', {
         result: {
           repo, task: effectiveTask, agentSummary: agentResult.summary, changed: true,
-          branch: branchName, prNumber: pr.number, prUrl: pr.html_url, toolLog: agentResult.toolLog,
+          branch: branchName, prNumber: pr.number, prUrl: pr.html_url, previewUrl, toolLog: agentResult.toolLog,
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { prUrl: pr.html_url });

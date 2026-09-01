@@ -102,6 +102,14 @@ module.exports = {
       githubToken: process.env.AIDA_GITHUB_TOKEN || null,
       authorizedRepos: (process.env.AIDA_AUTHORIZED_REPOS || '')
         .split(',').map((s) => s.trim()).filter(Boolean),
+      // The backend's "preview" deployment slot (see .github/workflows/
+      // preview_og-track-backend.yml) — a FIXED, always-known URL, unlike the
+      // frontend's per-PR Azure Static Web Apps preview hostname (which is
+      // unpredictable and has to be fetched from GitHub after the fact — see
+      // devFix.js/getSwaPreviewUrl). Any push to a non-main branch already
+      // auto-deploys there, so a dev_repo_fix job against the backend repo
+      // can report this URL immediately, with no polling needed.
+      previewBackendUrl: process.env.AIDA_PREVIEW_BACKEND_URL || null,
       // Coding agent (src/aida/codingAgent/) — the "AIDA writes and tests
       // actual code" capability (phase 1: weekly self-diagnose-and-fix; see
       // docs/AIDA_PHASE1_SELF_FIX_PLAN.md). Deliberately its OWN provider
@@ -160,16 +168,6 @@ module.exports = {
           previewCompanySlug,
           backendRepo,
           frontendRepo,
-          frontendStartCommand: process.env.AIDA_MODULE_FRONTEND_START_CMD || 'node serve.js',
-          // Confirmed: the frontend has no API-base-URL env var and no build
-          // step at all (plain static HTML, serve.js just serves it as-is).
-          // Its inline script instead hardcodes http://localhost:3000
-          // whenever it detects it's being viewed from localhost — so the
-          // preview backend MUST bind to this exact port for the frontend
-          // preview to be able to reach it; only frontend gets a dynamically
-          // picked free port (via FRONTEND_PORT, which serve.js does read).
-          previewBackendPort: parseInt(process.env.AIDA_MODULE_PREVIEW_BACKEND_PORT || '3000', 10),
-          frontendPortEnvVar: process.env.AIDA_MODULE_FRONTEND_PORT_ENV_VAR || 'FRONTEND_PORT',
           stagingDb,
           insertOnlyFiles: {
             backend: ['src/server.js', 'src/utils/provisioning.js'],

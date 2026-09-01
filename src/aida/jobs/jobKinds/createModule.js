@@ -16,7 +16,6 @@ const {
   createBranch, commitAll, pushBranch, openPullRequest,
   mergePullRequest, closePullRequest,
 } = require('../../codingAgent/github');
-const { startPreview, stopPreview } = require('../../codingAgent/preview');
 
 /**
  * Phase 2 of the AIDA power-tier plan — "Hey AIDA, create me a module
@@ -24,18 +23,24 @@ const { startPreview, stopPreview } = require('../../codingAgent/preview');
  * for the full design. Clones BOTH the backend and frontend repos into
  * sibling sandboxes, runs the dual-repo module-builder agent (guardrailed to
  * new-files-only, see moduleGuardrails.js), and — if it produced real
- * changes — pushes matching branches, opens a PR in each repo, and boots
- * BOTH sandboxes as a live pair of processes against the shared staging
- * database so a human can actually click through the module before
- * approving it.
+ * changes — pushes matching branches and opens a PR in each repo.
  *
- * Unlike devFix.js, the sandboxes are NOT cleaned up when this reaches
- * awaiting_approval — the live preview is still running FROM those
- * directories. Cleanup happens in resume()/onReject() below, right after
- * the preview is torn down. If a job sits in awaiting_approval forever
- * (nobody ever approves/rejects it), its sandboxes and preview processes
- * leak until the server restarts — acceptable for a first version, worth a
- * TTL-based reaper later if that becomes a real problem.
+ * Live preview is real infrastructure now, not a locally-spawned process
+ * pair (that original approach only ever worked from the same machine as
+ * the browser — its URLs were literally http://localhost:<port>, unreachable
+ * once this job runs on the actual deployed server; see the git history for
+ * codingAgent/preview.js, now removed). The backend repo already has a
+ * "preview" deployment slot that auto-deploys any pushed non-main branch
+ * (config.aida.previewBackendUrl is fixed/known the moment the branch is
+ * pushed), and the frontend repo's Azure Static Web Apps integration
+ * auto-builds a real preview URL per PR — just not synchronously (1-3
+ * minutes), so previewUrls.frontendUrl starts null and is filled in by
+ * GET /jobs/:id once Static Web Apps' bot comment appears (same pattern used
+ * for dev_repo_fix — see routes/aida.js).
+ *
+ * Sandboxes ARE now cleaned up in the finally block below same as devFix.js
+ * — nothing needs them to stay on disk once the PRs are open, since nothing
+ * is running FROM them anymore.
  */
 
 function slugify(moduleName) {
@@ -131,7 +136,6 @@ module.exports = {
     await appendEvent(job.id, 'started', { moduleName, slug, features });
 
     let backendSandbox, frontendSandbox;
-    let reachedAwaitingApproval = false;
     try {
       backendSandbox = await createSandbox(backendOwner, backendRepoName, ca.githubToken);
       frontendSandbox = await createSandbox(frontendOwner, frontendRepoName, ca.githubToken);
@@ -273,24 +277,21 @@ module.exports = {
         await appendEvent(job.id, 'preview_module_enable_failed', { error: e.message });
       }
 
-      await appendEvent(job.id, 'booting_preview');
-      let previewUrls = null;
-      try {
-        previewUrls = await startPreview({
-          jobId: job.id,
-          backendDir: backendSandbox.dir,
-          frontendDir: frontendSandbox.dir,
-          stagingDb: mb.stagingDb,
-          frontendStartCommand: mb.frontendStartCommand,
-          previewBackendPort: mb.previewBackendPort,
-          frontendPortEnvVar: mb.frontendPortEnvVar,
-        });
-        await appendEvent(job.id, 'preview_ready', previewUrls);
-      } catch (e) {
-        await appendEvent(job.id, 'preview_failed', { error: e.message });
-      }
+      // Backend: the "preview" deployment slot auto-deploys any pushed
+      // non-main branch (see .github/workflows/preview_og-track-backend.yml),
+      // so this URL is fixed and already known the moment the push above
+      // completes — no boot step needed. Frontend: Azure Static Web Apps
+      // builds a real per-PR preview automatically too, but its unique
+      // hostname only appears in a bot comment 1-3 minutes later, so it
+      // starts null and gets filled in by GET /jobs/:id (see routes/aida.js),
+      // same pattern as dev_repo_fix.
+      const previewUrls = {
+        backendUrl: backendPr ? config.aida.previewBackendUrl : null,
+        frontendUrl: null,
+        backendReady: !!(backendPr && config.aida.previewBackendUrl),
+        frontendReady: false,
+      };
 
-      reachedAwaitingApproval = true;
       await updateStatus(job.id, 'awaiting_approval', {
         result: {
           moduleName, slug, agentSummary: agentResult.summary, changed: true,
@@ -299,32 +300,27 @@ module.exports = {
           backendPr: backendPr && { number: backendPr.number, url: backendPr.html_url },
           frontendPr: frontendPr && { number: frontendPr.number, url: frontendPr.html_url },
           previewUrls,
-          backendSandboxDir: backendSandbox.dir,
-          frontendSandboxDir: frontendSandbox.dir,
           toolLog: agentResult.toolLog,
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { backendPrUrl: backendPr?.html_url, frontendPrUrl: frontendPr?.html_url });
-      return; // sandboxes stay on disk — the live preview is running from them; cleaned up on approve/reject below
+      return;
     } catch (e) {
       const safeMessage = ca.githubToken ? e.message.split(ca.githubToken).join('***') : e.message;
       await updateStatus(job.id, 'failed', { errorMessage: safeMessage });
       await appendEvent(job.id, 'failed', { error: safeMessage });
     } finally {
-      // Only clean up here on any path that did NOT reach awaiting_approval —
-      // once we're there (even if the preview itself failed to boot), the
-      // sandboxes are referenced by job.result for resume()/onReject() to
-      // find and clean up later, right after tearing down the preview.
-      if (!reachedAwaitingApproval) {
-        backendSandbox?.cleanup();
-        frontendSandbox?.cleanup();
-      }
+      // Nothing runs FROM these directories anymore (preview is real
+      // deployed infrastructure now, not a local process pair) — safe to
+      // clean up unconditionally, same as devFix.js.
+      backendSandbox?.cleanup();
+      frontendSandbox?.cleanup();
     }
   },
 
-  /** Called only when a human clicks Approve on an 'awaiting_approval' create_module job — merges both real PRs, tears down the preview, cleans up the sandboxes. */
+  /** Called only when a human clicks Approve on an 'awaiting_approval' create_module job — merges both real PRs. */
   async resume(job, { appendEvent, updateStatus }) {
-    const { backendRepo, frontendRepo, backendPr, frontendPr, backendSandboxDir, frontendSandboxDir } = job.result || {};
+    const { backendRepo, frontendRepo, backendPr, frontendPr } = job.result || {};
     try {
       if (backendPr) {
         const [owner, repoName] = backendRepo.split('/');
@@ -336,8 +332,6 @@ module.exports = {
         await mergePullRequest({ owner, repo: repoName, token: config.aida.codingAgent.githubToken, pullNumber: frontendPr.number });
         await appendEvent(job.id, 'frontend_merged', { prNumber: frontendPr.number });
       }
-      stopPreview(job.id);
-      cleanupSandboxDirs(backendSandboxDir, frontendSandboxDir);
       await updateStatus(job.id, 'completed', { result: { ...job.result, merged: true } });
     } catch (e) {
       await updateStatus(job.id, 'failed', { errorMessage: `Approved, but merging failed: ${e.message}` });
@@ -345,9 +339,9 @@ module.exports = {
     }
   },
 
-  /** Called only when a human clicks Reject on an 'awaiting_approval' create_module job — closes both real PRs without merging, tears down the preview. */
+  /** Called only when a human clicks Reject on an 'awaiting_approval' create_module job — closes both real PRs without merging. */
   async onReject(job, { appendEvent }) {
-    const { backendRepo, frontendRepo, backendPr, frontendPr, backendSandboxDir, frontendSandboxDir } = job.result || {};
+    const { backendRepo, frontendRepo, backendPr, frontendPr } = job.result || {};
     try {
       if (backendPr) {
         const [owner, repoName] = backendRepo.split('/');
@@ -361,9 +355,6 @@ module.exports = {
       }
     } catch (e) {
       await appendEvent(job.id, 'pr_close_failed', { error: e.message });
-    } finally {
-      stopPreview(job.id);
-      cleanupSandboxDirs(backendSandboxDir, frontendSandboxDir);
     }
   },
 };
@@ -407,12 +398,5 @@ async function enableModuleForPreviewCompany(slug, stagingDb, previewCompanySlug
       .query('UPDATE dbo.companies SET enabled_modules = @modules WHERE id = @id');
   } finally {
     await pool.close();
-  }
-}
-
-function cleanupSandboxDirs(...dirs) {
-  for (const dir of dirs) {
-    if (!dir) continue;
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort — a leaked temp dir is harmless, unlike a leaked process */ }
   }
 }
