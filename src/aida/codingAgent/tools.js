@@ -108,6 +108,28 @@ function listFiles(sandboxRoot, relDir, { recursive = false } = {}) {
  * user input.
  */
 function runCommand(sandboxRoot, command, args = [], { timeoutMs = 120_000 } = {}) {
+  // The model occasionally emits a JSON-stringified array instead of a real
+  // one for this field (confirmed live) — execFile() validates args
+  // SYNCHRONOUSLY and throws a TypeError if it isn't a real array, which
+  // (since that throw happens inside this Promise executor) becomes a
+  // REJECTED promise that nothing downstream in the agent loop awaits inside
+  // a try/catch — crashing the entire job instead of just this one tool
+  // call. Recover the common case (a JSON-encoded array) and otherwise fail
+  // soft with a normal tool-error result the agent can see and retry from.
+  if (!Array.isArray(args)) {
+    if (typeof args === 'string') {
+      try {
+        const parsed = JSON.parse(args);
+        if (Array.isArray(parsed)) args = parsed;
+      } catch { /* not recoverable JSON — falls through to the error result below */ }
+    }
+    if (!Array.isArray(args)) {
+      return Promise.resolve({
+        exitCode: 1, timedOut: false, stdout: '',
+        stderr: `Invalid args: expected an array of strings, got ${typeof args}. Pass args as a real JSON array, e.g. ["test"].`,
+      });
+    }
+  }
   return new Promise((resolve) => {
     execFile(command, args, {
       cwd: fs.realpathSync(sandboxRoot),
