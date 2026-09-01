@@ -663,4 +663,56 @@ Add birthday/work-anniversary tracking to the frontend.
 
 Keep this purely additive — don't change any existing registration/login behavior beyond
 what's described here.
+
+---
+
+## 13. Point preview deployments at the preview backend, not production
+
+**Frontend setup checklist (do this before the code change below) — no slot or publish
+profile to create here, this is Azure Static Web Apps, which manages per-PR preview
+environments itself once connected:**
+1. Look for `.github/workflows/azure-static-web-apps-<something>.yml` in this repo — Azure
+   auto-generated it (with its own auto-created secret) when the Static Web App was first
+   linked to this repo. If it's missing entirely, the SWA was never connected via GitHub
+   Actions and that's a bigger gap than this prompt covers.
+2. Open it and check for a `staging_environment_policy: Disabled` line — remove it or set
+   to `Enabled` (Enabled is the default when the line is absent).
+3. Confirm which branch(es) its `pull_request:` trigger watches — matches whatever branch
+   you'll actually target when opening PRs.
+4. Test empirically: open any small test PR against that branch and confirm Azure's bot
+   comments a live preview link within a couple minutes, before relying on it.
+
+**Status: backend piece built (a "preview" deployment slot + a workflow that auto-deploys
+every non-main branch to it, so any in-progress branch gets a real, live URL without
+merging first). This prompt is the one frontend piece needed to make that actually useful
+end-to-end** — right now, whatever decides which backend API base URL to call only knows
+about two cases (localhost → dev API, anything else → the hardcoded production API URL),
+so even once the frontend itself has a live preview URL (Azure Static Web Apps' built-in
+per-PR preview environments), it would still silently call the PRODUCTION backend, not the
+preview one — meaning a preview of a frontend+backend change together isn't actually
+testing the backend change at all.
+
+I don't have visibility into this repo (standing rule — I never read/edit the frontend), so
+find this yourself first: search for wherever the API base URL is currently decided —
+likely a single small function/const near the top of a config file or index.html, something
+like `location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://<prod-host>'`.
+Read whatever you find before changing it; the exact current shape may differ from this
+guess.
+
+Add a third case: when `location.hostname` is neither `localhost` NOR the known production
+hostname/custom domain, treat it as a preview environment (Azure Static Web Apps' per-PR
+preview URLs look like `https://<some-hash>.<region>.azurestaticapps.net`, distinct from
+the production custom domain) and point the API base URL at the backend's preview slot
+instead. The preview slot's exact URL will show in the Azure Portal once it's created
+(App Service → Deployment slots → preview) — something like
+`https://og-track-backend-preview.azurewebsites.net` or with a region/hash suffix matching
+production's own hostname pattern; use whatever the Portal actually shows, don't guess it.
+
+If there's ever a need to preview a frontend change ALONE without a matching backend change
+(most cases), falling back to the regular production backend for a preview build is
+perfectly fine — only add the preview-backend branch, don't try to guess the "right" one
+API-call-by-API-call.
+
+Keep this to just the API-base-URL decision — don't touch the localhost/production cases
+that already work.
 ```
