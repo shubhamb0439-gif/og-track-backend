@@ -1,7 +1,20 @@
 const config = require('../../config');
 const jobStore = require('../jobs/jobStore');
+const jobRunner = require('../jobs/jobRunner');
 const { MASTERADMIN_SENTINEL_MODULE } = require('../contextBuilder');
 const { tryResolvePreviewUrl } = require('../jobs/previewResolver');
+
+/** Human-readable summary of what approving/rejecting a job would actually do — shown to the user before either tool acts for real. */
+function describeJob(job) {
+  if (job.kind === 'create_module') {
+    const prs = [
+      job.result?.backendPr && `backend PR #${job.result.backendPr.number} (${job.result.backendPr.url})`,
+      job.result?.frontendPr && `frontend PR #${job.result.frontendPr.number} (${job.result.frontendPr.url})`,
+    ].filter(Boolean);
+    return { jobId: job.id, kind: job.kind, moduleName: job.result?.moduleName, prs };
+  }
+  return { jobId: job.id, kind: job.kind, repo: job.result?.repo, task: job.result?.task, pr: job.result?.prNumber && `PR #${job.result.prNumber} (${job.result.prUrl})` };
+}
 
 /**
  * Master-admin-only "AIDA as a coding agent" tools — the lightweight,
@@ -150,6 +163,79 @@ module.exports = [
       // when the panel happened to already be open.
       job = await tryResolvePreviewUrl(job);
       return { job };
+    },
+  },
+
+  {
+    name: 'dev_approve_job',
+    description:
+      "Approves an 'awaiting_approval' AIDA job — merges its real PR(s) into main. SAFETY — this is a real, " +
+      "irreversible action: call this WITHOUT confirmed first, it returns a preview instead of merging anything. " +
+      "Read that preview back to the user (which repo(s)/PR(s) this would merge) and wait for their explicit yes " +
+      "in their NEXT message. Only then call this again with the exact same jobId plus confirmed: true.",
+    requiredModules: [MASTERADMIN_SENTINEL_MODULE],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string' },
+        confirmed: { type: 'boolean', description: 'Only set true after the user has explicitly confirmed approval, in a later message.' },
+      },
+      required: ['jobId'],
+    },
+    async handler(context, { jobId, confirmed }) {
+      const job = await jobStore.getJob(jobId);
+      if (!job) return { error: `No job found with id "${jobId}".` };
+      if (job.status !== 'awaiting_approval') return { error: `Job ${jobId} is not awaiting approval (status: ${job.status}) — nothing to approve.` };
+
+      if (!confirmed) {
+        return {
+          status: 'needs_confirmation',
+          preview: describeJob(job),
+          instruction: 'Read this preview back to the user and ask them to confirm before merging. Do NOT merge anything until they explicitly say yes in their next message — then call this tool again with confirmed: true.',
+        };
+      }
+
+      const approved = await jobStore.updateJobStatus(job.id, 'approved');
+      await jobStore.appendEvent(job.id, 'approved', { approvedBy: context.userId });
+      jobRunner.emitJobUpdate(approved);
+      const final = await jobRunner.resumeApproved(approved);
+      return { success: final.status === 'completed', status: final.status, job: final };
+    },
+  },
+
+  {
+    name: 'dev_reject_job',
+    description:
+      "Rejects an 'awaiting_approval' AIDA job — closes its PR(s) without merging, and never touches main. " +
+      "SAFETY: call this WITHOUT confirmed first to preview what would be closed; only call again with " +
+      "confirmed: true after the user explicitly confirms in their next message.",
+    requiredModules: [MASTERADMIN_SENTINEL_MODULE],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string' },
+        confirmed: { type: 'boolean', description: 'Only set true after the user has explicitly confirmed rejection, in a later message.' },
+      },
+      required: ['jobId'],
+    },
+    async handler(context, { jobId, confirmed }) {
+      const job = await jobStore.getJob(jobId);
+      if (!job) return { error: `No job found with id "${jobId}".` };
+      if (job.status !== 'awaiting_approval') return { error: `Job ${jobId} is not awaiting approval (status: ${job.status}) — nothing to reject.` };
+
+      if (!confirmed) {
+        return {
+          status: 'needs_confirmation',
+          preview: describeJob(job),
+          instruction: 'Read this preview back to the user and ask them to confirm before rejecting. Only call this tool again with confirmed: true after they explicitly say yes.',
+        };
+      }
+
+      await jobRunner.runOnReject(job);
+      const rejected = await jobStore.updateJobStatus(job.id, 'rejected');
+      await jobStore.appendEvent(job.id, 'rejected', { rejectedBy: context.userId });
+      jobRunner.emitJobUpdate(rejected);
+      return { success: true, job: rejected };
     },
   },
 ];

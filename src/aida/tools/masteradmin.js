@@ -1,4 +1,6 @@
-const { callPlatformApi } = require('../apiClient');
+const jwt = require('jsonwebtoken');
+const config = require('../../config');
+const { callPlatformApi, callTenantApi } = require('../apiClient');
 
 /**
  * Master-admin-only tools (domain.com/master-admin/aida). These operate on
@@ -46,6 +48,74 @@ module.exports = [
     async handler(context, { companyId }) {
       const rows = await callPlatformApi(context, 'GET', `/masteradmin/provisioning-log/${encodeURIComponent(companyId)}`);
       return { companyId, log: rows };
+    },
+  },
+
+  {
+    name: 'send_message_to_user',
+    description:
+      "Sends a direct message to a specific user in a specific company's internal messaging (only works if " +
+      "that company has the 'messages' module enabled). SAFETY — this is a real, visible action: call this tool " +
+      "WITHOUT confirmed first — it returns a preview instead of sending anything. Read that preview back to the " +
+      "user in plain language (who, which company, what text) and wait for their explicit yes in their NEXT " +
+      "message. Only then call this again with the exact same arguments plus confirmed: true to actually send it.",
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        companySlug: { type: 'string', description: 'The target company/tenant slug.' },
+        recipientName: { type: 'string', description: "The recipient's name (or a distinctive part of it) — resolved against that company's user list." },
+        text: { type: 'string' },
+        confirmed: { type: 'boolean', description: 'Only set true after the user has explicitly confirmed sending, in a later message.' },
+      },
+      required: ['companySlug', 'recipientName', 'text'],
+    },
+    async handler(context, { companySlug, recipientName, text, confirmed }) {
+      // Same synthetic-token pattern as masteradminCrossTenant.js — the real
+      // tenant-scoped routes this loops back into (users, conversations)
+      // enforce their own auth/module gates exactly as they would for any
+      // other caller; this only pins down *who* masteradmin is acting as.
+      const syntheticToken = jwt.sign({ userId: context.userId, role: 'superadmin', slug: companySlug }, config.app.jwtSecret, { expiresIn: '5m' });
+      const tenantContext = { ...context, tenantSlug: companySlug, authHeader: `Bearer ${syntheticToken}` };
+
+      let users;
+      try {
+        users = await callTenantApi(tenantContext, 'GET', '/users');
+      } catch (e) {
+        return { error: `Could not look up users in "${companySlug}": ${e.message}` };
+      }
+      const needle = recipientName.toLowerCase();
+      const matches = (users || []).filter((u) => (u.name || '').toLowerCase().includes(needle));
+      if (!matches.length) return { error: `No user matching "${recipientName}" found in "${companySlug}".` };
+      if (matches.length > 1) {
+        return {
+          error: `Multiple users match "${recipientName}" in "${companySlug}" — ask which one and be more specific.`,
+          matches: matches.map((u) => ({ id: u.id, name: u.name })),
+        };
+      }
+      const recipient = matches[0];
+
+      if (!confirmed) {
+        return {
+          status: 'needs_confirmation',
+          preview: { to: recipient.name, company: companySlug, text },
+          instruction: 'Read this preview back to the user and ask them to confirm. Do NOT send anything until they explicitly say yes in their next message — then call this tool again with confirmed: true.',
+        };
+      }
+
+      const SENDER_ID = 'masteradmin';
+      const SENDER_NAME = 'AIDA (Master Admin)';
+      try {
+        const convo = await callTenantApi(tenantContext, 'POST', '/conversations', {
+          body: { type: 'dm', memberIds: [SENDER_ID, recipient.id], memberNames: [SENDER_NAME, recipient.name], createdBy: SENDER_ID },
+        });
+        await callTenantApi(tenantContext, 'POST', `/conversations/${convo.id}/messages`, {
+          body: { senderId: SENDER_ID, senderName: SENDER_NAME, text },
+        });
+      } catch (e) {
+        return { error: `Failed to send message: ${e.message}` };
+      }
+      return { success: true, to: recipient.name, company: companySlug };
     },
   },
 ];

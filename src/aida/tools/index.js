@@ -16,6 +16,7 @@ const MODULE_TOOL_FILES = [
   require('./masteradmin'),
   require('./masteradminCrossTenant'),
   require('./devops'),
+  require('./webResearch'),
 ];
 
 let registered = false;

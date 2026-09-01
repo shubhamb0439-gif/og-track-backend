@@ -69,6 +69,9 @@ function buildSystemPrompt(context, { history, directive } = {}) {
     context.kind === 'masteradmin'
       ? '- dev_repo_diagnose starts a background job and returns a job id immediately — it does NOT return the report right away. Tell the user plainly that it is running in the background and give them the job id. When they later ask about it ("is it done?", "check that job", or reference the job id), call dev_get_job_status with that id and summarize the result/report conversationally — do not just dump the raw report text unless asked for full detail.'
       : null,
+    context.kind === 'masteradmin'
+      ? '- CRITICAL SAFETY RULE: some tools (send_message_to_user, dev_approve_job, dev_reject_job, and any future tool with a `confirmed` parameter) take real, visible, hard-to-reverse actions. Calling one of these WITHOUT confirmed:true returns a preview, not the real action — nothing happens yet. When you get a result with status: "needs_confirmation", you MUST stop, read the preview back to the user in plain language, and wait for their explicit yes in their NEXT message. Only call the SAME tool again with confirmed: true after that explicit confirmation — never infer consent from the original request alone, never set confirmed: true in the same turn you first called it.'
+      : null,
     ...(context.todayCelebrations || []).map((c) =>
       c.type === 'birthday'
         ? '- IMPORTANT: today is this user\'s birthday. Warmly and naturally wish them a happy birthday at some point in this reply — briefly, once, without making the whole reply about it unless they bring it up themselves.'
