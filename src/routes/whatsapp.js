@@ -7,6 +7,7 @@ const { MASTERADMIN_SENTINEL_MODULE } = require('../aida/contextBuilder');
 const { runTurn } = require('../aida/engine');
 const sessionMemory = require('../aida/sessionMemory');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
+const { sendWhatsAppMessage } = require('../aida/whatsapp');
 
 const router = express.Router();
 
@@ -49,20 +50,6 @@ function verifySignature(req) {
     return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
   } catch {
     return false; // length mismatch etc. — definitely not a match
-  }
-}
-
-async function sendWhatsAppMessage(to, body) {
-  try {
-    const url = `https://graph.facebook.com/v20.0/${config.whatsapp.phoneNumberId}/messages`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${config.whatsapp.accessToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }),
-    });
-    if (!res.ok) console.error('[whatsapp] send failed:', res.status, await res.text());
-  } catch (e) {
-    console.error('[whatsapp] send threw:', e.message);
   }
 }
 

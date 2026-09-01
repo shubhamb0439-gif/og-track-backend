@@ -16,6 +16,7 @@ const {
   createBranch, commitAll, pushBranch, openPullRequest,
   mergePullRequest, closePullRequest,
 } = require('../../codingAgent/github');
+const { notifyPreviewReady } = require('../previewResolver');
 
 /**
  * Phase 2 of the AIDA power-tier plan — "Hey AIDA, create me a module
@@ -292,7 +293,7 @@ module.exports = {
         frontendReady: false,
       };
 
-      await updateStatus(job.id, 'awaiting_approval', {
+      const finalJob = await updateStatus(job.id, 'awaiting_approval', {
         result: {
           moduleName, slug, agentSummary: agentResult.summary, changed: true,
           branch: branchName,
@@ -304,6 +305,13 @@ module.exports = {
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { backendPrUrl: backendPr?.html_url, frontendPrUrl: frontendPr?.html_url });
+      // A frontend PR means there's a real preview build to wait on — that
+      // notification fires later, once previewResolver.js's background poll
+      // actually resolves it. Only notify immediately here for the case
+      // where there's nothing left to resolve (e.g. a backend-only change).
+      if (!frontendPr && previewUrls.backendUrl) {
+        notifyPreviewReady(finalJob).catch((e) => console.error(`[aida] preview-ready WhatsApp notify failed for job ${job.id}:`, e.message));
+      }
       return;
     } catch (e) {
       const safeMessage = ca.githubToken ? e.message.split(ca.githubToken).join('***') : e.message;

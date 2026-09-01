@@ -14,8 +14,9 @@ const { transcribeAudio } = require('../aida/voice/speechToText');
 const { warmFillerCache } = require('../aida/voice/fillerPhrases');
 const { createTurnTimer } = require('../aida/latency');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
-const { getCombinedStatus, getSwaPreviewUrl } = require('../aida/codingAgent/github');
+const { getCombinedStatus } = require('../aida/codingAgent/github');
 const { matchTodayCelebrations } = require('../aida/celebrations');
+const { tryResolvePreviewUrl } = require('../aida/jobs/previewResolver');
 
 registerAllTools();
 sessionMemory.startSweeper();
@@ -442,16 +443,6 @@ async function fetchCiStatus(repo, ref) {
   }
 }
 
-/** Null (not yet ready — normal for a just-opened PR) rather than throwing on any lookup failure, since this only ever enriches an already-successful job response. */
-async function resolveFrontendPreviewUrl(repo, prNumber, jobId) {
-  try {
-    const [owner, repoName] = repo.split('/');
-    return await getSwaPreviewUrl({ owner, repo: repoName, token: config.aida.codingAgent.githubToken, pullNumber: prNumber });
-  } catch (e) {
-    console.error(`[aida] preview-URL lookup failed for job ${jobId}:`, e.message);
-    return null;
-  }
-}
 
 // GET /jobs/:id — poll a job's current state + its event timeline. For a
 // dev_repo_fix job with an open PR, also fetches LIVE CI status from GitHub
@@ -477,28 +468,11 @@ masterAdminAidaRouter.get('/jobs/:id', async (req, res) => {
       };
     }
 
-    // The frontend repo's Azure Static Web Apps preview URL isn't known at PR-open
-    // time (see devFix.js / createModule.js) — since we're already here re-checking
-    // this job for ciStatus, also check whether that preview build has finished and
-    // posted its URL yet. Persist + broadcast once found so it doesn't need
-    // re-fetching on every subsequent poll, and so any other open AIDA Job panel
-    // picks it up live.
-    if (job.kind === 'dev_repo_fix' && job.result?.prNumber && job.result?.previewUrl == null &&
-        job.result?.repo === config.aida.moduleBuilder.frontendRepo) {
-      const previewUrl = await resolveFrontendPreviewUrl(job.result.repo, job.result.prNumber, job.id);
-      if (previewUrl) {
-        job = await jobStore.updateJobStatus(job.id, job.status, { result: { ...job.result, previewUrl } });
-        jobRunner.emitJobUpdate(job);
-      }
-    } else if (job.kind === 'create_module' && job.result?.frontendPr && job.result?.previewUrls?.frontendUrl == null) {
-      const previewUrl = await resolveFrontendPreviewUrl(job.result.frontendRepo, job.result.frontendPr.number, job.id);
-      if (previewUrl) {
-        job = await jobStore.updateJobStatus(job.id, job.status, {
-          result: { ...job.result, previewUrls: { ...job.result.previewUrls, frontendUrl: previewUrl, frontendReady: true } },
-        });
-        jobRunner.emitJobUpdate(job);
-      }
-    }
+    // Also check whether the frontend's Static Web Apps preview build has
+    // finished and posted its URL yet (see previewResolver.js) — persists +
+    // broadcasts once found so it doesn't need re-fetching on every
+    // subsequent poll, and any other open AIDA Job panel picks it up live.
+    job = await tryResolvePreviewUrl(job);
 
     res.json({ job, events, ciStatus });
   } catch (e) { res.status(500).json({ error: e.message }); }

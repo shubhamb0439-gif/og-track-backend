@@ -1,6 +1,7 @@
 const config = require('../../config');
 const jobStore = require('../jobs/jobStore');
 const { MASTERADMIN_SENTINEL_MODULE } = require('../contextBuilder');
+const { tryResolvePreviewUrl } = require('../jobs/previewResolver');
 
 /**
  * Master-admin-only "AIDA as a coding agent" tools — the lightweight,
@@ -142,8 +143,12 @@ module.exports = [
       required: ['jobId'],
     },
     async handler(context, { jobId }) {
-      const job = await jobStore.getJob(jobId);
+      let job = await jobStore.getJob(jobId);
       if (!job) return { error: `No job found with id "${jobId}".` };
+      // Same live check the web job panel does — so asking AIDA directly in
+      // chat surfaces a just-finished frontend preview link too, not only
+      // when the panel happened to already be open.
+      job = await tryResolvePreviewUrl(job);
       return { job };
     },
   },

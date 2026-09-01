@@ -115,12 +115,45 @@ async function poll() {
   }
 }
 
+// Much slower than the main job poll above — this only ever checks GitHub
+// for a frontend Static Web Apps preview URL that isn't known yet, and that
+// build takes 1-3 minutes anyway, so there's no value in checking every 3s
+// (and every tick here is a real GitHub API call per pending job). This is
+// what makes the preview link resolve/broadcast on its own — a human doesn't
+// have to ask AIDA or open the job panel for the aida:job socket update to
+// fire once it's ready. See previewResolver.js for the resolve+persist+emit
+// logic itself.
+const PREVIEW_POLL_INTERVAL_MS = 20_000;
+let previewPollTimer = null;
+let previewPolling = false;
+
+async function pollPendingPreviewUrls() {
+  if (previewPolling) return;
+  previewPolling = true;
+  try {
+    // Lazy require — previewResolver.js requires this module back (to emit
+    // job updates), so at least one side of the cycle has to defer until
+    // call time rather than module-load time.
+    const { tryResolvePreviewUrl } = require('./previewResolver');
+    const jobs = await jobStore.listJobs({ status: 'awaiting_approval', limit: 50 });
+    for (const job of jobs) {
+      await tryResolvePreviewUrl(job);
+    }
+  } catch (e) {
+    console.error('[aida-jobs] preview-url poll tick failed:', e);
+  } finally {
+    previewPolling = false;
+  }
+}
+
 /** Call once from server.js with the shared Socket.io instance. */
 function start(ioInstance) {
   io = ioInstance;
   if (pollTimer) return;
   pollTimer = setInterval(poll, POLL_INTERVAL_MS);
   pollTimer.unref?.();
+  previewPollTimer = setInterval(pollPendingPreviewUrls, PREVIEW_POLL_INTERVAL_MS);
+  previewPollTimer.unref?.();
 }
 
 module.exports = { start, resumeApproved, runOnReject, emitJobUpdate, roomForJob };

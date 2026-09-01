@@ -12,6 +12,7 @@ const {
   createBranch, commitAll, pushBranch, openPullRequest,
   mergePullRequest, closePullRequest,
 } = require('../../codingAgent/github');
+const { notifyPreviewReady } = require('../previewResolver');
 
 /**
  * Phase 1 of the AIDA power-tier coding-agent vision — see
@@ -146,13 +147,19 @@ module.exports = {
         ? config.aida.previewBackendUrl
         : null;
 
-      await updateStatus(job.id, 'awaiting_approval', {
+      const finalJob = await updateStatus(job.id, 'awaiting_approval', {
         result: {
           repo, task: effectiveTask, agentSummary: agentResult.summary, changed: true,
           branch: branchName, prNumber: pr.number, prUrl: pr.html_url, previewUrl, toolLog: agentResult.toolLog,
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { prUrl: pr.html_url });
+      // Only the backend case has a link already at this point (see above) —
+      // the frontend case starts null and gets its own notification later,
+      // once previewResolver.js's background poll actually resolves it.
+      if (previewUrl) {
+        notifyPreviewReady(finalJob).catch((e) => console.error(`[aida] preview-ready WhatsApp notify failed for job ${job.id}:`, e.message));
+      }
     } catch (e) {
       const safeMessage = ca.githubToken ? e.message.split(ca.githubToken).join('***') : e.message;
       await updateStatus(job.id, 'failed', { errorMessage: safeMessage });
