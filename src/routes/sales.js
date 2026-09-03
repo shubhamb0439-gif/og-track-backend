@@ -86,10 +86,31 @@ router.patch('/deliveries/:id', async (req, res) => {
     if (b.delivered !== undefined) {
       updates.delivered = b.delivered ? 1 : 0;
       updates.delivered_date = b.delivered ? new Date() : null;
-      // Mirror onto the sale
+      // Mirror onto the sale, and move inv_items.stock in lockstep with the
+      // is_delivered transition — stock_sold is already incremented at sale
+      // creation time and must never be touched here. Guarded on an actual
+      // 0->1 (or 1->0) transition so re-saving other delivery fields on an
+      // already-delivered row never double-counts the stock movement.
       const delivery = await req.db('deliveries').where({ id: req.params.id }).first();
       if (delivery) {
-        await req.db('sales').where({ id: delivery.sale_id }).update({ is_delivered: b.delivered ? 1 : 0 });
+        const sale = await req.db('sales').where({ id: delivery.sale_id }).first();
+        if (sale) {
+          const wasDelivered = !!sale.is_delivered;
+          const nowDelivered = !!b.delivered;
+          if (wasDelivered !== nowDelivered) {
+            await req.db.transaction(async (trx) => {
+              await trx('sales').where({ id: delivery.sale_id }).update({ is_delivered: nowDelivered ? 1 : 0 });
+              const saleItems = await trx('sale_items').where({ sale_id: delivery.sale_id });
+              for (const item of saleItems) {
+                if (nowDelivered) {
+                  await trx('inv_items').where({ id: item.item_id }).decrement('stock', Number(item.quantity));
+                } else {
+                  await trx('inv_items').where({ id: item.item_id }).increment('stock', Number(item.quantity));
+                }
+              }
+            });
+          }
+        }
       }
     }
     await req.db('deliveries').where({ id: req.params.id }).update(updates);
