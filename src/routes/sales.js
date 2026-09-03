@@ -26,6 +26,32 @@ const mapDelivery = (r) => r && ({
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
+// Recomputes a customer_purchase_order's status as a side effect of one of
+// its linked sales' delivery being (un)marked delivered. Only ever moves
+// between 'open'/'late' -> 'fulfilled' (once every linked sale has a
+// delivered delivery) and 'fulfilled' -> 'open' (once one no longer does) —
+// never touches a PO a human has manually set to 'closed'/'cancelled'.
+async function recomputeCustomerPoStatus(trx, poId) {
+  if (!poId) return;
+  const po = await trx('customer_purchase_orders').where({ id: poId }).first();
+  if (!po) return;
+
+  const linkedSales = await trx('sales').where({ customer_po_id: poId });
+  if (!linkedSales.length) return;
+
+  let allDelivered = true;
+  for (const sale of linkedSales) {
+    const delivery = await trx('deliveries').where({ sale_id: sale.id }).first();
+    if (!delivery || !delivery.delivered) { allDelivered = false; break; }
+  }
+
+  if (allDelivered && (po.status === 'open' || po.status === 'late')) {
+    await trx('customer_purchase_orders').where({ id: poId }).update({ status: 'fulfilled', updated_at: new Date() });
+  } else if (!allDelivered && po.status === 'fulfilled') {
+    await trx('customer_purchase_orders').where({ id: poId }).update({ status: 'open', updated_at: new Date() });
+  }
+}
+
 // Helper: generate next sale number
 async function nextSaleNumber(db) {
   const last = await db('sales').orderBy('created_at', 'desc').first();
@@ -83,14 +109,20 @@ router.patch('/deliveries/:id', async (req, res) => {
     if (b.deliveryLocation !== undefined) updates.delivery_location = b.deliveryLocation;
     if (b.scheduledDate !== undefined) updates.scheduled_date = b.scheduledDate;
     if (b.notes !== undefined) updates.notes = b.notes;
+    let handledInTransaction = false;
     if (b.delivered !== undefined) {
       updates.delivered = b.delivered ? 1 : 0;
       updates.delivered_date = b.delivered ? new Date() : null;
-      // Mirror onto the sale, and move inv_items.stock in lockstep with the
-      // is_delivered transition — stock_sold is already incremented at sale
+      // Mirror onto the sale, move inv_items.stock in lockstep with the
+      // is_delivered transition, and recompute the linked customer PO's
+      // status (if any) — stock_sold is already incremented at sale
       // creation time and must never be touched here. Guarded on an actual
       // 0->1 (or 1->0) transition so re-saving other delivery fields on an
-      // already-delivered row never double-counts the stock movement.
+      // already-delivered row never double-counts the stock movement or
+      // re-triggers the PO recompute. Everything (including the delivery's
+      // own `updates`) runs in ONE transaction — recomputeCustomerPoStatus
+      // reads this same delivery's `delivered` flag back out, so it must
+      // already reflect the new value, not the pre-update one.
       const delivery = await req.db('deliveries').where({ id: req.params.id }).first();
       if (delivery) {
         const sale = await req.db('sales').where({ id: delivery.sale_id }).first();
@@ -99,6 +131,7 @@ router.patch('/deliveries/:id', async (req, res) => {
           const nowDelivered = !!b.delivered;
           if (wasDelivered !== nowDelivered) {
             await req.db.transaction(async (trx) => {
+              await trx('deliveries').where({ id: req.params.id }).update(updates);
               await trx('sales').where({ id: delivery.sale_id }).update({ is_delivered: nowDelivered ? 1 : 0 });
               const saleItems = await trx('sale_items').where({ sale_id: delivery.sale_id });
               for (const item of saleItems) {
@@ -108,12 +141,16 @@ router.patch('/deliveries/:id', async (req, res) => {
                   await trx('inv_items').where({ id: item.item_id }).increment('stock', Number(item.quantity));
                 }
               }
+              await recomputeCustomerPoStatus(trx, sale.customer_po_id);
             });
+            handledInTransaction = true;
           }
         }
       }
     }
-    await req.db('deliveries').where({ id: req.params.id }).update(updates);
+    if (!handledInTransaction) {
+      await req.db('deliveries').where({ id: req.params.id }).update(updates);
+    }
     const saved = await req.db('deliveries').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Delivery not found' });
     req.io.to(req.company.slug).emit('sales:delivery_updated', mapDelivery(saved));
