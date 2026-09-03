@@ -452,15 +452,25 @@ router.post('/customer-purchase-orders', async (req, res) => {
 
       const bom = await req.db('mfg_boms').where({ id: line.bomId }).first();
       if (!bom) return res.status(400).json({ error: `BOM ${line.bomId} not found` });
-      const bomLines = await req.db('mfg_bom_lines').where({ bom_id: line.bomId });
-      if (!bomLines.length) return res.status(400).json({ error: `BOM "${bom.name}" has no components defined` });
 
-      for (const bl of bomLines) {
-        const component = await req.db('inv_items').where({ id: bl.component_item_id }).first();
-        const required = Number(bl.quantity_per_unit) * qty;
-        const available = Number(component?.stock || 0);
-        if (available < required) {
-          shortfalls.push(`${component?.name || bl.component_item_id}: need ${required} for "${bom.name}" x${qty}, have ${available}`);
+      // If the finished product's own stock already covers this line, the
+      // order can be fulfilled straight from existing inventory — skip the
+      // component-level check entirely rather than demanding raw-component
+      // stock for units that don't need to be built. Only fall back to the
+      // BOM/component check when finished-goods stock can't cover it alone.
+      const product = await req.db('inv_items').where({ id: bom.product_item_id }).first();
+      const finishedStock = Number(product?.stock || 0);
+      if (finishedStock < qty) {
+        const bomLines = await req.db('mfg_bom_lines').where({ bom_id: line.bomId });
+        if (!bomLines.length) return res.status(400).json({ error: `BOM "${bom.name}" has no components defined` });
+
+        for (const bl of bomLines) {
+          const component = await req.db('inv_items').where({ id: bl.component_item_id }).first();
+          const required = Number(bl.quantity_per_unit) * qty;
+          const available = Number(component?.stock || 0);
+          if (available < required) {
+            shortfalls.push(`${component?.name || bl.component_item_id}: need ${required} for "${bom.name}" x${qty}, have ${available}`);
+          }
         }
       }
       preparedLines.push({ bom, qty, unitPrice: Number(line.unitPrice || 0) });

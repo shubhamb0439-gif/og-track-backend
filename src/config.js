@@ -304,4 +304,22 @@ module.exports = {
       adminMap,
     };
   })(),
+  // Azure Communication Services Email (src/utils/email.js) — currently just
+  // the "forgot password" flow (src/routes/users.js). Deliberately NOT
+  // validated via required() — same reasoning as `aida`/`whatsapp` above.
+  email: {
+    enabled: !!(process.env.AZURE_ACS_EMAIL_CONNECTION_STRING && process.env.AZURE_ACS_EMAIL_SENDER),
+    connectionString: process.env.AZURE_ACS_EMAIL_CONNECTION_STRING || null,
+    // Must be a MailFrom sender already verified on this ACS resource's
+    // domain (e.g. "no-reply@ogplus.in") — ACS rejects sends from anything
+    // not explicitly added there, see the domain-setup steps in chat.
+    senderAddress: process.env.AZURE_ACS_EMAIL_SENDER || null,
+    // Base URL of the deployed frontend — the reset-password link emailed to
+    // a user is `${frontendBaseUrl}/reset-password?token=...&company=...`.
+    // No default: without this, a reset email would go out with a broken
+    // link, so treat it as required for the feature to actually work even
+    // though it's not required() at boot (same "keep booting either way"
+    // reasoning as the rest of this block).
+    frontendBaseUrl: process.env.FRONTEND_BASE_URL || null,
+  },
 };

@@ -1,6 +1,9 @@
 const express = require('express');
+const crypto = require('crypto');
+const config = require('../config');
 const { hashPassword, verifyPassword, issueToken, requireAuth } = require('../utils/auth');
 const { matchTodayCelebrations } = require('../aida/celebrations');
+const { sendEmail } = require('../utils/email');
 
 const router = express.Router();
 
@@ -123,6 +126,74 @@ router.post('/login', async (req, res) => {
 
     const token = issueToken({ userId: user.id, role: user.role, slug: req.company.slug });
     res.json({ token, user: stripPassword(user) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const GENERIC_FORGOT_PASSWORD_MESSAGE = 'If that email is registered and approved, a password reset link has been sent.';
+
+function hashResetToken(rawToken) {
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
+}
+
+// POST /api/:slug/users/forgot-password — body: { email }. ALWAYS responds
+// with the same generic message regardless of whether the email exists, is
+// approved, or the send itself failed — never let this endpoint confirm or
+// deny that a given address is registered (a classic account-enumeration
+// leak otherwise). Real failures are logged server-side, not surfaced.
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const email = (req.body?.email || '').toLowerCase().trim();
+    if (email) {
+      const user = await req.db('users').where({ email }).first();
+      // Only 'active' (admin-approved) accounts get a real link — matches
+      // the same gate login() already enforces for pending/rejected users.
+      if (user && user.status === 'active') {
+        const rawToken = crypto.randomBytes(32).toString('hex');
+        await req.db('users').where({ id: user.id }).update({
+          reset_token_hash: hashResetToken(rawToken),
+          reset_token_expires: new Date(Date.now() + RESET_TOKEN_TTL_MS),
+          updated_at: new Date(),
+        });
+        if (config.email.enabled && config.email.frontendBaseUrl) {
+          const link = `${config.email.frontendBaseUrl.replace(/\/+$/, '')}/reset-password?token=${rawToken}&company=${encodeURIComponent(req.company.slug)}`;
+          sendEmail({
+            to: user.email,
+            subject: 'Reset your OG Track password',
+            html: `<p>Hi ${user.name},</p><p>Click below to reset your OG Track password. This link expires in 1 hour and can only be used once.</p><p><a href="${link}">Reset your password</a></p><p>If you didn't request this, you can safely ignore this email.</p>`,
+            text: `Reset your OG Track password: ${link}\n\nThis link expires in 1 hour and can only be used once. If you didn't request this, you can safely ignore this email.`,
+          }).catch((e) => console.error('[users] forgot-password email send failed:', e.message));
+        } else {
+          console.error('[users] forgot-password: email not configured (AZURE_ACS_EMAIL_CONNECTION_STRING/SENDER/FRONTEND_BASE_URL) — no email sent.');
+        }
+      }
+    }
+    res.json({ success: true, message: GENERIC_FORGOT_PASSWORD_MESSAGE });
+  } catch (e) {
+    console.error('[users] forgot-password failed:', e.message);
+    // Still generic — an internal error here must not look different from "not found" to the caller.
+    res.json({ success: true, message: GENERIC_FORGOT_PASSWORD_MESSAGE });
+  }
+});
+
+// POST /api/:slug/users/reset-password — body: { token, newPassword }.
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) return res.status(400).json({ error: 'token and newPassword are required' });
+    if (newPassword.length < 8) return res.status(400).json({ error: 'newPassword must be at least 8 characters.' });
+
+    const tokenHash = hashResetToken(token);
+    const user = await req.db('users').where({ reset_token_hash: tokenHash }).first();
+    if (!user || !user.reset_token_expires || new Date(user.reset_token_expires) < new Date()) {
+      return res.status(400).json({ error: 'This reset link is invalid or has expired. Request a new one.' });
+    }
+
+    const password_hash = await hashPassword(newPassword);
+    await req.db('users').where({ id: user.id }).update({
+      password_hash, reset_token_hash: null, reset_token_expires: null, updated_at: new Date(),
+    });
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

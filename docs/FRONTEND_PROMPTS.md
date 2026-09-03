@@ -715,4 +715,55 @@ API-call-by-API-call.
 
 Keep this to just the API-base-URL decision — don't touch the localhost/production cases
 that already work.
+
+---
+
+## 14. Forgot password / reset password
+
+**Status: backend built, needs Azure email setup to actually send (see chat) — frontend
+change required, new UI.**
+
+**Endpoints:**
+```
+POST /api/:slug/users/forgot-password
+  Body: { email }
+  Always returns { success: true, message: "..." } — even if the email doesn't exist, isn't
+  approved yet, or the send itself failed. Never treat a different response shape as meaning
+  "this email exists" — there isn't one, by design (prevents account enumeration). Show the
+  returned `message` as-is.
+
+POST /api/:slug/users/reset-password
+  Body: { token, newPassword }
+  token comes from the emailed link's query string. newPassword must be at least 8
+  characters (server-enforced; validate client-side too for a faster error). On success:
+  { success: true }. On an invalid/expired token: 400 { error: "..." } — show that error and
+  let them request a new link (the token is single-use and expires after 1 hour either way).
+```
+
+```
+Add a forgot-password flow to the frontend.
+
+1. Login page: add a "Forgot password?" link/button. Clicking it shows a simple form (an
+   email input) — either a modal or a separate view, match whatever pattern this app already
+   uses for that kind of small auxiliary form. On submit, POST /forgot-password with the
+   entered email, then show the returned `message` (a generic, non-committal confirmation —
+   don't add your own "email sent!" wording, use exactly what the backend returns) and let
+   them dismiss back to login.
+
+2. New route/page: /reset-password — reads `token` and `company` from the URL query string
+   (the emailed link is `<frontend-base-url>/reset-password?token=...&company=<slug>`).
+   Show a form with a new-password input (+ confirm-password input, checked to match
+   client-side) and a submit button. On submit, POST /api/<company-from-query>/users/reset-password
+   with { token, newPassword }. On success, show a confirmation and a link/button back to
+   login. On error (invalid/expired token), show the error message and a link back to the
+   login page's "Forgot password?" flow so they can request a fresh one — don't let them
+   resubmit the same dead token.
+
+3. If `token` or `company` is missing from the URL entirely (someone navigated to
+   /reset-password directly), show a plain "invalid reset link" state instead of rendering
+   the form — don't call the endpoint with empty/missing values.
+
+Keep this purely additive — don't change any existing login/registration behavior beyond
+adding the "Forgot password?" entry point described in step 1.
+```
 ```
