@@ -497,6 +497,20 @@ router.post('/bigcommerce/webhook', async (req, res) => {
   }
 });
 
+// GET /api/:slug/sitara/bigcommerce/debug/:orderId — returns BigCommerce's
+// RAW order + line-items response, unmodified. Temporary diagnostic only
+// (not referenced by any other code), used to fix field-mapping bugs
+// against real data instead of guessing from documentation — remove once
+// the mapping issues are resolved and confirmed correct.
+router.get('/bigcommerce/debug/:orderId', async (req, res) => {
+  if (!config.bigcommerce.enabled) return res.status(503).json({ error: 'BigCommerce is not configured.' });
+  try {
+    const order = await fetchBigCommerceOrder(req.params.orderId);
+    const products = await fetchBigCommerceOrderProducts(req.params.orderId);
+    res.json({ order, products });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 async function listAllBigCommerceOrderIds() {
   const ids = [];
   let page = 1;
