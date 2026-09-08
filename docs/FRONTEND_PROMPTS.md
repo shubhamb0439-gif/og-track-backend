@@ -766,4 +766,96 @@ Add a forgot-password flow to the frontend.
 Keep this purely additive — don't change any existing login/registration behavior beyond
 adding the "Forgot password?" entry point described in step 1.
 ```
+
+---
+
+## 15. Sitara Bespoke module bundle (dashboard, people, stocks, orders)
+
+**Status: backend built (Phase 1 — manual data entry; BigCommerce/Razorpay sync are later
+phases, not live yet) — frontend change required, new company checkbox + 4 new screens.**
+
+**1. Company-creation form (master admin)**: add a single checkbox — **"Sitara Bespoke"** —
+that, when ticked, sets all 4 of these module keys in `enabled_modules` at once (don't add 4
+separate checkboxes, one toggle does all 4): `sitara_dashboard`, `sitara_people`,
+`sitara_stocks`, `sitara_orders`. This is purely a convenience grouping — under the hood
+they're just normal entries in the same `enabled_modules` array every other module checkbox
+already writes to.
+
+**Endpoints** (all under `/api/:slug/sitara`, gated by any of the 4 module keys above):
+```
+GET  /weavers  |  POST /weavers  |  PATCH /weavers/:id  |  DELETE /weavers/:id
+  Weaver: { id, name, contactName, phone, email, notes }. POST body: { name, contactName?,
+  phone?, email?, notes? } — name is the only required field.
+
+GET  /vendors  |  POST /vendors  |  PATCH /vendors/:id  |  DELETE /vendors/:id
+  Same shape as weavers (separate list — a vendor and a weaver are different people/roles).
+
+GET  /customers  |  POST /customers  |  PATCH /customers/:id  |  DELETE /customers/:id
+  Customer: { id, name, phone, email, source, bigcommerceCustomerId, notes }. source is one
+  of "bigcommerce" | "whatsapp" | "instagram" | "manual" — POST body needs a source dropdown
+  with exactly these 4 options (defaults to "manual" if omitted). Real BigCommerce customers
+  get created automatically by a later phase's webhook — this endpoint is for manually adding
+  a customer yourself (e.g. a WhatsApp/Instagram DM sale).
+
+GET  /products  |  POST /products  |  PATCH /products/:id  |  DELETE /products/:id
+  Product (a saree, the inventory item): { id, name, sku, vendorId, weaverId, stock, unit,
+  bigcommerceProductId, notes }. POST body: { name, sku?, vendorId?, weaverId?, stock?, unit?,
+  notes? } — vendorId/weaverId are dropdowns sourced from GET /vendors and GET /weavers.
+
+GET  /purchase-orders  |  GET /purchase-orders/:id (includes items)
+POST /purchase-orders
+  Body: { vendorId, orderDate?, notes?, items: [{ productId, quantity, unitPrice }] }
+  This is the "manual Add Purchase" button — every purchase order is created this way (there's
+  no auto-generated path yet). vendorId is a dropdown from GET /vendors; each item's productId
+  is a dropdown from GET /products.
+PATCH /purchase-orders/:id — body: { status? ('pending'|'partial'|'received'|'cancelled'), notes? }
+DELETE /purchase-orders/:id
+
+GET  /orders  (optional query: ?status=... or ?source=bigcommerce|manual)
+GET  /orders/:id (includes items)
+POST /orders
+  Body: { customerId?, status?, notes?, items: [{ productId?, productName, quantity, unitPrice }] }
+  Manual order entry (a GPay/DM sale) — always creates source:"manual". A later phase adds
+  BigCommerce-sourced orders automatically; this endpoint never creates those.
+PATCH /orders/:id/status — body: { status }. Valid values: "awaiting_fulfillment",
+  "awaiting_payment", "partially_shipped", "shipped", "completed", "cancelled", "refunded".
+  This is THE status-change action for every order regardless of source — use the same
+  control/button for both BigCommerce-sourced and manual orders.
+
+GET  /dashboard
+  -> { recentSales: [...orders], totalSales, totalSalesThisMonth, orderCount, totalExpenses,
+       stockOnHand, pendingOrderCount }
+  totalExpenses is currently always 0 (no expense-tracking source exists yet) — show it as-is,
+  don't hide the field.
+```
+
+```
+Add the Sitara Bespoke module bundle to the frontend: the company-creation checkbox (step 1
+above) plus 4 new screens, all under a "Sitara Bespoke" section in the sidebar (only visible
+when at least one of the 4 module keys is enabled for the company, same pattern every other
+module's sidebar entry already follows).
+
+1. Sitara Drapes Dashboard — a stat-tile row (recent sales, total sales, total sales this
+   month, number of orders, total expenses, stock in hand, pending orders) fed from
+   GET /dashboard, plus a simple recent-orders list below it (from the same response's
+   `recentSales`).
+
+2. People — one screen with 3 tabs/sub-sections: Weavers, Vendors, Customers. Each is a
+   simple list + add/edit/delete form (name required, the rest optional) — Weavers and
+   Vendors are identical in shape, Customers additionally has the 4-option source dropdown
+   described above.
+
+3. Stocks — one screen with 2 tabs: Inventory (the Products list — name, sku, vendor, weaver,
+   stock, unit, with add/edit/delete) and Purchases (purchase order list with a prominent
+   "Add Purchase" button opening the vendor + line-items form described in POST
+   /purchase-orders above; clicking a PO shows its items).
+
+4. Orders — a list (filterable by status and by source) showing order number, customer,
+   status, total, and how long it's been in the current status (compute client-side from
+   `statusChangedAt` — no need to wait for a backend "days stale" field). Each row/detail view
+   needs a status-change control (dropdown or buttons) calling PATCH /orders/:id/status, and a
+   manual "Add Order" button for the GPay/DM case (POST /orders above).
+
+Keep this additive — don't touch any existing module's screens or the company-creation form
+beyond adding the one new checkbox.
 ```

@@ -43,6 +43,10 @@ const MODULE_TO_SCRIPT = {
   token:          '14_module_token.sql',
   notes:          '15_module_notes.sql',
   birthday:       '16_module_birthday.sql',
+  sitara_dashboard: '17_module_sitara.sql',
+  sitara_people:    '17_module_sitara.sql',
+  sitara_stocks:    '17_module_sitara.sql',
+  sitara_orders:    '17_module_sitara.sql',
 };
 
 // Some modules' tables have foreign keys into another module's tables (e.g.
@@ -147,6 +151,7 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   if (scriptsNeeded.has('14_module_token.sql')) orderedScripts.push('14_module_token.sql');
   if (scriptsNeeded.has('15_module_notes.sql')) orderedScripts.push('15_module_notes.sql');
   if (scriptsNeeded.has('16_module_birthday.sql')) orderedScripts.push('16_module_birthday.sql');
+  if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('17_module_sitara.sql');
 
   for (const scriptFile of orderedScripts) {
     const step = `run_${scriptFile}`;
