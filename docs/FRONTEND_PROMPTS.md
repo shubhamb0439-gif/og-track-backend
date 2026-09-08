@@ -771,8 +771,9 @@ adding the "Forgot password?" entry point described in step 1.
 
 ## 15. Sitara Bespoke module bundle (dashboard, people, stocks, orders)
 
-**Status: backend built (Phase 1 — manual data entry; BigCommerce/Razorpay sync are later
-phases, not live yet) — frontend change required, new company checkbox + 4 new screens.**
+**Status: backend built (Phase 1 manual data entry + Phase 2 BigCommerce order sync are both
+in; Razorpay reconciliation is still a later phase) — frontend change required, new company
+checkbox + 4 new screens.**
 
 **1. Company-creation form (master admin)**: add a single checkbox — **"Sitara Bespoke"** —
 that, when ticked, sets all 4 of these module keys in `enabled_modules` at once (don't add 4
@@ -815,12 +816,17 @@ GET  /orders  (optional query: ?status=... or ?source=bigcommerce|manual)
 GET  /orders/:id (includes items)
 POST /orders
   Body: { customerId?, status?, notes?, items: [{ productId?, productName, quantity, unitPrice }] }
-  Manual order entry (a GPay/DM sale) — always creates source:"manual". A later phase adds
-  BigCommerce-sourced orders automatically; this endpoint never creates those.
-PATCH /orders/:id/status — body: { status }. Valid values: "awaiting_fulfillment",
-  "awaiting_payment", "partially_shipped", "shipped", "completed", "cancelled", "refunded".
-  This is THE status-change action for every order regardless of source — use the same
-  control/button for both BigCommerce-sourced and manual orders.
+  Manual order entry (a GPay/DM sale) — always creates source:"manual". BigCommerce orders now
+  arrive automatically via a webhook (source:"bigcommerce") — this endpoint never creates those.
+PATCH /orders/:id/status — body: { status }. Valid values mirror BigCommerce's own order
+  statuses: "incomplete", "pending", "awaiting_payment", "awaiting_fulfillment",
+  "awaiting_shipment", "awaiting_pickup", "partially_shipped", "shipped", "completed",
+  "cancelled", "declined", "refunded", "partially_refunded", "disputed",
+  "manual_verification_required", "verified". This is THE status-change action for every order
+  regardless of source — use the same control/button for both BigCommerce-sourced and manual
+  orders. Response includes `bigcommerceSyncError` (string or null) — if non-null, the local
+  status change still succeeded but pushing it back to BigCommerce failed; show this as a
+  dismissible warning next to the (already-updated) status, don't block on it or roll anything back.
 
 GET  /dashboard
   -> { recentSales: [...orders], totalSales, totalSalesThisMonth, orderCount, totalExpenses,

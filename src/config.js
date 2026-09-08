@@ -322,4 +322,20 @@ module.exports = {
     // reasoning as the rest of this block).
     frontendBaseUrl: process.env.FRONTEND_BASE_URL || null,
   },
+  // BigCommerce (src/routes/sitara.js's webhook + outbound status push) —
+  // Sitara Bespoke's own store, global env vars per the user's own choice
+  // (only one company uses this today). Deliberately NOT validated via
+  // required() — same reasoning as the rest of this file.
+  bigcommerce: {
+    enabled: !!(process.env.BIGCOMMERCE_STORE_HASH && process.env.BIGCOMMERCE_ACCESS_TOKEN),
+    storeHash: process.env.BIGCOMMERCE_STORE_HASH || null,
+    accessToken: process.env.BIGCOMMERCE_ACCESS_TOKEN || null,
+    // BigCommerce doesn't sign webhook payloads with a computed HMAC the way
+    // Meta/Stripe do — its real mechanism is a custom header you attach when
+    // creating the webhook subscription (BigCommerce V3 Webhooks API's
+    // "headers" field). This is that header's expected value; the header
+    // NAME itself is hardcoded to X-Sitara-Webhook-Secret in sitara.js — use
+    // that exact name when creating the webhook subscription.
+    webhookSecret: process.env.BIGCOMMERCE_WEBHOOK_SECRET || null,
+  },
 };

@@ -129,7 +129,16 @@ CREATE TABLE dbo.sitara_orders (
     created_at              DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at              DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
 
-    CONSTRAINT CK_sitara_orders_source CHECK (source IN ('bigcommerce','manual'))
+    CONSTRAINT CK_sitara_orders_source CHECK (source IN ('bigcommerce','manual')),
+    -- Mirrors BigCommerce's own order status list (mapped from their human
+    -- strings — e.g. "Awaiting Fulfillment" -> 'awaiting_fulfillment' — in
+    -- src/routes/sitara.js's BC_STATUS_MAP) plus 'awaiting_fulfillment' as
+    -- the default starting status for a manual order.
+    CONSTRAINT CK_sitara_orders_status CHECK (status IN (
+        'incomplete','pending','awaiting_payment','awaiting_fulfillment','awaiting_shipment',
+        'awaiting_pickup','partially_shipped','shipped','completed','cancelled','declined',
+        'refunded','partially_refunded','disputed','manual_verification_required','verified'
+    ))
 );
 GO
 CREATE UNIQUE INDEX IX_sitara_orders_bc_id ON dbo.sitara_orders(bigcommerce_order_id) WHERE bigcommerce_order_id IS NOT NULL;

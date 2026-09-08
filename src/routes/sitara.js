@@ -1,4 +1,6 @@
 const express = require('express');
+const crypto = require('crypto');
+const config = require('../config');
 const router = express.Router();
 
 // ── Row mappers ──────────────────────────────────────────────────────────────
@@ -51,9 +53,12 @@ function newId(prefix) {
   return `${prefix}_${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
 }
 
+// Mirrors BigCommerce's own order status list — see BC_STATUS_MAP below for
+// the human-string -> this-enum mapping used when syncing a BigCommerce order in.
 const ORDER_STATUSES = [
-  'awaiting_fulfillment', 'awaiting_payment', 'partially_shipped',
-  'shipped', 'completed', 'cancelled', 'refunded',
+  'incomplete', 'pending', 'awaiting_payment', 'awaiting_fulfillment', 'awaiting_shipment',
+  'awaiting_pickup', 'partially_shipped', 'shipped', 'completed', 'cancelled', 'declined',
+  'refunded', 'partially_refunded', 'disputed', 'manual_verification_required', 'verified',
 ];
 
 // ── Weavers ──────────────────────────────────────────────────────────────────
@@ -339,6 +344,204 @@ router.delete('/purchase-orders/:id', async (req, res) => {
 });
 
 // ── Orders (BigCommerce-fed in Phase 2 + manual entry) ────────────────────────
+
+// BigCommerce's own order status strings (its Order Statuses reference) ->
+// this table's snake_case enum. Verify this list against a real webhook
+// payload once BigCommerce is actually wired up — mapped from documented
+// status names, not yet confirmed against this specific store's live data.
+const BC_STATUS_MAP = {
+  'Incomplete': 'incomplete',
+  'Pending': 'pending',
+  'Awaiting Payment': 'awaiting_payment',
+  'Awaiting Fulfillment': 'awaiting_fulfillment',
+  'Awaiting Shipment': 'awaiting_shipment',
+  'Awaiting Pickup': 'awaiting_pickup',
+  'Partially Shipped': 'partially_shipped',
+  'Shipped': 'shipped',
+  'Completed': 'completed',
+  'Cancelled': 'cancelled',
+  'Declined': 'declined',
+  'Refunded': 'refunded',
+  'Partially Refunded': 'partially_refunded',
+  'Disputed': 'disputed',
+  'Manual Verification Required': 'manual_verification_required',
+  'Verified': 'verified',
+};
+function mapBigCommerceStatus(bcStatus) {
+  return BC_STATUS_MAP[bcStatus] || 'awaiting_fulfillment';
+}
+
+function bigcommerceApiHeaders() {
+  return { 'X-Auth-Token': config.bigcommerce.accessToken, Accept: 'application/json' };
+}
+
+async function fetchBigCommerceOrder(orderId) {
+  const res = await fetch(`https://api.bigcommerce.com/stores/${config.bigcommerce.storeHash}/v2/orders/${orderId}`, {
+    headers: bigcommerceApiHeaders(),
+  });
+  if (!res.ok) throw new Error(`BigCommerce order fetch failed (${res.status})`);
+  return res.json();
+}
+
+async function fetchBigCommerceOrderProducts(orderId) {
+  const res = await fetch(`https://api.bigcommerce.com/stores/${config.bigcommerce.storeHash}/v2/orders/${orderId}/products`, {
+    headers: bigcommerceApiHeaders(),
+  });
+  if (!res.ok) throw new Error(`BigCommerce order products fetch failed (${res.status})`);
+  return res.json();
+}
+
+/**
+ * Pulls one order (by its BigCommerce id) from BigCommerce's API and
+ * upserts it into sitara_orders/sitara_order_items. Called from the webhook
+ * on both order/created and order/statusUpdated — always re-fetches the
+ * full order rather than trusting webhook payload fields, since the
+ * webhook body itself only carries the id, not the order contents.
+ */
+async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
+  const bcOrder = await fetchBigCommerceOrder(bcOrderId);
+  const bcProducts = await fetchBigCommerceOrderProducts(bcOrderId);
+  const mappedStatus = mapBigCommerceStatus(bcOrder.status);
+
+  // Match/create the customer by BigCommerce's own customer id. A guest
+  // checkout (customer_id === 0) has no real BigCommerce customer to link —
+  // leave customer_id null rather than inventing a placeholder row.
+  let customerId = null;
+  if (bcOrder.customer_id) {
+    const bcCustomerId = String(bcOrder.customer_id);
+    let customer = await db('sitara_customers').where({ bigcommerce_customer_id: bcCustomerId }).first();
+    if (!customer) {
+      const billing = bcOrder.billing_address || {};
+      const id = newId('cust');
+      await db('sitara_customers').insert({
+        id,
+        name: [billing.first_name, billing.last_name].filter(Boolean).join(' ') || `Customer ${bcCustomerId}`,
+        phone: billing.phone || null,
+        email: bcOrder.billing_address?.email || null,
+        source: 'bigcommerce',
+        bigcommerce_customer_id: bcCustomerId,
+      });
+      customer = await db('sitara_customers').where({ id }).first();
+    }
+    customerId = customer.id;
+  }
+
+  const existing = await db('sitara_orders').where({ bigcommerce_order_id: String(bcOrderId) }).first();
+  const statusChanged = !existing || existing.status !== mappedStatus;
+
+  let orderId = existing?.id;
+  if (!existing) {
+    orderId = newId('sord');
+    await db('sitara_orders').insert({
+      id: orderId, bigcommerce_order_id: String(bcOrderId), order_number: `BC-${bcOrderId}`,
+      customer_id: customerId, status: mappedStatus, total: Number(bcOrder.total_inc_tax || 0),
+      source: 'bigcommerce', status_changed_at: new Date(),
+    });
+  } else {
+    await db('sitara_orders').where({ id: orderId }).update({
+      customer_id: customerId, status: mappedStatus, total: Number(bcOrder.total_inc_tax || 0),
+      status_changed_at: statusChanged ? new Date() : existing.status_changed_at,
+      flagged: statusChanged ? 0 : existing.flagged,
+      updated_at: new Date(),
+    });
+    await db('sitara_order_items').where({ order_id: orderId }).delete();
+  }
+
+  for (const p of (bcProducts || [])) {
+    await db('sitara_order_items').insert({
+      id: newId('soi'), order_id: orderId, product_id: null,
+      product_name: p.name || 'Item', quantity: Number(p.quantity || 1),
+      unit_price: Number(p.price_inc_tax || 0), line_total: Number(p.total_inc_tax || 0),
+    });
+  }
+
+  const saved = await db('sitara_orders').where({ id: orderId }).first();
+  io.to(companySlug).emit(existing ? 'sitara:order_updated' : 'sitara:order_created', mapOrder(saved));
+}
+
+function verifyBigCommerceWebhook(req) {
+  if (!config.bigcommerce.webhookSecret) {
+    console.warn('[sitara] BIGCOMMERCE_WEBHOOK_SECRET not set — skipping webhook verification.');
+    return true;
+  }
+  const provided = req.headers['x-sitara-webhook-secret'];
+  if (!provided) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(config.bigcommerce.webhookSecret));
+  } catch {
+    return false; // length mismatch etc. — definitely not a match
+  }
+}
+
+// POST /api/:slug/sitara/bigcommerce/webhook
+// BigCommerce doesn't sign webhook bodies with a computed HMAC — its real
+// mechanism is a custom header attached when the webhook subscription is
+// created (BigCommerce V3 Webhooks API's "headers" field). Create the
+// subscription with a header named exactly X-Sitara-Webhook-Secret, value =
+// whatever BIGCOMMERCE_WEBHOOK_SECRET is set to.
+router.post('/bigcommerce/webhook', async (req, res) => {
+  res.sendStatus(200); // ack fast — same reasoning as the WhatsApp webhook
+  try {
+    if (!config.bigcommerce.enabled) return;
+    if (!verifyBigCommerceWebhook(req)) {
+      console.error('[sitara] rejected a BigCommerce webhook POST with an invalid/missing secret header.');
+      return;
+    }
+    const { scope, data } = req.body || {};
+    if (!scope || !data?.id) return;
+    if (scope.startsWith('store/order/')) {
+      await syncBigCommerceOrder(req.db, req.io, req.company.slug, data.id);
+    }
+  } catch (e) {
+    console.error('[sitara] BigCommerce webhook processing failed:', e);
+  }
+});
+
+async function listAllBigCommerceOrderIds() {
+  const ids = [];
+  let page = 1;
+  const limit = 250;
+  for (;;) {
+    const res = await fetch(
+      `https://api.bigcommerce.com/stores/${config.bigcommerce.storeHash}/v2/orders?limit=${limit}&page=${page}`,
+      { headers: bigcommerceApiHeaders() }
+    );
+    if (res.status === 204) break; // BigCommerce returns 204 (no body) past the last page
+    if (!res.ok) throw new Error(`BigCommerce order list failed (${res.status}): ${await res.text()}`);
+    const orders = await res.json();
+    if (!orders.length) break;
+    orders.forEach((o) => ids.push(o.id));
+    if (orders.length < limit) break;
+    page += 1;
+  }
+  return ids;
+}
+
+// POST /api/:slug/sitara/bigcommerce/backfill
+// One-time (or re-runnable) catch-up for orders that existed in BigCommerce
+// BEFORE the webhooks were created — those only fire for new events going
+// forward. Reuses syncBigCommerceOrder, so this is safe to re-run (it
+// upserts by bigcommerce_order_id either way). Runs on production, where
+// the BigCommerce credentials actually live — see scripts/backfillBigCommerceOrders.js
+// for the equivalent as a local CLI script, for anyone who prefers that.
+router.post('/bigcommerce/backfill', async (req, res) => {
+  if (!config.bigcommerce.enabled) return res.status(503).json({ error: 'BigCommerce is not configured.' });
+  try {
+    const orderIds = await listAllBigCommerceOrderIds();
+    let succeeded = 0;
+    const failures = [];
+    for (const id of orderIds) {
+      try {
+        await syncBigCommerceOrder(req.db, req.io, req.company.slug, id);
+        succeeded += 1;
+      } catch (e) {
+        failures.push({ id, error: e.message });
+      }
+    }
+    res.json({ totalFound: orderIds.length, succeeded, failed: failures.length, failures });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 async function nextOrderNumber(db) {
   const last = await db('sitara_orders').orderBy('created_at', 'desc').first();
   if (!last || !last.order_number) return 'SORD-0001';
@@ -406,6 +609,29 @@ router.post('/orders', async (req, res) => {
 // The one status-change path for every order regardless of source — Phase 2
 // extends this SAME handler to also push the change to BigCommerce when
 // order.bigcommerce_order_id is set, rather than adding a separate endpoint.
+// BigCommerce's write API keys order status by a NUMERIC status_id, not the
+// string — these are BigCommerce's documented DEFAULT status ids, but a
+// store can have custom statuses with different ids. VERIFY this against
+// GET https://api.bigcommerce.com/stores/{store_hash}/v2/order_statuses for
+// this specific store before relying on it; don't trust this list blindly.
+const BC_STATUS_ID = {
+  incomplete: 0, pending: 1, shipped: 2, partially_shipped: 3, refunded: 4,
+  cancelled: 5, declined: 6, awaiting_payment: 7, awaiting_pickup: 8,
+  awaiting_shipment: 9, completed: 10, awaiting_fulfillment: 11,
+  manual_verification_required: 12, disputed: 13, partially_refunded: 14,
+};
+
+async function pushStatusToBigCommerce(bcOrderId, status) {
+  const statusId = BC_STATUS_ID[status];
+  if (statusId === undefined) throw new Error(`No known BigCommerce status_id for "${status}" — verify BC_STATUS_ID against this store's real order statuses.`);
+  const res = await fetch(`https://api.bigcommerce.com/stores/${config.bigcommerce.storeHash}/v2/orders/${bcOrderId}`, {
+    method: 'PUT',
+    headers: { ...bigcommerceApiHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status_id: statusId }),
+  });
+  if (!res.ok) throw new Error(`BigCommerce order status push failed (${res.status}): ${await res.text()}`);
+}
+
 router.patch('/orders/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
@@ -420,7 +646,22 @@ router.patch('/orders/:id/status', async (req, res) => {
     });
     const saved = await req.db('sitara_orders').where({ id: req.params.id }).first();
     req.io.to(req.company.slug).emit('sitara:order_updated', mapOrder(saved));
-    res.json(mapOrder(saved));
+
+    // Push to BigCommerce for a BigCommerce-sourced order — best-effort: a
+    // failure here must never undo the local status change (the local DB is
+    // the source of truth for this request), just surface it clearly so the
+    // user knows to retry/investigate rather than assuming it round-tripped.
+    let bigcommerceSyncError = null;
+    if (order.bigcommerce_order_id && config.bigcommerce.enabled) {
+      try {
+        await pushStatusToBigCommerce(order.bigcommerce_order_id, status);
+      } catch (e) {
+        console.error(`[sitara] failed to push status to BigCommerce for order ${req.params.id}:`, e.message);
+        bigcommerceSyncError = e.message;
+      }
+    }
+
+    res.json({ ...mapOrder(saved), bigcommerceSyncError });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -452,5 +693,13 @@ router.get('/dashboard', async (req, res) => {
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// Exposed as a property on the router (not a separate named export) so
+// `require('./routes/sitara')` still works exactly as every other route file
+// expects (a bare Express router) — scripts/backfillBigCommerceOrders.js is
+// the one place that needs this function directly, reusing the exact same
+// sync logic the webhook uses rather than a second copy of it.
+router.syncBigCommerceOrder = syncBigCommerceOrder;
+router.listAllBigCommerceOrderIds = listAllBigCommerceOrderIds;
 
 module.exports = router;
