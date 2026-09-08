@@ -403,21 +403,30 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
   const bcProducts = await fetchBigCommerceOrderProducts(bcOrderId);
   const mappedStatus = mapBigCommerceStatus(bcOrder.status);
 
-  // Match/create the customer by BigCommerce's own customer id. A guest
-  // checkout (customer_id === 0) has no real BigCommerce customer to link —
-  // leave customer_id null rather than inventing a placeholder row.
+  // Match/create the customer. BigCommerce uses customer_id === 0 for a
+  // GUEST checkout (not "no customer") — confirmed live: a real order had
+  // customer_id: 0 but full name/email sitting right in billing_address.
+  // 0 is falsy in JS, so a plain `if (bcOrder.customer_id)` check silently
+  // skipped customer creation for every guest order — that was the bug.
+  // Registered customers key off bigcommerce_customer_id; guests (no real BC
+  // customer id to key off) key off email instead, so repeat guest orders
+  // from the same email still link to one customer record.
   let customerId = null;
-  if (bcOrder.customer_id) {
-    const bcCustomerId = String(bcOrder.customer_id);
-    let customer = await db('sitara_customers').where({ bigcommerce_customer_id: bcCustomerId }).first();
+  const billing = bcOrder.billing_address || {};
+  const customerName = [billing.first_name, billing.last_name].filter(Boolean).join(' ').trim();
+  const bcCustomerId = bcOrder.customer_id ? String(bcOrder.customer_id) : null;
+
+  if (bcCustomerId || billing.email || customerName) {
+    let customer = bcCustomerId
+      ? await db('sitara_customers').where({ bigcommerce_customer_id: bcCustomerId }).first()
+      : (billing.email ? await db('sitara_customers').where({ email: billing.email, source: 'bigcommerce' }).first() : null);
     if (!customer) {
-      const billing = bcOrder.billing_address || {};
       const id = newId('cust');
       await db('sitara_customers').insert({
         id,
-        name: [billing.first_name, billing.last_name].filter(Boolean).join(' ') || `Customer ${bcCustomerId}`,
+        name: customerName || (bcCustomerId ? `Customer ${bcCustomerId}` : 'Guest'),
         phone: billing.phone || null,
-        email: bcOrder.billing_address?.email || null,
+        email: billing.email || null,
         source: 'bigcommerce',
         bigcommerce_customer_id: bcCustomerId,
       });
@@ -448,9 +457,33 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
   }
 
   for (const p of (bcProducts || [])) {
+    // BigCommerce product names can contain HTML (confirmed live:
+    // "Moonlit  <em>Jamdani</em>") — strip it before storing.
+    const cleanName = String(p.name || '').replace(/<[^>]+>/g, '').trim() || 'Item';
+
+    // Match/create the catalog product by BigCommerce's product id. Starts
+    // at stock: 0 — this only ever discovers a product THROUGH an order, it
+    // has no way to know the product's actual current stock (a real
+    // catalog/inventory sync from BigCommerce is still out of scope) —
+    // correct it manually in Stocks > Inventory once you notice it appear.
+    let productId = null;
+    if (p.product_id) {
+      const bcProductId = String(p.product_id);
+      let product = await db('sitara_products').where({ bigcommerce_product_id: bcProductId }).first();
+      if (!product) {
+        const id = newId('prod');
+        await db('sitara_products').insert({
+          id, name: cleanName, sku: p.sku || null, stock: 0, unit: 'pcs',
+          bigcommerce_product_id: bcProductId,
+        });
+        product = await db('sitara_products').where({ id }).first();
+      }
+      productId = product.id;
+    }
+
     await db('sitara_order_items').insert({
-      id: newId('soi'), order_id: orderId, product_id: null,
-      product_name: p.name || 'Item', quantity: Number(p.quantity || 1),
+      id: newId('soi'), order_id: orderId, product_id: productId,
+      product_name: cleanName, quantity: Number(p.quantity || 1),
       unit_price: Number(p.price_inc_tax || 0), line_total: Number(p.total_inc_tax || 0),
     });
   }
