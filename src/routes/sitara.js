@@ -517,29 +517,53 @@ async function listAllBigCommerceOrderIds() {
   return ids;
 }
 
+// In-memory only (one entry per company slug) — this is a rare, one-off
+// admin operation, not a real job queue; a server restart losing progress
+// mid-backfill is fine, just re-run it (syncBigCommerceOrder upserts, so a
+// partial re-run never double-counts).
+const backfillStatus = new Map();
+
 // POST /api/:slug/sitara/bigcommerce/backfill
 // One-time (or re-runnable) catch-up for orders that existed in BigCommerce
 // BEFORE the webhooks were created — those only fire for new events going
-// forward. Reuses syncBigCommerceOrder, so this is safe to re-run (it
-// upserts by bigcommerce_order_id either way). Runs on production, where
-// the BigCommerce credentials actually live — see scripts/backfillBigCommerceOrders.js
-// for the equivalent as a local CLI script, for anyone who prefers that.
+// forward. Reuses syncBigCommerceOrder. Fire-and-forget: acks immediately
+// and runs in the background (same "ack fast, process after" pattern as the
+// webhook above) — a real store's order history can easily take longer than
+// any HTTP client's own timeout (confirmed live: Postman's cloud agent caps
+// at 30s). Poll GET /bigcommerce/backfill/status for progress instead.
 router.post('/bigcommerce/backfill', async (req, res) => {
   if (!config.bigcommerce.enabled) return res.status(503).json({ error: 'BigCommerce is not configured.' });
-  try {
-    const orderIds = await listAllBigCommerceOrderIds();
-    let succeeded = 0;
-    const failures = [];
-    for (const id of orderIds) {
-      try {
-        await syncBigCommerceOrder(req.db, req.io, req.company.slug, id);
-        succeeded += 1;
-      } catch (e) {
-        failures.push({ id, error: e.message });
+  const slug = req.company.slug;
+  if (backfillStatus.get(slug)?.status === 'running') {
+    return res.status(409).json({ error: 'A backfill is already running for this company — check GET /bigcommerce/backfill/status.' });
+  }
+  backfillStatus.set(slug, { status: 'running', startedAt: new Date() });
+  res.json({ started: true, message: 'Running in the background — poll GET /bigcommerce/backfill/status for progress.' });
+
+  const db = req.db;
+  const io = req.io;
+  (async () => {
+    try {
+      const orderIds = await listAllBigCommerceOrderIds();
+      let succeeded = 0;
+      const failures = [];
+      for (const id of orderIds) {
+        try {
+          await syncBigCommerceOrder(db, io, slug, id);
+          succeeded += 1;
+        } catch (e) {
+          failures.push({ id, error: e.message });
+        }
       }
+      backfillStatus.set(slug, { status: 'completed', totalFound: orderIds.length, succeeded, failed: failures.length, failures, finishedAt: new Date() });
+    } catch (e) {
+      backfillStatus.set(slug, { status: 'failed', error: e.message, finishedAt: new Date() });
     }
-    res.json({ totalFound: orderIds.length, succeeded, failed: failures.length, failures });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  })();
+});
+
+router.get('/bigcommerce/backfill/status', (req, res) => {
+  res.json(backfillStatus.get(req.company.slug) || { status: 'never_run' });
 });
 
 async function nextOrderNumber(db) {
