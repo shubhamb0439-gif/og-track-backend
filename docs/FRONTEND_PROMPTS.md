@@ -815,7 +815,12 @@ PATCH /purchase-orders/:id — body: { status? ('pending'|'partial'|'received'|'
 DELETE /purchase-orders/:id
 
 GET  /orders  (optional query: ?status=... or ?source=bigcommerce|manual)
-GET  /orders/:id (includes items)
+  Order objects now include `customerName` and `customerCity` (flat fields, not nested under
+  a `customer` object) — populated automatically for BigCommerce-synced orders, null when
+  there's no linked customer (a rare case: an order synced before the guest-checkout fix, or
+  a manual order with no customerId given). Use these directly — no separate GET /customers
+  lookup needed to show a name on an order.
+GET  /orders/:id (includes items, same customerName/customerCity fields)
 POST /orders
   Body: { customerId?, status?, notes?, items: [{ productId?, productName, quantity, unitPrice }] }
   Manual order entry (a GPay/DM sale) — always creates source:"manual". BigCommerce orders now
@@ -832,11 +837,15 @@ PATCH /orders/:id/status — body: { status }. Valid values mirror BigCommerce's
 
 GET  /dashboard
   -> { recentSales: [...orders], totalSales, totalSalesThisMonth, orderCount, totalExpenses,
-       stockOnHand, pendingOrderCount, topProducts }
+       stockOnHand, pendingOrderCount, topProducts, topRegions }
   totalExpenses is currently always 0 (no expense-tracking source exists yet) — show it as-is,
-  don't hide the field. topProducts is an array (up to 10) of
-  { productName, totalQuantity, totalRevenue }, sorted by totalQuantity descending — the
-  best-sellers list. Show it as a simple ranked table/list on the dashboard.
+  don't hide the field. recentSales entries include customerName/customerCity same as GET /orders.
+  topProducts is an array (up to 10) of { productName, totalQuantity, totalRevenue }, sorted by
+  totalQuantity descending — the best-sellers list.
+  topRegions is an array (up to 10) of { city, orderCount, revenue }, sorted by revenue
+  descending — orders grouped by the customer's city (from BigCommerce billing address).
+  Orders with no linked customer or no city on file are excluded rather than lumped into an
+  "unknown" bucket. Show both as simple ranked tables/lists on the dashboard.
 ```
 
 ```

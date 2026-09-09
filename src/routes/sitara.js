@@ -37,9 +37,14 @@ const mapPOItem = (r) => r && ({
   quantity: Number(r.quantity), unitPrice: Number(r.unit_price), lineTotal: Number(r.line_total || 0),
 });
 
+// customerName/customerCity are flat fields (not nested customer: {...}) —
+// simplest for the frontend to render directly without a second lookup.
+// Both are null when there's no linked customer (e.g. an order synced before
+// the guest-checkout fix) or the caller didn't join sitara_customers in.
 const mapOrder = (r) => r && ({
   id: r.id, bigcommerceOrderId: r.bigcommerce_order_id, orderNumber: r.order_number,
-  customerId: r.customer_id, status: r.status, total: Number(r.total || 0), source: r.source,
+  customerId: r.customer_id, customerName: r.customer_name ?? null, customerCity: r.customer_city ?? null,
+  status: r.status, total: Number(r.total || 0), source: r.source,
   statusChangedAt: r.status_changed_at, flagged: !!r.flagged, notes: r.notes,
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
@@ -51,6 +56,17 @@ const mapOrderItem = (r) => r && ({
 
 function newId(prefix) {
   return `${prefix}_${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+// Base query for reading sitara_orders with the linked customer's name/city
+// already joined in — every read path that ends in mapOrder(...) should
+// start from this, not a bare db('sitara_orders'), so customerName/customerCity
+// are always populated rather than silently null. Writes (insert/update)
+// still go through the plain table name directly, not this query.
+function ordersQuery(db) {
+  return db('sitara_orders')
+    .leftJoin('sitara_customers', 'sitara_orders.customer_id', 'sitara_customers.id')
+    .select('sitara_orders.*', 'sitara_customers.name as customer_name', 'sitara_customers.city as customer_city');
 }
 
 // Mirrors BigCommerce's own order status list — see BC_STATUS_MAP below for
@@ -499,7 +515,7 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
     });
   }
 
-  const saved = await db('sitara_orders').where({ id: orderId }).first();
+  const saved = await ordersQuery(db).where({ 'sitara_orders.id': orderId }).first();
   io.to(companySlug).emit(existing ? 'sitara:order_updated' : 'sitara:order_created', mapOrder(saved));
 }
 
@@ -634,17 +650,17 @@ async function nextOrderNumber(db) {
 
 router.get('/orders', async (req, res) => {
   try {
-    let q = req.db('sitara_orders');
-    if (req.query.status) q = q.where({ status: req.query.status });
-    if (req.query.source) q = q.where({ source: req.query.source });
-    const rows = await q.orderBy('created_at', 'desc');
+    let q = ordersQuery(req.db);
+    if (req.query.status) q = q.where({ 'sitara_orders.status': req.query.status });
+    if (req.query.source) q = q.where({ 'sitara_orders.source': req.query.source });
+    const rows = await q.orderBy('sitara_orders.created_at', 'desc');
     res.json(rows.map(mapOrder));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 router.get('/orders/:id', async (req, res) => {
   try {
-    const order = await req.db('sitara_orders').where({ id: req.params.id }).first();
+    const order = await ordersQuery(req.db).where({ 'sitara_orders.id': req.params.id }).first();
     if (!order) return res.status(404).json({ error: 'Order not found' });
     const items = await req.db('sitara_order_items').where({ order_id: req.params.id });
     res.json({ ...mapOrder(order), items: items.map(mapOrderItem) });
@@ -679,7 +695,7 @@ router.post('/orders', async (req, res) => {
         unit_price: item.unitPrice || 0, line_total: lineTotal,
       });
     }
-    const saved = await req.db('sitara_orders').where({ id }).first();
+    const saved = await ordersQuery(req.db).where({ 'sitara_orders.id': id }).first();
     const savedItems = await req.db('sitara_order_items').where({ order_id: id });
     req.io.to(req.company.slug).emit('sitara:order_created', mapOrder(saved));
     res.json({ ...mapOrder(saved), items: savedItems.map(mapOrderItem) });
@@ -726,7 +742,7 @@ router.patch('/orders/:id/status', async (req, res) => {
     await req.db('sitara_orders').where({ id: req.params.id }).update({
       status, status_changed_at: new Date(), flagged: 0, updated_at: new Date(),
     });
-    const saved = await req.db('sitara_orders').where({ id: req.params.id }).first();
+    const saved = await ordersQuery(req.db).where({ 'sitara_orders.id': req.params.id }).first();
     req.io.to(req.company.slug).emit('sitara:order_updated', mapOrder(saved));
 
     // Push to BigCommerce for a BigCommerce-sourced order — best-effort: a
@@ -758,7 +774,7 @@ router.get('/dashboard', async (req, res) => {
     const monthSales = allOrders
       .filter((o) => new Date(o.created_at) >= monthStart)
       .reduce((sum, o) => sum + Number(o.total || 0), 0);
-    const recentOrders = await req.db('sitara_orders').orderBy('created_at', 'desc').limit(10);
+    const recentOrders = await ordersQuery(req.db).orderBy('sitara_orders.created_at', 'desc').limit(10);
     const pendingOrders = allOrders.filter((o) => !['completed', 'cancelled', 'refunded'].includes(o.status));
 
     const products = await req.db('sitara_products').select('stock');
@@ -776,6 +792,19 @@ router.get('/dashboard', async (req, res) => {
       .orderBy('totalQuantity', 'desc')
       .limit(10);
 
+    // Region/location breakdown — grouped by the linked customer's city.
+    // Orders with no linked customer or no city on file are excluded rather
+    // than lumped into a misleading "unknown" bucket.
+    const topRegions = await req.db('sitara_orders')
+      .join('sitara_customers', 'sitara_orders.customer_id', 'sitara_customers.id')
+      .whereNotNull('sitara_customers.city')
+      .select('sitara_customers.city as city')
+      .count('sitara_orders.id as orderCount')
+      .sum('sitara_orders.total as revenue')
+      .groupBy('sitara_customers.city')
+      .orderBy('revenue', 'desc')
+      .limit(10);
+
     res.json({
       recentSales: recentOrders.map(mapOrder),
       totalSales,
@@ -788,6 +817,11 @@ router.get('/dashboard', async (req, res) => {
         productName: p.product_name,
         totalQuantity: Number(p.totalQuantity || 0),
         totalRevenue: Number(p.totalRevenue || 0),
+      })),
+      topRegions: topRegions.map((r) => ({
+        city: r.city,
+        orderCount: Number(r.orderCount || 0),
+        revenue: Number(r.revenue || 0),
       })),
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
