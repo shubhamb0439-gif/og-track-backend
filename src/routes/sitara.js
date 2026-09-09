@@ -640,6 +640,200 @@ router.get('/bigcommerce/backfill/status', (req, res) => {
   res.json(backfillStatus.get(req.company.slug) || { status: 'never_run' });
 });
 
+// ── Razorpay reconciliation ───────────────────────────────────────────────────
+// Razorpay is the payment gateway already sitting behind BigCommerce checkout
+// (confirmed with the user) — this cross-checks Razorpay's own payment
+// records against sitara_orders, so a payment that came through Razorpay but
+// never turned into a recorded order (a sync gap, or a manual/DM sale that
+// still went through the same Razorpay account) gets surfaced instead of
+// silently missed.
+
+const mapRazorpayPayment = (r) => r && ({
+  id: r.id, razorpayPaymentId: r.razorpay_payment_id, amount: Number(r.amount),
+  status: r.status, orderId: r.order_id, capturedAt: r.captured_at, createdAt: r.created_at,
+});
+
+function razorpayApiHeaders() {
+  const basic = Buffer.from(`${config.razorpay.keyId}:${config.razorpay.keySecret}`).toString('base64');
+  return { Authorization: `Basic ${basic}`, Accept: 'application/json' };
+}
+
+async function fetchRazorpayPayment(paymentId) {
+  const res = await fetch(`https://api.razorpay.com/v1/payments/${paymentId}`, { headers: razorpayApiHeaders() });
+  if (!res.ok) throw new Error(`Razorpay payment fetch failed (${res.status}): ${await res.text()}`);
+  return res.json();
+}
+
+async function listAllRazorpayPayments() {
+  const payments = [];
+  let skip = 0;
+  const count = 100; // Razorpay's max page size
+  for (;;) {
+    const res = await fetch(`https://api.razorpay.com/v1/payments?count=${count}&skip=${skip}`, { headers: razorpayApiHeaders() });
+    if (!res.ok) throw new Error(`Razorpay payment list failed (${res.status}): ${await res.text()}`);
+    const page = await res.json();
+    const items = page.items || [];
+    payments.push(...items);
+    if (items.length < count) break;
+    skip += count;
+  }
+  return payments;
+}
+
+/**
+ * Matches a Razorpay payment to a sitara_orders row via the CUSTOMER, not a
+ * direct order reference — confirmed with the user this is what's needed
+ * (name/id/email cross-check), since Razorpay's own payment record doesn't
+ * carry a BigCommerce/Sitara order id. Matches the customer by email first
+ * (most reliable), falls back to phone. Among that customer's orders, picks
+ * one whose total is within ₹1 of the payment amount and isn't already
+ * linked to another payment — leaves order_id null (surfaced as unmatched
+ * in the reconciliation list) if no confident match is found at either step.
+ */
+async function matchRazorpayPaymentToOrder(db, entity) {
+  const amountRupees = Number(entity.amount || 0) / 100; // Razorpay amounts are in paise
+  let customer = null;
+  if (entity.email) customer = await db('sitara_customers').where({ email: entity.email }).first();
+  if (!customer && entity.contact) customer = await db('sitara_customers').where({ phone: entity.contact }).first();
+  if (!customer) return null;
+
+  const candidateOrders = await db('sitara_orders').where({ customer_id: customer.id });
+  for (const order of candidateOrders) {
+    if (Math.abs(Number(order.total) - amountRupees) > 1) continue;
+    const alreadyLinked = await db('sitara_razorpay_payments').where({ order_id: order.id }).first();
+    if (!alreadyLinked) return order.id;
+  }
+  return null;
+}
+
+async function syncRazorpayPayment(db, entity) {
+  const existing = await db('sitara_razorpay_payments').where({ razorpay_payment_id: entity.id }).first();
+  const orderId = await matchRazorpayPaymentToOrder(db, entity);
+  const row = {
+    amount: Number(entity.amount || 0) / 100,
+    status: entity.status,
+    order_id: orderId,
+    captured_at: entity.created_at ? new Date(entity.created_at * 1000) : new Date(),
+  };
+  if (existing) {
+    await db('sitara_razorpay_payments').where({ id: existing.id }).update(row);
+  } else {
+    await db('sitara_razorpay_payments').insert({ id: newId('rzp'), razorpay_payment_id: entity.id, ...row });
+  }
+}
+
+function verifyRazorpayWebhook(req) {
+  if (!config.razorpay.webhookSecret) {
+    console.warn('[sitara] RAZORPAY_WEBHOOK_SECRET not set — skipping webhook verification.');
+    return true;
+  }
+  const signature = req.headers['x-razorpay-signature'];
+  if (!signature || !req.rawBody) return false;
+  const expected = crypto.createHmac('sha256', config.razorpay.webhookSecret).update(req.rawBody).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+// POST /api/:slug/sitara/razorpay/webhook — Razorpay DOES sign webhooks with
+// a computed HMAC-SHA256 of the raw body (unlike BigCommerce), checked
+// against X-Razorpay-Signature. Set the same value as RAZORPAY_WEBHOOK_SECRET
+// when creating the webhook in Razorpay's dashboard (Settings > Webhooks),
+// subscribed to the "payment.captured" event.
+router.post('/razorpay/webhook', async (req, res) => {
+  res.sendStatus(200); // ack fast — same reasoning as the other webhooks
+  try {
+    if (!config.razorpay.enabled) return;
+    if (!verifyRazorpayWebhook(req)) {
+      console.error('[sitara] rejected a Razorpay webhook POST with an invalid/missing signature.');
+      return;
+    }
+    const entity = req.body?.payload?.payment?.entity;
+    if (!entity) return;
+    await syncRazorpayPayment(req.db, entity);
+  } catch (e) {
+    console.error('[sitara] Razorpay webhook processing failed:', e);
+  }
+});
+
+// GET /api/:slug/sitara/razorpay/debug/:paymentId — raw Razorpay payment
+// object, unmodified. Same purpose as the BigCommerce debug endpoint: verify
+// field names (email/contact/notes shape) against a REAL payment before
+// trusting matchRazorpayPaymentToOrder's assumptions. Temporary diagnostic.
+router.get('/razorpay/debug/:paymentId', async (req, res) => {
+  if (!config.razorpay.enabled) return res.status(503).json({ error: 'Razorpay is not configured.' });
+  try {
+    const payment = await fetchRazorpayPayment(req.params.paymentId);
+    res.json({ payment });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+const razorpayBackfillStatus = new Map();
+
+// POST /api/:slug/sitara/razorpay/backfill — same fire-and-forget pattern as
+// the BigCommerce backfill (a real payment history can exceed any client's
+// own timeout). Safe to re-run — syncRazorpayPayment upserts by razorpay_payment_id.
+router.post('/razorpay/backfill', async (req, res) => {
+  if (!config.razorpay.enabled) return res.status(503).json({ error: 'Razorpay is not configured.' });
+  const slug = req.company.slug;
+  if (razorpayBackfillStatus.get(slug)?.status === 'running') {
+    return res.status(409).json({ error: 'A backfill is already running for this company — check GET /razorpay/backfill/status.' });
+  }
+  razorpayBackfillStatus.set(slug, { status: 'running', startedAt: new Date() });
+  res.json({ started: true, message: 'Running in the background — poll GET /razorpay/backfill/status for progress.' });
+
+  const db = req.db;
+  (async () => {
+    try {
+      const payments = await listAllRazorpayPayments();
+      let succeeded = 0;
+      const failures = [];
+      for (const entity of payments) {
+        try {
+          await syncRazorpayPayment(db, entity);
+          succeeded += 1;
+        } catch (e) {
+          failures.push({ id: entity.id, error: e.message });
+        }
+      }
+      razorpayBackfillStatus.set(slug, { status: 'completed', totalFound: payments.length, succeeded, failed: failures.length, failures, finishedAt: new Date() });
+    } catch (e) {
+      razorpayBackfillStatus.set(slug, { status: 'failed', error: e.message, finishedAt: new Date() });
+    }
+  })();
+});
+
+router.get('/razorpay/backfill/status', (req, res) => {
+  res.json(razorpayBackfillStatus.get(req.company.slug) || { status: 'never_run' });
+});
+
+// GET /api/:slug/sitara/razorpay-payments — the actual reconciliation list:
+// every known Razorpay payment, with customer/order info if matched. This is
+// what the new "Razorpay" section reads from.
+router.get('/razorpay-payments', async (req, res) => {
+  try {
+    const rows = await req.db('sitara_razorpay_payments')
+      .leftJoin('sitara_orders', 'sitara_razorpay_payments.order_id', 'sitara_orders.id')
+      .leftJoin('sitara_customers', 'sitara_orders.customer_id', 'sitara_customers.id')
+      .select(
+        'sitara_razorpay_payments.*',
+        'sitara_orders.order_number as order_number',
+        'sitara_customers.name as customer_name',
+        'sitara_customers.email as customer_email'
+      )
+      .orderBy('sitara_razorpay_payments.captured_at', 'desc');
+    res.json(rows.map((r) => ({
+      ...mapRazorpayPayment(r),
+      matched: !!r.order_id,
+      orderNumber: r.order_number || null,
+      customerName: r.customer_name || null,
+      customerEmail: r.customer_email || null,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 async function nextOrderNumber(db) {
   const last = await db('sitara_orders').orderBy('created_at', 'desc').first();
   if (!last || !last.order_number) return 'SORD-0001';

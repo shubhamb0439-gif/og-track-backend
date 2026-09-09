@@ -338,4 +338,16 @@ module.exports = {
     // that exact name when creating the webhook subscription.
     webhookSecret: process.env.BIGCOMMERCE_WEBHOOK_SECRET || null,
   },
+  // Razorpay (src/routes/sitara.js's payment reconciliation) — Sitara's
+  // existing payment gateway behind BigCommerce checkout. Global env vars,
+  // same reasoning as bigcommerce above.
+  razorpay: {
+    enabled: !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
+    keyId: process.env.RAZORPAY_KEY_ID || null,
+    keySecret: process.env.RAZORPAY_KEY_SECRET || null,
+    // Razorpay DOES sign webhooks with a computed HMAC-SHA256 of the raw
+    // body (unlike BigCommerce) — this is that secret, set when creating
+    // the webhook in Razorpay's own dashboard (Settings > Webhooks).
+    webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || null,
+  },
 };

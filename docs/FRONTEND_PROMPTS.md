@@ -973,3 +973,40 @@ screen (e.g. Sales or CRM) subscribes to its own events and updates its local st
 Don't change how any other module's real-time updates work — this is only adding the missing
 Sitara subscriptions.
 ```
+
+---
+
+## 18. Sitara Bespoke — Razorpay reconciliation section
+
+**Status: backend built (webhook + backfill both in place) — needs a real payment run through
+before the matching logic is fully verified (see chat) — frontend change required, new section.**
+
+**Endpoint:**
+```
+GET  /razorpay-payments
+  -> [ { id, razorpayPaymentId, amount, status, orderId, matched, orderNumber, customerName,
+         customerEmail, capturedAt, createdAt }, ... ]
+  Every known Razorpay payment, newest first. `matched` is true when it's been linked to a
+  real sitara_orders row (matching is done by customer email/phone + amount, not a direct
+  order reference — Razorpay itself doesn't carry one). When matched: orderNumber/
+  customerName/customerEmail are populated. When NOT matched (matched: false, those three
+  null) — that's the actual "did we miss a sale" signal: a real payment came through Razorpay
+  with no corresponding order in the system.
+```
+
+```
+Add a new "Razorpay" section to Sitara Bespoke (sidebar, alongside Dashboard/People/Stocks/
+Orders), fed from GET /razorpay-payments.
+
+Show it as a list/table: payment id, amount, status, captured date, and a clear visual
+distinction between matched and unmatched rows — e.g. matched rows show the linked order
+number + customer name; unmatched rows show something like "⚠ No matching order found" in a
+warning color, since these are the ones that actually need someone to look into (a real
+payment with nothing recorded against it — possibly a manual/DM sale that was paid via this
+same Razorpay account but never entered into Sitara Bespoke, or a sync gap).
+
+Sort or filter so unmatched payments are easy to find (e.g. a "Show unmatched only" toggle,
+or just sort unmatched-first) — that's the primary reason this section exists.
+
+Keep this additive — a new section, not a change to any existing screen.
+```
