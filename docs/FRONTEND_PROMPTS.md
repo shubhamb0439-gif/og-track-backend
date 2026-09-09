@@ -877,4 +877,99 @@ module's sidebar entry already follows).
 
 Keep this additive — don't touch any existing module's screens or the company-creation form
 beyond adding the one new checkbox.
+
+---
+
+## 16. Sitara Bespoke follow-up — dashboard analytics, customer info on orders
+
+**Status: backend built — updates to the screens from Prompt 15, not new screens.**
+
+**Endpoints** (both already exist from Prompt 15 — these are field additions to their responses):
+```
+GET  /orders  (and GET /orders/:id, and recentSales inside GET /dashboard)
+  Order objects now also include: customerName, customerCity (flat fields, not nested under
+  a customer object) — populated automatically for BigCommerce-synced orders. Both are null
+  when there's no linked customer (rare: an order synced before a fix, or a manual order with
+  no customerId given). Use these directly instead of cross-referencing GET /customers.
+
+PATCH /orders/:id/status
+  Valid status values are now the full BigCommerce list, not the shorter one from Prompt 15:
+  "incomplete", "pending", "awaiting_payment", "awaiting_fulfillment", "awaiting_shipment",
+  "awaiting_pickup", "partially_shipped", "shipped", "completed", "cancelled", "declined",
+  "refunded", "partially_refunded", "disputed", "manual_verification_required", "verified".
+  If your status dropdown/control only has the original 7 values, update it to this full list.
+
+GET  /dashboard
+  Now also returns: topProducts, topRegions.
+  topProducts: array (up to 10) of { productName, totalQuantity, totalRevenue }, sorted by
+  totalQuantity descending — the best-sellers list.
+  topRegions: array (up to 10) of { city, orderCount, revenue }, sorted by revenue descending
+  — orders grouped by the customer's city. Orders with no linked customer or no city on file
+  are excluded rather than lumped into an "unknown" bucket.
+
+GET  /customers  |  POST /customers  |  PATCH /customers/:id
+  Customer objects now also include: city (nullable — populated automatically from
+  BigCommerce's billing address for synced customers; a plain optional text field for
+  manually-added ones).
+```
+
+```
+Update the Sitara Bespoke screens built from Prompt 15 — no new screens, just these changes:
+
+1. Orders (list + detail): show the new customerName/customerCity fields directly on each
+   order — remove any client-side lookup against GET /customers you may have built to get a
+   name, it's no longer needed.
+
+2. Orders: update the status dropdown/control to the full 16-value list above, if it only has
+   the original 7.
+
+3. Orders: after PATCH /orders/:id/status, if the response's bigcommerceSyncError is non-null,
+   show it as a small dismissible warning next to the (already-updated) status — the status
+   change itself still succeeded, this only means the push back to BigCommerce failed.
+
+4. Dashboard: add two new sections — "Top Products" (topProducts, ranked list/table) and "Top
+   Regions" (topRegions, ranked list/table) — same simple stat-tile/list style as the existing
+   dashboard sections.
+
+5. Customers screen: optionally show the new city field per customer (not required for
+   anything else to function).
+
+Keep this additive — don't change anything about the screens beyond what's listed above.
+```
+
+---
+
+## 17. Sitara Bespoke — live updates without refreshing
+
+**Status: no backend change needed — every write already emits a socket event, same room
+(`io.to(company.slug)`) your other modules already use. This is purely wiring the Sitara
+screens up to listen, the same way your other modules' screens presumably already do.**
+
+**Events already emitted** (payload is the same shape `GET`/`POST`/`PATCH` for that resource
+already returns):
+```
+sitara:weaver_created / sitara:weaver_updated / sitara:weaver_deleted   (deleted payload: { id })
+sitara:vendor_created / sitara:vendor_updated / sitara:vendor_deleted   (deleted payload: { id })
+sitara:customer_created / sitara:customer_updated / sitara:customer_deleted (deleted payload: { id })
+sitara:product_created / sitara:product_updated / sitara:product_deleted (deleted payload: { id })
+sitara:po_created / sitara:po_updated / sitara:po_deleted (purchase orders; deleted payload: { id })
+sitara:order_created / sitara:order_updated
+```
+
+```
+Wire the Sitara Bespoke screens (Dashboard, People, Stocks, Orders) up to the same socket.io
+room every other module's screens already join for this company. Look at how an existing
+screen (e.g. Sales or CRM) subscribes to its own events and updates its local state/re-fetches
+— apply the exact same pattern here for the sitara:* events listed above, so:
+
+- Weavers/Vendors/Customers/Products lists update live on create/update/delete.
+- Purchase orders list updates live on create/update/delete.
+- Orders list/detail updates live on create/update (there's no order-delete event — orders
+  aren't deletable through the UI).
+- Dashboard numbers (totals, recent orders, top products/regions) refresh when an order or
+  product event comes in — either by re-fetching GET /dashboard on the relevant events, or by
+  patching state locally if that's the pattern already used elsewhere.
+
+Don't change how any other module's real-time updates work — this is only adding the missing
+Sitara subscriptions.
 ```

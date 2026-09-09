@@ -770,12 +770,21 @@ router.get('/dashboard', async (req, res) => {
     const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 
     const allOrders = await req.db('sitara_orders').select('id', 'total', 'status', 'created_at');
-    const totalSales = allOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
-    const monthSales = allOrders
+    // Only a genuinely paid/confirmed order counts as a "sale" — excludes
+    // incomplete (abandoned cart, no payment ever happened), pending,
+    // awaiting_payment, declined, cancelled, refunded, partially_refunded,
+    // disputed, and manual_verification_required.
+    const REAL_SALE_STATUSES = [
+      'awaiting_fulfillment', 'awaiting_shipment', 'awaiting_pickup',
+      'partially_shipped', 'shipped', 'completed', 'verified',
+    ];
+    const countedOrders = allOrders.filter((o) => REAL_SALE_STATUSES.includes(o.status));
+    const totalSales = countedOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+    const monthSales = countedOrders
       .filter((o) => new Date(o.created_at) >= monthStart)
       .reduce((sum, o) => sum + Number(o.total || 0), 0);
     const recentOrders = await ordersQuery(req.db).orderBy('sitara_orders.created_at', 'desc').limit(10);
-    const pendingOrders = allOrders.filter((o) => !['completed', 'cancelled', 'refunded'].includes(o.status));
+    const pendingOrders = countedOrders.filter((o) => o.status !== 'completed');
 
     const products = await req.db('sitara_products').select('stock');
     const stockOnHand = products.reduce((sum, p) => sum + Number(p.stock || 0), 0);
@@ -809,7 +818,7 @@ router.get('/dashboard', async (req, res) => {
       recentSales: recentOrders.map(mapOrder),
       totalSales,
       totalSalesThisMonth: monthSales,
-      orderCount: allOrders.length,
+      orderCount: countedOrders.length,
       totalExpenses: 0, // no expense-tracking source yet in Phase 1 — reserved for a later pass
       stockOnHand,
       pendingOrderCount: pendingOrders.length,
