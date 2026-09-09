@@ -792,11 +792,13 @@ GET  /vendors  |  POST /vendors  |  PATCH /vendors/:id  |  DELETE /vendors/:id
   Same shape as weavers (separate list — a vendor and a weaver are different people/roles).
 
 GET  /customers  |  POST /customers  |  PATCH /customers/:id  |  DELETE /customers/:id
-  Customer: { id, name, phone, email, source, bigcommerceCustomerId, notes }. source is one
-  of "bigcommerce" | "whatsapp" | "instagram" | "manual" — POST body needs a source dropdown
-  with exactly these 4 options (defaults to "manual" if omitted). Real BigCommerce customers
-  get created automatically by a later phase's webhook — this endpoint is for manually adding
-  a customer yourself (e.g. a WhatsApp/Instagram DM sale).
+  Customer: { id, name, phone, email, source, city, bigcommerceCustomerId, notes }. source is
+  one of "bigcommerce" | "whatsapp" | "instagram" | "manual" — POST body needs a source
+  dropdown with exactly these 4 options (defaults to "manual" if omitted). city is the
+  customer's location (populated automatically from BigCommerce's billing address for synced
+  orders; optional free-text field for manually-added customers). Real BigCommerce customers
+  now get created automatically by the order webhook — this endpoint is for manually adding a
+  customer yourself (e.g. a WhatsApp/Instagram DM sale).
 
 GET  /products  |  POST /products  |  PATCH /products/:id  |  DELETE /products/:id
   Product (a saree, the inventory item): { id, name, sku, vendorId, weaverId, stock, unit,
@@ -830,9 +832,11 @@ PATCH /orders/:id/status — body: { status }. Valid values mirror BigCommerce's
 
 GET  /dashboard
   -> { recentSales: [...orders], totalSales, totalSalesThisMonth, orderCount, totalExpenses,
-       stockOnHand, pendingOrderCount }
+       stockOnHand, pendingOrderCount, topProducts }
   totalExpenses is currently always 0 (no expense-tracking source exists yet) — show it as-is,
-  don't hide the field.
+  don't hide the field. topProducts is an array (up to 10) of
+  { productName, totalQuantity, totalRevenue }, sorted by totalQuantity descending — the
+  best-sellers list. Show it as a simple ranked table/list on the dashboard.
 ```
 
 ```

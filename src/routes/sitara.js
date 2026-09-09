@@ -15,7 +15,7 @@ const mapVendor = (r) => r && ({
 });
 
 const mapCustomer = (r) => r && ({
-  id: r.id, name: r.name, phone: r.phone, email: r.email, source: r.source,
+  id: r.id, name: r.name, phone: r.phone, email: r.email, source: r.source, city: r.city,
   bigcommerceCustomerId: r.bigcommerce_customer_id, notes: r.notes,
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
@@ -173,13 +173,13 @@ router.get('/customers', async (req, res) => {
 // (Phase 2), not through this endpoint.
 router.post('/customers', async (req, res) => {
   try {
-    const { name, phone, email, source, notes } = req.body;
+    const { name, phone, email, source, city, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
     const validSource = ['bigcommerce', 'whatsapp', 'instagram', 'manual'].includes(source) ? source : 'manual';
     const id = newId('cust');
     await req.db('sitara_customers').insert({
       id, name, phone: phone || null, email: email || null, source: validSource,
-      notes: notes || null, created_by: req.user?.userId || null,
+      city: city || null, notes: notes || null, created_by: req.user?.userId || null,
     });
     const saved = await req.db('sitara_customers').where({ id }).first();
     req.io.to(req.company.slug).emit('sitara:customer_created', mapCustomer(saved));
@@ -194,6 +194,7 @@ router.patch('/customers/:id', async (req, res) => {
     if (b.name !== undefined) updates.name = b.name;
     if (b.phone !== undefined) updates.phone = b.phone;
     if (b.email !== undefined) updates.email = b.email;
+    if (b.city !== undefined) updates.city = b.city;
     if (b.notes !== undefined) updates.notes = b.notes;
     await req.db('sitara_customers').where({ id: req.params.id }).update(updates);
     const saved = await req.db('sitara_customers').where({ id: req.params.id }).first();
@@ -428,6 +429,7 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
         phone: billing.phone || null,
         email: billing.email || null,
         source: 'bigcommerce',
+        city: billing.city || null,
         bigcommerce_customer_id: bcCustomerId,
       });
       customer = await db('sitara_customers').where({ id }).first();
@@ -479,6 +481,15 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
         product = await db('sitara_products').where({ id }).first();
       }
       productId = product.id;
+
+      // Decrement stock ONLY the first time this order is ever synced — a
+      // status-update webhook re-syncs the SAME order later (that's the
+      // `existing` branch above, which already deleted+will re-insert these
+      // same order_items), so gating on `!existing` here is what stops a
+      // second webhook for the same order from decrementing stock twice.
+      if (!existing) {
+        await db('sitara_products').where({ id: productId }).decrement('stock', Number(p.quantity || 1));
+      }
     }
 
     await db('sitara_order_items').insert({
@@ -753,6 +764,18 @@ router.get('/dashboard', async (req, res) => {
     const products = await req.db('sitara_products').select('stock');
     const stockOnHand = products.reduce((sum, p) => sum + Number(p.stock || 0), 0);
 
+    // Best-sellers — grouped by product_name (not product_id) since a
+    // BigCommerce line item without a matched catalog product still has a
+    // real name and should still count; joining on product_id alone would
+    // silently drop those.
+    const topProducts = await req.db('sitara_order_items')
+      .select('product_name')
+      .sum('quantity as totalQuantity')
+      .sum('line_total as totalRevenue')
+      .groupBy('product_name')
+      .orderBy('totalQuantity', 'desc')
+      .limit(10);
+
     res.json({
       recentSales: recentOrders.map(mapOrder),
       totalSales,
@@ -761,6 +784,11 @@ router.get('/dashboard', async (req, res) => {
       totalExpenses: 0, // no expense-tracking source yet in Phase 1 — reserved for a later pass
       stockOnHand,
       pendingOrderCount: pendingOrders.length,
+      topProducts: topProducts.map((p) => ({
+        productName: p.product_name,
+        totalQuantity: Number(p.totalQuantity || 0),
+        totalRevenue: Number(p.totalRevenue || 0),
+      })),
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
