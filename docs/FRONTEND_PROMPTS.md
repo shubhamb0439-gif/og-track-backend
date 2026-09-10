@@ -1010,3 +1010,61 @@ or just sort unmatched-first) — that's the primary reason this section exists.
 
 Keep this additive — a new section, not a change to any existing screen.
 ```
+
+---
+
+## 19. Sitara Bespoke — logic change: purchase orders now use Weavers, Razorpay/Orders regrouped under a new "Business" section with Expenses
+
+**Status: backend built — this changes the meaning of an existing field (Purchases) and asks
+for a sidebar regroup, not just new additive screens. Read carefully before implementing.**
+
+**Why:** stock purchases are made from weavers (who supply the sarees), not vendors. Vendors
+are for unrelated business expenses — electricity, rent, anything else — which is a brand new
+feature. Since Orders and Razorpay are both "money coming in/reconciliation" concerns and
+Expenses is "money going out", all three now live together under one new **"Business"**
+sidebar section, replacing the standalone "Orders" and "Razorpay" entries from Prompts 15/18.
+
+**1. Breaking field change — Purchases (Stocks section, from Prompt 15 #3):**
+The "Add Purchase" form and purchase-order list now use a **Weaver** dropdown (from
+GET /weavers), not a Vendor dropdown.
+```
+POST /purchase-orders
+  Body: { weaverId, orderDate?, notes?, items: [{ productId, quantity, unitPrice }] }
+  (was `vendorId` — rename the field and swap the dropdown's data source to GET /weavers)
+
+GET /purchase-orders  |  GET /purchase-orders/:id
+  Purchase order objects now have `weaverId` instead of `vendorId` — show the weaver's name
+  (looked up from GET /weavers) wherever the vendor name used to be shown.
+```
+Vendors are unaffected everywhere else (People section, Prompt 15 #2 — unchanged) — they're
+just no longer used for purchases.
+
+**2. New: Expenses**
+```
+GET  /expenses  |  POST /expenses  |  PATCH /expenses/:id  |  DELETE /expenses/:id
+  Expense: { id, vendorId, category, description, amount, expenseDate, createdBy, createdAt,
+             updatedAt }.
+  POST body: { vendorId, category, description?, amount, expenseDate? }
+    - vendorId: dropdown from GET /vendors (required)
+    - category: free-text field, NOT a fixed dropdown — e.g. "Electricity", "Rent", "Repairs",
+      whatever the user types (placeholder examples are fine, but don't restrict input)
+    - description: optional free-text notes
+    - amount: required number
+    - expenseDate: optional, defaults to today if omitted
+  Real-time: sitara:expense_created / sitara:expense_updated / sitara:expense_deleted socket
+  events on the company room, same pattern as every other Sitara real-time event from Prompt 17.
+```
+
+**3. Sidebar regroup — new "Business" section:**
+Replace the standalone "Orders" (Prompt 15 #4) and "Razorpay" (Prompt 18) sidebar entries with
+one **"Business"** section containing three tabs:
+- **Orders** — exactly the screen from Prompt 15 #4 (no endpoint changes), just moved here.
+- **Razorpay** — exactly the screen from Prompt 18 (no endpoint changes), just moved here.
+- **Expenses** — new tab: a list (sortable/filterable by date or category) + add/edit/delete
+  form per the Expenses endpoints above. Show vendor name (looked up from GET /vendors), not
+  just the raw ID.
+
+Final sidebar shape for Sitara Bespoke: Dashboard, People, Stocks, **Business** (Orders /
+Razorpay / Expenses tabs). Dashboard's `totalExpenses` stat (Prompt 15, currently hardcoded to
+0) can now be wired to a real sum of GET /expenses amounts if convenient, but that's optional —
+not a backend contract change either way.

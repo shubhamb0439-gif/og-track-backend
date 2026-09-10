@@ -27,7 +27,7 @@ const mapProduct = (r) => r && ({
 });
 
 const mapPO = (r) => r && ({
-  id: r.id, poNumber: r.po_number, vendorId: r.vendor_id, status: r.status,
+  id: r.id, poNumber: r.po_number, weaverId: r.weaver_id, status: r.status,
   orderDate: r.order_date, notes: r.notes,
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
@@ -35,6 +35,12 @@ const mapPO = (r) => r && ({
 const mapPOItem = (r) => r && ({
   id: r.id, purchaseOrderId: r.purchase_order_id, productId: r.product_id,
   quantity: Number(r.quantity), unitPrice: Number(r.unit_price), lineTotal: Number(r.line_total || 0),
+});
+
+const mapExpense = (r) => r && ({
+  id: r.id, vendorId: r.vendor_id, category: r.category, description: r.description,
+  amount: Number(r.amount || 0), expenseDate: r.expense_date,
+  createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
 // customerName/customerCity are flat fields (not nested customer: {...}) —
@@ -279,7 +285,8 @@ router.delete('/products/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Purchase orders (vendor-linked) ───────────────────────────────────────────
+// ── Purchase orders (weaver-linked — stock is bought FROM weavers; vendors
+// are for other business expenses, see sitara_expenses below) ────────────────
 async function nextPoNumber(db) {
   const last = await db('sitara_purchase_orders').orderBy('created_at', 'desc').first();
   if (!last || !last.po_number) return 'SPO-0001';
@@ -305,22 +312,22 @@ router.get('/purchase-orders/:id', async (req, res) => {
 });
 
 // POST /api/:slug/sitara/purchase-orders
-// Body: { vendorId, orderDate?, notes?, items: [{ productId, quantity, unitPrice }] }
+// Body: { weaverId, orderDate?, notes?, items: [{ productId, quantity, unitPrice }] }
 // The "manual Add Purchase button" the spec explicitly asks for — every
 // purchase order here is created this way, there's no separate auto-generated
 // path (unlike sitara_orders, which BigCommerce also feeds in Phase 2).
 router.post('/purchase-orders', async (req, res) => {
   try {
-    const { vendorId, orderDate, notes, items } = req.body;
-    if (!vendorId) return res.status(400).json({ error: 'vendorId is required' });
+    const { weaverId, orderDate, notes, items } = req.body;
+    if (!weaverId) return res.status(400).json({ error: 'weaverId is required' });
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'At least one item is required' });
-    const vendor = await req.db('sitara_vendors').where({ id: vendorId }).first();
-    if (!vendor) return res.status(400).json({ error: 'Vendor not found' });
+    const weaver = await req.db('sitara_weavers').where({ id: weaverId }).first();
+    if (!weaver) return res.status(400).json({ error: 'Weaver not found' });
 
     const id = newId('spo');
     const poNumber = await nextPoNumber(req.db);
     await req.db('sitara_purchase_orders').insert({
-      id, po_number: poNumber, vendor_id: vendorId, order_date: orderDate || new Date(),
+      id, po_number: poNumber, weaver_id: weaverId, order_date: orderDate || new Date(),
       notes: notes || null, created_by: req.user?.userId || null,
     });
     for (const item of items) {
@@ -356,6 +363,66 @@ router.delete('/purchase-orders/:id', async (req, res) => {
     await req.db('sitara_purchase_order_items').where({ purchase_order_id: req.params.id }).delete();
     await req.db('sitara_purchase_orders').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('sitara:po_deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Expenses (vendor-linked — electricity, rent, or any other business
+// expense; lives under the frontend's "Business" section alongside Orders
+// and Razorpay, but has nothing to do with the BigCommerce sync itself) ──────
+router.get('/expenses', async (req, res) => {
+  try {
+    const rows = await req.db('sitara_expenses').orderBy('expense_date', 'desc');
+    res.json(rows.map(mapExpense));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/sitara/expenses
+// Body: { vendorId, category, description?, amount, expenseDate? }
+router.post('/expenses', async (req, res) => {
+  try {
+    const { vendorId, category, description, amount, expenseDate } = req.body;
+    if (!vendorId) return res.status(400).json({ error: 'vendorId is required' });
+    if (!category) return res.status(400).json({ error: 'category is required' });
+    if (amount === undefined || amount === null || isNaN(Number(amount))) {
+      return res.status(400).json({ error: 'amount is required' });
+    }
+    const vendor = await req.db('sitara_vendors').where({ id: vendorId }).first();
+    if (!vendor) return res.status(400).json({ error: 'Vendor not found' });
+
+    const id = newId('exp');
+    await req.db('sitara_expenses').insert({
+      id, vendor_id: vendorId, category, description: description || null,
+      amount: Number(amount), expense_date: expenseDate || new Date(),
+      created_by: req.user?.userId || null,
+    });
+    const saved = await req.db('sitara_expenses').where({ id }).first();
+    req.io.to(req.company.slug).emit('sitara:expense_created', mapExpense(saved));
+    res.json(mapExpense(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.patch('/expenses/:id', async (req, res) => {
+  try {
+    const b = req.body;
+    const updates = { updated_at: new Date() };
+    if (b.vendorId !== undefined) updates.vendor_id = b.vendorId;
+    if (b.category !== undefined) updates.category = b.category;
+    if (b.description !== undefined) updates.description = b.description;
+    if (b.amount !== undefined) updates.amount = Number(b.amount);
+    if (b.expenseDate !== undefined) updates.expense_date = b.expenseDate;
+    await req.db('sitara_expenses').where({ id: req.params.id }).update(updates);
+    const saved = await req.db('sitara_expenses').where({ id: req.params.id }).first();
+    if (!saved) return res.status(404).json({ error: 'Expense not found' });
+    req.io.to(req.company.slug).emit('sitara:expense_updated', mapExpense(saved));
+    res.json(mapExpense(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.delete('/expenses/:id', async (req, res) => {
+  try {
+    await req.db('sitara_expenses').where({ id: req.params.id }).delete();
+    req.io.to(req.company.slug).emit('sitara:expense_deleted', { id: req.params.id });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

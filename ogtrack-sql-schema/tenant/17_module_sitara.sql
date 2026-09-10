@@ -1,10 +1,13 @@
 /* =============================================================================
-   MODULE: SITARA BESPOKE  (dashboard, people, stocks, orders)
+   MODULE: SITARA BESPOKE  (dashboard, people, stocks, business)
    =============================================================================
    A dedicated bundle for a BigCommerce-fed tenant — weavers/vendors/customers,
-   saree inventory + vendor-linked purchases, and orders synced from
-   BigCommerce (source = 'bigcommerce') alongside manually-entered orders
-   (source = 'manual', e.g. a GPay/DM sale that never went through checkout).
+   saree inventory + weaver-linked purchases (stock is bought FROM weavers,
+   not vendors), and a "Business" area covering orders synced from BigCommerce
+   (source = 'bigcommerce') alongside manually-entered orders (source =
+   'manual', e.g. a GPay/DM sale that never went through checkout), Razorpay
+   reconciliation, and vendor-linked expenses (electricity, rent, etc. — i.e.
+   what vendors are actually for here).
    Deliberately its own tables, not an extension of the generic
    crm/inventory/sales modules — Sitara's domain doesn't fit those, and
    gating it behind them would drag in unrelated module baggage.
@@ -85,7 +88,10 @@ GO
 CREATE TABLE dbo.sitara_purchase_orders (
     id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
     po_number       NVARCHAR(50)   NOT NULL,
-    vendor_id       NVARCHAR(64)   NOT NULL,
+    -- Stock purchases are made from weavers, not vendors — vendors are for
+    -- other business expenses (electricity, rent, etc.), tracked separately
+    -- in sitara_expenses below.
+    weaver_id       NVARCHAR(64)   NOT NULL,
     status          NVARCHAR(20)   NOT NULL DEFAULT 'pending',
     order_date      DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
     notes           NVARCHAR(MAX)  NULL,
@@ -181,6 +187,28 @@ GO
 CREATE INDEX IX_sitara_rzp_order ON dbo.sitara_razorpay_payments(order_id);
 GO
 
+-- Business expenses (electricity, rent, etc.) — vendor-linked, unrelated to
+-- stock. Lives alongside Orders/Razorpay under the frontend's "Business" nav
+-- grouping, but has nothing to do with the BigCommerce order sync itself.
+CREATE TABLE dbo.sitara_expenses (
+    id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    vendor_id       NVARCHAR(64)   NOT NULL,
+    -- Free-text, not a CHECK-constrained enum — "it can be any type of
+    -- expense" per spec (electricity, rent, whatever comes up).
+    category        NVARCHAR(100)  NOT NULL,
+    description     NVARCHAR(500)  NULL,
+    amount          DECIMAL(14,2)  NOT NULL,
+    expense_date    DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
+    created_by      NVARCHAR(64)   NULL,
+    created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+CREATE INDEX IX_sitara_expenses_vendor ON dbo.sitara_expenses(vendor_id);
+GO
+CREATE INDEX IX_sitara_expenses_date ON dbo.sitara_expenses(expense_date);
+GO
+
 CREATE TABLE dbo.sitara_notifications (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
     type                NVARCHAR(30)   NOT NULL,
@@ -208,7 +236,7 @@ ALTER TABLE dbo.sitara_products ADD CONSTRAINT FK_sitara_products_weaver FOREIGN
 GO
 ALTER TABLE dbo.sitara_products ADD CONSTRAINT FK_sitara_products_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
 GO
-ALTER TABLE dbo.sitara_purchase_orders ADD CONSTRAINT FK_sitara_po_vendor FOREIGN KEY (vendor_id) REFERENCES dbo.sitara_vendors(id);
+ALTER TABLE dbo.sitara_purchase_orders ADD CONSTRAINT FK_sitara_po_weaver FOREIGN KEY (weaver_id) REFERENCES dbo.sitara_weavers(id);
 GO
 ALTER TABLE dbo.sitara_purchase_orders ADD CONSTRAINT FK_sitara_po_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
 GO
@@ -227,4 +255,8 @@ GO
 ALTER TABLE dbo.sitara_razorpay_payments ADD CONSTRAINT FK_sitara_rzp_order FOREIGN KEY (order_id) REFERENCES dbo.sitara_orders(id);
 GO
 ALTER TABLE dbo.sitara_notifications ADD CONSTRAINT FK_sitara_notif_order FOREIGN KEY (related_order_id) REFERENCES dbo.sitara_orders(id);
+GO
+ALTER TABLE dbo.sitara_expenses ADD CONSTRAINT FK_sitara_expenses_vendor FOREIGN KEY (vendor_id) REFERENCES dbo.sitara_vendors(id);
+GO
+ALTER TABLE dbo.sitara_expenses ADD CONSTRAINT FK_sitara_expenses_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
 GO
