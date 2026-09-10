@@ -153,6 +153,23 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   if (scriptsNeeded.has('16_module_birthday.sql')) orderedScripts.push('16_module_birthday.sql');
   if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('17_module_sitara.sql');
 
+  // Patch files are additive schema changes (see ogtrack-sql-schema/tenant's
+  // patch_*.sql convention) meant to be run once against an already-live
+  // tenant DB — but a BRAND NEW company never got them either, since this
+  // function only ever ran the base numbered scripts above. Bug found
+  // 2026-09-10: Sitara Bespoke's freshly-provisioned users table was missing
+  // date_of_birth/joining_date (patch_01) and reset_token_* (patch_07),
+  // breaking registration outright. Every patch is idempotent
+  // (IF NOT EXISTS/IF OBJECT_ID guards), so appending the ones whose base
+  // script already ran is always safe, including on a re-provision.
+  orderedScripts.push('patch_01_users_dob_and_joining_date.sql');
+  orderedScripts.push('patch_07_users_reset_token.sql');
+  if (scriptsNeeded.has('02_module_projects.sql')) orderedScripts.push('patch_05_sprints_completed_at_column.sql');
+  if (scriptsNeeded.has('08_module_crm.sql')) orderedScripts.push('patch_02_crm_po_bom_and_payment_terms.sql');
+  if (scriptsNeeded.has('09_module_inventory.sql')) orderedScripts.push('patch_03_inventory_optional_po_and_vendor.sql');
+  if (scriptsNeeded.has('12_module_test_cases.sql')) orderedScripts.push('patch_06_test_cases_precondition_and_bugged_columns.sql');
+  if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('patch_08_sitara_customer_city.sql');
+
   for (const scriptFile of orderedScripts) {
     const step = `run_${scriptFile}`;
     await log(companyId, step, 'pending');
