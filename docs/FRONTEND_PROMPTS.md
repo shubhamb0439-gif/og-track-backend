@@ -1068,3 +1068,40 @@ Final sidebar shape for Sitara Bespoke: Dashboard, People, Stocks, **Business** 
 Razorpay / Expenses tabs). Dashboard's `totalExpenses` stat (Prompt 15, currently hardcoded to
 0) can now be wired to a real sum of GET /expenses amounts if convenient, but that's optional —
 not a backend contract change either way.
+
+---
+
+## 20. BUG — sidebar shows modules a custom role doesn't have permission for
+
+**Status: backend needs no changes — confirmed via direct DB inspection that this is a
+frontend nav-filtering bug, not a data/config problem. Affects every company using custom
+roles, not just Sitara — found there by accident.**
+
+**Repro (real data):** A custom role named "Sitara drapes users" has
+`permissions: ["attendance","messages"]` (confirmed straight from the `custom_roles` table —
+GET `/api/:slug/roles` returns the same thing: `[{ id, name, permissions: [...] }, ...]`). A
+user assigned that role (their `role` field holds the custom role's `id`, e.g. `"r17888..."`,
+not a builtin string like `"superadmin"`) still sees **both** "Dashboard" and "Sitara Bespoke"
+in the sidebar — neither of which is in that role's permissions list at all.
+
+**Root cause:** the backend has no per-route permission enforcement tied to
+`custom_roles.permissions` — it only gates by the company's `enabled_modules` (via
+`requireModule`), which is intentional (module gating is a company-wide setting; permission
+scoping within that is meant to be handled by the frontend UI only, for know-your-nav /
+UX purposes). So the sidebar must currently be computing visible nav items from
+`enabled_modules` alone, ignoring the logged-in user's own role's permission list.
+
+**Fix:** wherever the sidebar decides which nav items to render, it needs to intersect two
+things, not just check `enabled_modules`:
+1. The company's `enabled_modules` (already being checked, keep this).
+2. The current user's own permission set:
+   - If `user.role === 'superadmin'` (or whatever the builtin top role's exact value is), skip
+     this check entirely — superadmins should always see everything enabled_modules allows.
+   - Otherwise, `user.role` is a custom role's `id` — look it up via GET `/api/:slug/roles`
+     (fetch once, e.g. on login/app-load, and cache in whatever global user/auth state already
+     holds the logged-in user) to get that role's `permissions` array, and only show a nav item
+     if its module key is in BOTH `enabled_modules` AND that role's `permissions`.
+
+Test with the exact repro above: log in as a non-superadmin user whose custom role only has
+`["attendance","messages"]` — after the fix, only Attendance, History, and Messages should
+appear in the sidebar, nothing else, regardless of what the company has enabled overall.

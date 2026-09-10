@@ -1,7 +1,13 @@
 const jobStore = require('./jobStore');
 const { getJobKind } = require('./jobKinds');
 
-const POLL_INTERVAL_MS = 3000;
+// Was widened to 2 hours briefly (see cost investigation, 2026-09-10) to stop
+// this from defeating OGCore's serverless auto-pause — reverted back to a
+// responsive interval now that OGCore itself is moving to a fixed-price
+// (non-serverless) tier instead, where query frequency no longer affects
+// cost. If OGCore ever goes back to serverless, widen this again rather than
+// paying serverless's per-second rate 24/7 for no reason.
+const POLL_INTERVAL_MS = 20_000;
 
 let io = null;
 let pollTimer = null;
@@ -115,15 +121,11 @@ async function poll() {
   }
 }
 
-// Much slower than the main job poll above — this only ever checks GitHub
-// for a frontend Static Web Apps preview URL that isn't known yet, and that
-// build takes 1-3 minutes anyway, so there's no value in checking every 3s
-// (and every tick here is a real GitHub API call per pending job). This is
-// what makes the preview link resolve/broadcast on its own — a human doesn't
-// have to ask AIDA or open the job panel for the aida:job socket update to
-// fire once it's ready. See previewResolver.js for the resolve+persist+emit
-// logic itself.
-const PREVIEW_POLL_INTERVAL_MS = 20_000;
+// Matches POLL_INTERVAL_MS's reasoning above — reverted from 2 hours back to
+// a responsive interval now that OGCore is moving off serverless. Still
+// deliberately slower than the main job poll (a build takes 1-3 minutes
+// anyway, and every tick here is a real GitHub API call per pending job).
+const PREVIEW_POLL_INTERVAL_MS = 30_000;
 let previewPollTimer = null;
 let previewPolling = false;
 
