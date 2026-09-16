@@ -1105,3 +1105,57 @@ things, not just check `enabled_modules`:
 Test with the exact repro above: log in as a non-superadmin user whose custom role only has
 `["attendance","messages"]` — after the fix, only Attendance, History, and Messages should
 appear in the sidebar, nothing else, regardless of what the company has enabled overall.
+
+---
+
+## 21. CAJO Inventory — Purchases form changes + Traceability for purchased serial-tracked items
+
+**Status: backend built — three separate changes to the existing Inventory/Purchases and
+Traceability screens (CAJO tenant, `inventory` + `manufacturing` modules). Not additive-only —
+item #1 is a pure layout change, item #2 exposes an already-existing field, item #3 exposes a
+new field, item #4 is a new data source for the Traceability page.**
+
+**1. Make Purchase / Edit Purchase — move "Vendor Code" up (pure layout change, no API change):**
+"Vendor Code" (the per-item field, `vendorItemCode` on each line — search-by-item, Quantity,
+Lead Time, Unit Cost, Freight, Import Charges row) should visually move up within the item
+card so it appears near the top of that card, above the other per-item fields. This is a
+design/layout instruction only — the field itself is unchanged (still per line item, still the
+same `vendorItemCode` field on `POST/PATCH .../purchases/:id/items/:lineId`), just repositioned.
+Do not remove it or change what it does — only where it sits in the card.
+
+**2. Make Purchase / Edit Purchase — add "Invoice Number" to the top/header section:**
+`inv_purchases` already has an `invoiceNumber` field (`GET/POST/PATCH /api/:slug/inventory/purchases`
+already read/write it — it just wasn't exposed in these two forms before now, only used
+internally at receiving time). Add an "Invoice Number" text input to the top header section of
+both the Make Purchase form (alongside Vendor / PO Number / Purchase Date) and the Edit
+Purchase form, wired to the existing `invoiceNumber` field — no new endpoint needed.
+
+**3. Edit Purchase — add "Receive Date":**
+Add a "Receive Date" field to the Edit Purchase form's header section (alongside Purchase Date
+/ PO Number / Vendor), marking the actual date of delivery. This uses `receivedDate` on
+`PATCH /api/:slug/inventory/purchases/:id` (newly writable — it was already readable/auto-set
+at receiving time, now the Edit form can override it to the real delivery date).
+
+**4. Traceability page — show purchased serial-tracked items too, not just manufactured ones:**
+```
+GET  /api/:slug/inventory/serial-units
+  -> [ { itemId, itemName, units: [{ id, itemId, lotId, purchaseItemId, unitNumber,
+         serialNumber, createdAt }, ...] }, ... ]
+  One group per item that has at least one received unit awaiting/holding a serial number.
+  Units are auto-created (serialNumber: null) whenever a purchase line for a serial_tracked
+  item (inv_items.serialTracked) is received via /purchases/:id/receive or /receive-lines —
+  no separate "mark as traceable" action needed, it's automatic based on that item flag.
+
+PATCH /api/:slug/inventory/serial-units/:unitId — body: { serialNumber }
+  Assigns/updates one unit's serial number. Same conflict behavior as Manufacturing's existing
+  serial assignment (400 if that serial is already used anywhere — checked across both
+  purchased AND manufactured units).
+  Real-time: inv:serial_unit_updated socket event on the company room.
+```
+The Traceability page currently only shows manufactured assembly groups (e.g. "PACE R" / "PACE
+L", from `GET /manufacturing/assemblies` + units). Add the groups from `GET /serial-units`
+alongside them, in the same visual style (item name header, a table of Unit # / Serial Number
+input / Save button per row) — these don't have a "BOM: X → X" subtitle since they were
+purchased, not built, so just omit that subtitle for this kind of group. This is what makes a
+serial-tracked item received via a plain Purchase Order (never manufactured) actually get a
+place to assign its serial number, which today it doesn't have anywhere.

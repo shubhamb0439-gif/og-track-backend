@@ -67,6 +67,33 @@ const mapPurchaseItem = (r) => r && ({
     : Number(r.unit_cost || 0),
 });
 
+const mapSerialUnit = (r) => r && ({
+  id: r.id, itemId: r.item_id, lotId: r.lot_id, purchaseItemId: r.purchase_item_id,
+  unitNumber: r.unit_number, serialNumber: r.serial_number, createdAt: r.created_at,
+});
+
+// Creates one inv_purchase_serial_units row per unit just received, only when
+// the item is serial_tracked — mirrors mfg_assembly_units' pattern (created
+// with serial_number NULL, assigned later via the Traceability page).
+// unit_number continues from whatever's already on file for this item, so
+// numbering stays unique per item across every lot it was ever received in,
+// not just within this one lot.
+async function createSerialUnitsForLot(db, { itemId, lotId, purchaseItemId, quantity }) {
+  const item = await db('inv_items').where({ id: itemId }).first();
+  if (!item || !item.serial_tracked) return;
+  const count = Math.round(Number(quantity));
+  if (count <= 0) return;
+  const last = await db('inv_purchase_serial_units').where({ item_id: itemId }).orderBy('unit_number', 'desc').first();
+  let nextNum = last ? last.unit_number + 1 : 1;
+  for (let i = 0; i < count; i++) {
+    await db('inv_purchase_serial_units').insert({
+      id: 'psu_' + Date.now() + Math.random().toString(36).slice(2, 6),
+      item_id: itemId, lot_id: lotId, purchase_item_id: purchaseItemId || null,
+      unit_number: nextNum++,
+    });
+  }
+}
+
 // ── Vendors ───────────────────────────────────────────────────────────────────
 
 router.get('/vendors', async (req, res) => {
@@ -452,6 +479,10 @@ router.patch('/purchases/:id', async (req, res) => {
     if (b.notes !== undefined) updates.notes = b.notes;
     if (b.expectedDate !== undefined) updates.expected_date = b.expectedDate;
     if (b.invoiceNumber !== undefined) updates.invoice_number = b.invoiceNumber;
+    // Manual override — /receive and /receive-lines already auto-stamp this to
+    // "now" when a purchase is marked received, but the Edit Purchase modal
+    // needs to let someone correct it to the real delivery date after the fact.
+    if (b.receivedDate !== undefined) updates.received_date = b.receivedDate;
     await req.db('inv_purchases').where({ id: req.params.id }).update(updates);
     const saved = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Purchase not found' });
@@ -484,13 +515,14 @@ router.post('/purchases/:id/receive', async (req, res) => {
           const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
             + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
             / Number(line.quantity_ordered);
-          await createLot(trx, {
+          const lotId = await createLot(trx, {
             itemId: line.item_id,
             lotRef: (lotRefs && lotRefs[line.id]) || `${purchase.po_number}-${line.id.slice(-6)}`,
             vendorId: purchase.vendor_id, purchaseItemId: line.id,
             quantity: outstanding, unitCost: landedUnitCost,
             receivedDate: new Date(), source: 'purchase',
           });
+          await createSerialUnitsForLot(trx, { itemId: line.item_id, lotId, purchaseItemId: line.id, quantity: outstanding });
           touchedItemIds.add(line.item_id);
         }
       }
@@ -546,19 +578,30 @@ router.post('/purchases/:id/receive-lines', async (req, res) => {
           const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
             + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
             / Number(line.quantity_ordered);
-          await createLot(trx, {
+          const lotId = await createLot(trx, {
             itemId: line.item_id,
             lotRef: `${purchase.po_number || purchase.id}-${line.id.slice(-6)}`,
             vendorId: purchase.vendor_id, purchaseItemId: line.id,
             quantity: delta, unitCost: landedUnitCost,
             receivedDate: new Date(), source: 'purchase',
           });
+          await createSerialUnitsForLot(trx, { itemId: line.item_id, lotId, purchaseItemId: line.id, quantity: delta });
         } else {
           // Receiving was reduced (e.g. correcting an over-receipt) — consume
           // back out of that item's stock. This is a rare correction path, so
           // we accept it may touch a different (newer) lot than the one this
           // receipt originally created; recomputeItemStock keeps totals correct.
           await consumeStockFIFO(trx, line.item_id, Math.abs(delta));
+          // Mirror the correction on serial units — only remove ones nobody's
+          // assigned a serial to yet (an already-assigned serial reflects a
+          // real physical unit someone recorded; deleting that silently would
+          // be data loss, so those are left for a human to sort out by hand).
+          const removable = await trx('inv_purchase_serial_units')
+            .where({ item_id: line.item_id }).whereNull('serial_number')
+            .orderBy('unit_number', 'desc').limit(Math.round(Math.abs(delta)));
+          if (removable.length) {
+            await trx('inv_purchase_serial_units').whereIn('id', removable.map(r => r.id)).delete();
+          }
         }
         await trx('inv_purchase_items').where({ id: line.id }).update({ quantity_received: newReceived });
         touchedItemIds.add(line.item_id);
@@ -658,6 +701,7 @@ router.delete('/purchases/:id', async (req, res) => {
       // rather than permanently blocking it — matching how assembly
       // reversal works elsewhere in the app.
       const itemIds = [...new Set(lines.map(l => l.item_id))];
+      if (lotIds.length) await trx('inv_purchase_serial_units').whereIn('lot_id', lotIds).delete();
       if (lotIds.length) await trx('inv_stock_lots').whereIn('id', lotIds).delete();
       if (lineIds.length) await trx('inv_purchase_items').whereIn('id', lineIds).delete();
       await trx('inv_purchases').where({ id: req.params.id }).delete();
@@ -666,6 +710,55 @@ router.delete('/purchases/:id', async (req, res) => {
 
     req.io.to(req.company.slug).emit('inv:purchase_deleted', { id: req.params.id });
     res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Serial units (traceability for purchased, serial_tracked items) ──────────
+// Complements Manufacturing's mfg_assembly_units/serial-assignment for BUILT
+// units — this is for items received as-is via a Purchase Order that are
+// individually serial numbered (inv_items.serial_tracked). Rows here are
+// auto-created (serial_number NULL) by /receive and /receive-lines above.
+
+// GET /api/:slug/inventory/serial-units — grouped by item, for the
+// Traceability page to list alongside Manufacturing's assembly groups.
+router.get('/serial-units', async (req, res) => {
+  try {
+    const units = await req.db('inv_purchase_serial_units').orderBy('unit_number', 'asc');
+    const itemIds = [...new Set(units.map(u => u.item_id))];
+    const items = itemIds.length ? await req.db('inv_items').whereIn('id', itemIds) : [];
+    const itemById = Object.fromEntries(items.map(i => [i.id, i]));
+
+    const byItem = {};
+    for (const u of units) {
+      if (!byItem[u.item_id]) {
+        const item = itemById[u.item_id];
+        byItem[u.item_id] = { itemId: u.item_id, itemName: item?.name || 'Unknown item', units: [] };
+      }
+      byItem[u.item_id].units.push(mapSerialUnit(u));
+    }
+    res.json(Object.values(byItem));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/:slug/inventory/serial-units/:unitId — body: { serialNumber }.
+// Uniqueness is checked against BOTH this table and mfg_assembly_units — a
+// real-world serial number should never collide across the two, even though
+// they're separate tables for purchased-vs-built units.
+router.patch('/serial-units/:unitId', async (req, res) => {
+  try {
+    const { serialNumber } = req.body;
+    if (serialNumber) {
+      const clash = await req.db('inv_purchase_serial_units')
+        .where({ serial_number: serialNumber }).andWhereNot({ id: req.params.unitId }).first();
+      if (clash) return res.status(400).json({ error: `Serial number "${serialNumber}" is already in use` });
+      const clashAssembly = await req.db('mfg_assembly_units').where({ serial_number: serialNumber }).first();
+      if (clashAssembly) return res.status(400).json({ error: `Serial number "${serialNumber}" is already in use` });
+    }
+    await req.db('inv_purchase_serial_units').where({ id: req.params.unitId }).update({ serial_number: serialNumber || null });
+    const saved = await req.db('inv_purchase_serial_units').where({ id: req.params.unitId }).first();
+    if (!saved) return res.status(404).json({ error: 'Serial unit not found' });
+    req.io.to(req.company.slug).emit('inv:serial_unit_updated', mapSerialUnit(saved));
+    res.json(mapSerialUnit(saved));
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 

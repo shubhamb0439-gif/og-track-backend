@@ -143,6 +143,29 @@ GO
 CREATE INDEX IX_inv_stock_issues_item ON dbo.inv_stock_issues(item_id);
 GO
 
+-- One row per individual unit of a serial_tracked item received via a
+-- purchase (see inv_items.serial_tracked) — mirrors mfg_assembly_units'
+-- pattern (created with serial_number NULL, assigned later through the
+-- Traceability page) but for PURCHASED units rather than manufactured ones.
+-- Only created when the received item is serial_tracked; a non-tracked
+-- item's lot never gets rows here.
+CREATE TABLE dbo.inv_purchase_serial_units (
+    id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    item_id             NVARCHAR(64)   NOT NULL,
+    lot_id              NVARCHAR(64)   NOT NULL,
+    purchase_item_id    NVARCHAR(64)   NULL,
+    unit_number         INT            NOT NULL,
+    serial_number       NVARCHAR(100)  NULL,
+    created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+CREATE UNIQUE INDEX IX_inv_psu_serial ON dbo.inv_purchase_serial_units(serial_number) WHERE serial_number IS NOT NULL;
+GO
+CREATE INDEX IX_inv_psu_item ON dbo.inv_purchase_serial_units(item_id);
+GO
+CREATE INDEX IX_inv_psu_lot ON dbo.inv_purchase_serial_units(lot_id);
+GO
+
 CREATE TABLE dbo.inv_stock_issue_lots (
     id              NVARCHAR(64)   NOT NULL PRIMARY KEY,
     issue_id        NVARCHAR(64)   NOT NULL,
@@ -183,6 +206,12 @@ GO
 ALTER TABLE dbo.inv_vendors ADD CONSTRAINT FK_inv_vendors_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
 GO
 ALTER TABLE dbo.inv_items ADD CONSTRAINT FK_inv_items_user FOREIGN KEY (created_by) REFERENCES dbo.users(id);
+GO
+ALTER TABLE dbo.inv_purchase_serial_units ADD CONSTRAINT FK_inv_psu_item FOREIGN KEY (item_id) REFERENCES dbo.inv_items(id);
+GO
+ALTER TABLE dbo.inv_purchase_serial_units ADD CONSTRAINT FK_inv_psu_lot FOREIGN KEY (lot_id) REFERENCES dbo.inv_stock_lots(id);
+GO
+ALTER TABLE dbo.inv_purchase_serial_units ADD CONSTRAINT FK_inv_psu_pi FOREIGN KEY (purchase_item_id) REFERENCES dbo.inv_purchase_items(id);
 GO
 
 -- Back-add the CRM cross-module FK if that module was created first
