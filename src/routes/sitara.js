@@ -16,6 +16,8 @@ const mapVendor = (r) => r && ({
 
 const mapCustomer = (r) => r && ({
   id: r.id, name: r.name, phone: r.phone, email: r.email, source: r.source, city: r.city,
+  addressLine1: r.address_line1, addressLine2: r.address_line2, state: r.state,
+  postalCode: r.postal_code, country: r.country,
   bigcommerceCustomerId: r.bigcommerce_customer_id, notes: r.notes,
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
@@ -52,6 +54,7 @@ const mapOrder = (r) => r && ({
   customerId: r.customer_id, customerName: r.customer_name ?? null, customerCity: r.customer_city ?? null,
   status: r.status, total: Number(r.total || 0), source: r.source,
   statusChangedAt: r.status_changed_at, flagged: !!r.flagged, notes: r.notes,
+  isStale: isOrderStale(r.status, r.status_changed_at),
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
@@ -83,10 +86,34 @@ const ORDER_STATUSES = [
   'refunded', 'partially_refunded', 'disputed', 'manual_verification_required', 'verified',
 ];
 
+// Statuses that are a final resting state — an order sitting in one of these
+// for a long time isn't "stuck", it's just done. Everything else is eligible
+// for the stale-order flag below.
+const TERMINAL_ORDER_STATUSES = ['completed', 'cancelled', 'declined', 'refunded', 'partially_refunded', 'verified'];
+
+// Computed at READ time (no background poller — see config.js's sitara block
+// for why that matters) rather than stored: an order flagged stale today
+// should un-flag itself the instant its status actually changes, and a fresh
+// read is the simplest way to guarantee that without a job also having to
+// remember to clear it.
+function isOrderStale(status, statusChangedAt) {
+  if (TERMINAL_ORDER_STATUSES.includes(status)) return false;
+  const changedAt = statusChangedAt ? new Date(statusChangedAt) : null;
+  if (!changedAt) return false;
+  const ageMs = Date.now() - changedAt.getTime();
+  return ageMs > config.sitara.staleOrderDays * 24 * 60 * 60 * 1000;
+}
+
 // ── Weavers ──────────────────────────────────────────────────────────────────
+// GET /api/:slug/sitara/weavers?search=... — search matches name/email/phone.
 router.get('/weavers', async (req, res) => {
   try {
-    const rows = await req.db('sitara_weavers').orderBy('name', 'asc');
+    let q = req.db('sitara_weavers');
+    if (req.query.search) {
+      const s = `%${req.query.search}%`;
+      q = q.where((qb) => qb.where('name', 'like', s).orWhere('email', 'like', s).orWhere('phone', 'like', s));
+    }
+    const rows = await q.orderBy('name', 'asc');
     res.json(rows.map(mapWeaver));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -132,9 +159,15 @@ router.delete('/weavers/:id', async (req, res) => {
 });
 
 // ── Vendors ──────────────────────────────────────────────────────────────────
+// GET /api/:slug/sitara/vendors?search=... — search matches name/email/phone.
 router.get('/vendors', async (req, res) => {
   try {
-    const rows = await req.db('sitara_vendors').orderBy('name', 'asc');
+    let q = req.db('sitara_vendors');
+    if (req.query.search) {
+      const s = `%${req.query.search}%`;
+      q = q.where((qb) => qb.where('name', 'like', s).orWhere('email', 'like', s).orWhere('phone', 'like', s));
+    }
+    const rows = await q.orderBy('name', 'asc');
     res.json(rows.map(mapVendor));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -180,28 +213,48 @@ router.delete('/vendors/:id', async (req, res) => {
 });
 
 // ── Customers ────────────────────────────────────────────────────────────────
+// GET /api/:slug/sitara/customers?search=... — search matches name/email/phone.
 router.get('/customers', async (req, res) => {
   try {
-    const rows = await req.db('sitara_customers').orderBy('name', 'asc');
+    let q = req.db('sitara_customers');
+    if (req.query.search) {
+      const s = `%${req.query.search}%`;
+      q = q.where((qb) => qb.where('name', 'like', s).orWhere('email', 'like', s).orWhere('phone', 'like', s));
+    }
+    if (req.query.source) q = q.where({ source: req.query.source });
+    const rows = await q.orderBy('name', 'asc');
     res.json(rows.map(mapCustomer));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/:slug/sitara/customers/:id — single customer detail (full address
+// included) for the "click a customer to see details" view.
+router.get('/customers/:id', async (req, res) => {
+  try {
+    const customer = await req.db('sitara_customers').where({ id: req.params.id }).first();
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    res.json(mapCustomer(customer));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/:slug/sitara/customers
-// Body: { name, phone?, email?, source ('bigcommerce'|'whatsapp'|'instagram'|'manual'), notes? }
+// Body: { name, phone?, email?, source ('bigcommerce'|'whatsapp'|'instagram'|'manual'),
+//         city?, addressLine1?, addressLine2?, state?, postalCode?, country?, notes? }
 // Manual customer creation — the source dropdown the frontend needs, per the
 // spec ("source of customer can vary from whatsapp/instagram/bigcommerce").
 // Real BigCommerce customers are upserted separately by the webhook handler
 // (Phase 2), not through this endpoint.
 router.post('/customers', async (req, res) => {
   try {
-    const { name, phone, email, source, city, notes } = req.body;
+    const { name, phone, email, source, city, addressLine1, addressLine2, state, postalCode, country, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
     const validSource = ['bigcommerce', 'whatsapp', 'instagram', 'manual'].includes(source) ? source : 'manual';
     const id = newId('cust');
     await req.db('sitara_customers').insert({
       id, name, phone: phone || null, email: email || null, source: validSource,
-      city: city || null, notes: notes || null, created_by: req.user?.userId || null,
+      city: city || null, address_line1: addressLine1 || null, address_line2: addressLine2 || null,
+      state: state || null, postal_code: postalCode || null, country: country || null,
+      notes: notes || null, created_by: req.user?.userId || null,
     });
     const saved = await req.db('sitara_customers').where({ id }).first();
     req.io.to(req.company.slug).emit('sitara:customer_created', mapCustomer(saved));
@@ -217,6 +270,11 @@ router.patch('/customers/:id', async (req, res) => {
     if (b.phone !== undefined) updates.phone = b.phone;
     if (b.email !== undefined) updates.email = b.email;
     if (b.city !== undefined) updates.city = b.city;
+    if (b.addressLine1 !== undefined) updates.address_line1 = b.addressLine1;
+    if (b.addressLine2 !== undefined) updates.address_line2 = b.addressLine2;
+    if (b.state !== undefined) updates.state = b.state;
+    if (b.postalCode !== undefined) updates.postal_code = b.postalCode;
+    if (b.country !== undefined) updates.country = b.country;
     if (b.notes !== undefined) updates.notes = b.notes;
     await req.db('sitara_customers').where({ id: req.params.id }).update(updates);
     const saved = await req.db('sitara_customers').where({ id: req.params.id }).first();
@@ -235,9 +293,15 @@ router.delete('/customers/:id', async (req, res) => {
 });
 
 // ── Products (inventory) ──────────────────────────────────────────────────────
+// GET /api/:slug/sitara/products?search=... — search matches name/sku.
 router.get('/products', async (req, res) => {
   try {
-    const rows = await req.db('sitara_products').orderBy('name', 'asc');
+    let q = req.db('sitara_products');
+    if (req.query.search) {
+      const s = `%${req.query.search}%`;
+      q = q.where((qb) => qb.where('name', 'like', s).orWhere('sku', 'like', s));
+    }
+    const rows = await q.orderBy('name', 'asc');
     res.json(rows.map(mapProduct));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -295,9 +359,14 @@ async function nextPoNumber(db) {
   return 'SPO-' + String(next).padStart(4, '0');
 }
 
+// GET /api/:slug/sitara/purchase-orders?search=...&status=...&weaverId=...
 router.get('/purchase-orders', async (req, res) => {
   try {
-    const rows = await req.db('sitara_purchase_orders').orderBy('order_date', 'desc');
+    let q = req.db('sitara_purchase_orders');
+    if (req.query.search) q = q.where('po_number', 'like', `%${req.query.search}%`);
+    if (req.query.status) q = q.where({ status: req.query.status });
+    if (req.query.weaverId) q = q.where({ weaver_id: req.query.weaverId });
+    const rows = await q.orderBy('order_date', 'desc');
     res.json(rows.map(mapPO));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -370,9 +439,17 @@ router.delete('/purchase-orders/:id', async (req, res) => {
 // ── Expenses (vendor-linked — electricity, rent, or any other business
 // expense; lives under the frontend's "Business" section alongside Orders
 // and Razorpay, but has nothing to do with the BigCommerce sync itself) ──────
+// GET /api/:slug/sitara/expenses?search=...&category=...&vendorId=...
 router.get('/expenses', async (req, res) => {
   try {
-    const rows = await req.db('sitara_expenses').orderBy('expense_date', 'desc');
+    let q = req.db('sitara_expenses');
+    if (req.query.search) {
+      const s = `%${req.query.search}%`;
+      q = q.where((qb) => qb.where('category', 'like', s).orWhere('description', 'like', s));
+    }
+    if (req.query.category) q = q.where({ category: req.query.category });
+    if (req.query.vendorId) q = q.where({ vendor_id: req.query.vendorId });
+    const rows = await q.orderBy('expense_date', 'desc');
     res.json(rows.map(mapExpense));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -513,6 +590,11 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
         email: billing.email || null,
         source: 'bigcommerce',
         city: billing.city || null,
+        address_line1: billing.street_1 || null,
+        address_line2: billing.street_2 || null,
+        state: billing.state || null,
+        postal_code: billing.zip || null,
+        country: billing.country || null,
         bigcommerce_customer_id: bcCustomerId,
       });
       customer = await db('sitara_customers').where({ id }).first();
@@ -909,13 +991,28 @@ async function nextOrderNumber(db) {
   return 'SORD-' + String(next).padStart(4, '0');
 }
 
+// GET /api/:slug/sitara/orders?status=...&source=...&search=... — search
+// matches order number or the linked customer's name.
 router.get('/orders', async (req, res) => {
   try {
     let q = ordersQuery(req.db);
     if (req.query.status) q = q.where({ 'sitara_orders.status': req.query.status });
     if (req.query.source) q = q.where({ 'sitara_orders.source': req.query.source });
+    if (req.query.search) {
+      const s = `%${req.query.search}%`;
+      q = q.where((qb) => qb.where('sitara_orders.order_number', 'like', s).orWhere('sitara_customers.name', 'like', s));
+    }
     const rows = await q.orderBy('sitara_orders.created_at', 'desc');
-    res.json(rows.map(mapOrder));
+    const mapped = rows.map(mapOrder);
+    // Stale orders float to the top (oldest-unchanged first) so the ones
+    // needing attention are never buried under recent activity; everything
+    // else keeps the recency order the query already produced.
+    mapped.sort((a, b) => {
+      if (a.isStale !== b.isStale) return a.isStale ? -1 : 1;
+      if (a.isStale && b.isStale) return new Date(a.statusChangedAt) - new Date(b.statusChangedAt);
+      return 0;
+    });
+    res.json(mapped);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1044,7 +1141,15 @@ router.get('/dashboard', async (req, res) => {
     const monthSales = countedOrders
       .filter((o) => new Date(o.created_at) >= monthStart)
       .reduce((sum, o) => sum + Number(o.total || 0), 0);
-    const recentOrders = await ordersQuery(req.db).orderBy('sitara_orders.created_at', 'desc').limit(10);
+    // Same stale-first ordering as GET /orders — pulled un-limited then cut
+    // to 10 after sorting, so a stale order doesn't get pushed out of the
+    // dashboard's recent list just because 10 newer orders arrived since.
+    const recentOrdersRaw = await ordersQuery(req.db).orderBy('sitara_orders.created_at', 'desc').limit(50);
+    const recentOrders = recentOrdersRaw.map(mapOrder).sort((a, b) => {
+      if (a.isStale !== b.isStale) return a.isStale ? -1 : 1;
+      if (a.isStale && b.isStale) return new Date(a.statusChangedAt) - new Date(b.statusChangedAt);
+      return 0;
+    }).slice(0, 10);
     const pendingOrders = countedOrders.filter((o) => o.status !== 'completed');
 
     const products = await req.db('sitara_products').select('stock');
@@ -1076,7 +1181,7 @@ router.get('/dashboard', async (req, res) => {
       .limit(10);
 
     res.json({
-      recentSales: recentOrders.map(mapOrder),
+      recentSales: recentOrders,
       totalSales,
       totalSalesThisMonth: monthSales,
       orderCount: countedOrders.length,

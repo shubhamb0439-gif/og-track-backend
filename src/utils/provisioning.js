@@ -171,6 +171,7 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   if (scriptsNeeded.has('12_module_test_cases.sql')) orderedScripts.push('patch_06_test_cases_precondition_and_bugged_columns.sql');
   if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('patch_08_sitara_customer_city.sql');
   if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('patch_09_sitara_po_weaver_and_expenses.sql');
+  if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('patch_11_sitara_customer_address.sql');
 
   for (const scriptFile of orderedScripts) {
     const step = `run_${scriptFile}`;

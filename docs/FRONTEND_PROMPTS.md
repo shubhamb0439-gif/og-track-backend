@@ -1159,3 +1159,60 @@ input / Save button per row) — these don't have a "BOM: X → X" subtitle sinc
 purchased, not built, so just omit that subtitle for this kind of group. This is what makes a
 serial-tracked item received via a plain Purchase Order (never manufactured) actually get a
 place to assign its serial number, which today it doesn't have anywhere.
+
+---
+
+## 22. Sitara Bespoke — customer address, search/filter, and stale-order highlighting
+
+**Status: backend built for 3 of the 4 asks below. The 4th (site visits on the dashboard) is
+blocked — see the note at the end, needs your input before it can be built at all.**
+
+**1. Customer detail — full address:**
+```
+GET  /api/:slug/sitara/customers/:id  — NEW endpoint, single customer detail.
+  Customer now also has: addressLine1, addressLine2, state, postalCode, country (all
+  nullable strings) alongside the existing city field. Populated automatically for
+  BigCommerce-synced customers (from billing_address); editable for manual ones.
+
+POST /customers and PATCH /customers/:id now also accept:
+  addressLine1?, addressLine2?, state?, postalCode?, country? (same shape as the response).
+```
+Wire the "click a customer to see details" view to `GET /customers/:id` (new) instead of
+relying on whatever the list already had in memory, and show the full address there — the list
+view itself doesn't need to change, just the detail view.
+
+**2. Search / filter bars — add `?search=` (and a couple of relevant filters) to every list
+endpoint that didn't already have one:**
+```
+GET /weavers?search=...       — matches name/email/phone
+GET /vendors?search=...       — matches name/email/phone
+GET /customers?search=...&source=...   — search matches name/email/phone
+GET /products?search=...      — matches name/sku
+GET /purchase-orders?search=...&status=...&weaverId=...   — search matches PO number
+GET /expenses?search=...&category=...&vendorId=...        — search matches category/description
+GET /orders?search=...&status=...&source=...              — search matches order number OR
+  customer name (status/source already existed, search is new)
+```
+All params are optional query-string additions — omitting them returns everything, exactly as
+before. Add a search input (and the relevant dropdown filters) to People (all 3 tabs), Stocks
+(both tabs), and Business (Orders/Expenses tabs) — Razorpay's reconciliation list can stay as
+it is unless you want a search there too later, not required now.
+
+**3. Stale/incomplete orders — highlight + surface first:**
+Every order object (from `GET /orders`, `GET /orders/:id`, the dashboard's `recentSales`, and
+any create/update response) now includes `isStale: boolean`. `true` means the order's status
+hasn't changed in more than `SITARA_STALE_ORDER_DAYS` (default 3 days) AND it isn't in a
+terminal status (completed/cancelled/declined/refunded/partially_refunded/verified) — i.e. it's
+genuinely stuck, not just old-but-done. `GET /orders` and the dashboard's `recentSales` already
+come back with stale orders sorted first (oldest-unchanged first among them) — no client-side
+sorting needed, just render in the order given. On the frontend: give a stale order (`isStale:
+true`) a red highlight/badge in both the Orders list and the dashboard's recent-orders list.
+
+**4. BLOCKED — "number of site visits" on the dashboard:**
+Checked BigCommerce's own API for this — it does NOT expose actual visitor/traffic numbers.
+The only relevant endpoint (`Get Web Analytics Provider`) just tells you *which* provider is
+configured (e.g. "Google Analytics"), not any numbers. To build this for real, tell me: does
+Sitara's storefront actually have Google Analytics (or another analytics tool) connected today?
+If yes, which one, and do you have (or can you get) API access to it — that's a separate
+integration with its own credentials, unrelated to the BigCommerce setup already in place. Not
+started until that's answered.

@@ -350,4 +350,11 @@ module.exports = {
     // the webhook in Razorpay's own dashboard (Settings > Webhooks).
     webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || null,
   },
+  // Sitara order-staleness threshold — computed at read time (src/routes/
+  // sitara.js), not a background poller, so there's no extra always-on job
+  // keeping OGCore/the tenant DB active (see the Azure cost investigation,
+  // 2026-09-10, for why that matters).
+  sitara: {
+    staleOrderDays: Number(process.env.SITARA_STALE_ORDER_DAYS || 3),
+  },
 };
