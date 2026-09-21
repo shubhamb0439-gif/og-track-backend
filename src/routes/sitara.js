@@ -866,7 +866,34 @@ async function matchRazorpayPaymentToOrder(db, entity) {
   return null;
 }
 
-async function syncRazorpayPayment(db, entity) {
+// Razorpay can succeed while BigCommerce's own checkout callback never fires
+// (a real failure mode reported live: BC leaves the order stuck at
+// "Incomplete" despite the customer having actually paid). Once a captured
+// payment is confidently matched to a local order (matchRazorpayPaymentToOrder
+// above — same customer + amount), if that order is still stuck at
+// 'incomplete' this corrects it to 'awaiting_fulfillment' both locally AND on
+// BigCommerce itself — best-effort on the BigCommerce push (mirrors
+// PATCH /orders/:id/status's own bigcommerceSyncError handling: a push
+// failure never blocks the local correction, just gets logged for retry).
+async function reconcileIncompleteOrder(db, io, companySlug, orderId) {
+  const order = await db('sitara_orders').where({ id: orderId }).first();
+  if (!order || order.status !== 'incomplete') return;
+
+  await db('sitara_orders').where({ id: orderId }).update({
+    status: 'awaiting_fulfillment', status_changed_at: new Date(), flagged: 0, updated_at: new Date(),
+  });
+  if (order.bigcommerce_order_id) {
+    try {
+      await pushStatusToBigCommerce(order.bigcommerce_order_id, 'awaiting_fulfillment');
+    } catch (e) {
+      console.error(`[sitara] reconcile: BigCommerce status push failed for order ${order.id}:`, e.message);
+    }
+  }
+  const saved = await ordersQuery(db).where('sitara_orders.id', orderId).first();
+  if (io) io.to(companySlug).emit('sitara:order_updated', mapOrder(saved));
+}
+
+async function syncRazorpayPayment(db, io, companySlug, entity) {
   const existing = await db('sitara_razorpay_payments').where({ razorpay_payment_id: entity.id }).first();
   const orderId = await matchRazorpayPaymentToOrder(db, entity);
   const row = {
@@ -879,6 +906,9 @@ async function syncRazorpayPayment(db, entity) {
     await db('sitara_razorpay_payments').where({ id: existing.id }).update(row);
   } else {
     await db('sitara_razorpay_payments').insert({ id: newId('rzp'), razorpay_payment_id: entity.id, ...row });
+  }
+  if (orderId && entity.status === 'captured') {
+    await reconcileIncompleteOrder(db, io, companySlug, orderId);
   }
 }
 
@@ -912,7 +942,7 @@ router.post('/razorpay/webhook', async (req, res) => {
     }
     const entity = req.body?.payload?.payment?.entity;
     if (!entity) return;
-    await syncRazorpayPayment(req.db, entity);
+    await syncRazorpayPayment(req.db, req.io, req.company.slug, entity);
   } catch (e) {
     console.error('[sitara] Razorpay webhook processing failed:', e);
   }
@@ -945,6 +975,7 @@ router.post('/razorpay/backfill', async (req, res) => {
   res.json({ started: true, message: 'Running in the background — poll GET /razorpay/backfill/status for progress.' });
 
   const db = req.db;
+  const io = req.io;
   (async () => {
     try {
       const payments = await listAllRazorpayPayments();
@@ -952,7 +983,7 @@ router.post('/razorpay/backfill', async (req, res) => {
       const failures = [];
       for (const entity of payments) {
         try {
-          await syncRazorpayPayment(db, entity);
+          await syncRazorpayPayment(db, io, slug, entity);
           succeeded += 1;
         } catch (e) {
           failures.push({ id: entity.id, error: e.message });
