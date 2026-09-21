@@ -598,6 +598,17 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
         bigcommerce_customer_id: bcCustomerId,
       });
       customer = await db('sitara_customers').where({ id }).first();
+    } else if (!customer.address_line1 && billing.street_1) {
+      // Opportunistic backfill: this customer existed before address fields
+      // did (or from an order that never had a billing address). We already
+      // have the current order's billing address in hand here at zero extra
+      // API cost, so use it rather than leaving the field permanently null.
+      await db('sitara_customers').where({ id: customer.id }).update({
+        address_line1: billing.street_1 || null, address_line2: billing.street_2 || null,
+        state: billing.state || null, postal_code: billing.zip || null, country: billing.country || null,
+        updated_at: new Date(),
+      });
+      customer = await db('sitara_customers').where({ id: customer.id }).first();
     }
     customerId = customer.id;
   }
