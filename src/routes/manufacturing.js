@@ -384,22 +384,20 @@ router.post('/assemblies', async (req, res) => {
       let totalComponentCost = 0;
       const distributionByComponent = {}; // item.id -> per-unit [{lotId, quantity}] arrays
 
-      // Per-component serial-unit queues, for components that are
-      // serial_tracked AND have enough unused inv_purchase_serial_units to
-      // cover this ENTIRE build. All-or-nothing per component: mixing
-      // serial-linked and generic lot-quantity rows within the same build
-      // risks double-counting a component's consumed quantity, so a
-      // component with incomplete serial coverage (e.g. older stock that
-      // predates it being marked serial_tracked, not yet backfilled via
-      // POST /inventory/items/:id/serial-units) falls back to the ordinary
-      // per-lot rows for the whole build instead.
+      // Per-component queue of available (unused) serialized units, for
+      // every serial_tracked component regardless of whether coverage is
+      // complete — consumed FIFO (oldest unit_number first) as physical
+      // slots are filled below. A component can be PARTIALLY covered: some
+      // slots get a real serial link, others (once the queue runs dry, e.g.
+      // older stock that predates this item being marked serial_tracked and
+      // hasn't been backfilled via POST /inventory/items/:id/serial-units)
+      // just don't get one — never blocks the build either way.
       const serialQueueByComponent = {};
       const usedSerialUnitIds = [];
-      for (const { item, required } of requirements) {
+      for (const { item } of requirements) {
         if (!item.serial_tracked) continue;
-        const available = await trx('inv_purchase_serial_units')
+        serialQueueByComponent[item.id] = await trx('inv_purchase_serial_units')
           .where({ item_id: item.id, is_used: false }).orderBy('unit_number', 'asc');
-        if (available.length >= Math.round(required)) serialQueueByComponent[item.id] = available;
       }
 
       // Consume stock FIFO for each component, then work out — from that
@@ -461,32 +459,36 @@ router.post('/assemblies', async (req, res) => {
         });
 
         // Per-unit component traceability: use this unit's actual share of
-        // the FIFO consumption recorded above — one row per lot it was
-        // really drawn from, which may be more than one if its share
-        // straddled a lot boundary. Serial-tracked components with full
-        // serial coverage (serialQueueByComponent) instead get one row PER
-        // PHYSICAL SERIALIZED PIECE, so exactly which unit went where is
-        // recorded — see the queue-building comment above for the
-        // all-or-nothing rule this depends on.
-        for (const { item, quantityPerUnit } of requirements) {
-          const serialQueue = serialQueueByComponent[item.id];
-          if (serialQueue) {
-            const needed = Math.round(quantityPerUnit);
-            for (let k = 0; k < needed; k++) {
-              const serialUnit = serialQueue.shift();
+        // the FIFO consumption recorded above. For an ordinary component,
+        // that's one row per lot it was really drawn from (may be more than
+        // one if its share straddled a lot boundary). For a serial_tracked
+        // component, that share is instead split into one row PER PHYSICAL
+        // PIECE (safe — serial-tracked quantities are always whole units),
+        // each linked to a real serialized unit wherever the per-component
+        // queue still has one available (FIFO, oldest first) — once it runs
+        // dry, remaining pieces just fall back to an unlinked row referencing
+        // the same lot, never blocking the build.
+        for (const { item } of requirements) {
+          const rowsForThisUnit = distributionByComponent[item.id][i - 1] || [];
+          if (item.serial_tracked) {
+            const queue = serialQueueByComponent[item.id];
+            // Flatten this unit's lot-quantity rows into one lotId per
+            // physical piece — exact, since these quantities are integers.
+            const pieceLotIds = rowsForThisUnit.flatMap(({ lotId, quantity }) => Array(Math.round(quantity)).fill(lotId));
+            for (const [pieceIdx, fallbackLotId] of pieceLotIds.entries()) {
+              const serialUnit = queue.shift();
               await trx('mfg_assembly_items').insert({
-                id: 'ai_' + unitId + '_' + item.id.slice(-6) + '_s' + k,
+                id: 'ai_' + unitId + '_' + item.id.slice(-6) + '_s' + pieceIdx,
                 assembly_id: assemblyId, assembly_unit_id: unitId,
                 component_item_id: item.id,
-                consumed_lot_id: serialUnit.lot_id || null,
+                consumed_lot_id: (serialUnit && serialUnit.lot_id) || fallbackLotId,
                 quantity: 1,
-                consumed_serial_unit_id: serialUnit.id,
+                consumed_serial_unit_id: serialUnit ? serialUnit.id : null,
               });
-              usedSerialUnitIds.push(serialUnit.id);
+              if (serialUnit) usedSerialUnitIds.push(serialUnit.id);
             }
             continue;
           }
-          const rowsForThisUnit = distributionByComponent[item.id][i - 1] || [];
           for (const [rowIdx, { lotId, quantity }] of rowsForThisUnit.entries()) {
             await trx('mfg_assembly_items').insert({
               id: 'ai_' + unitId + '_' + item.id.slice(-6) + '_' + rowIdx,

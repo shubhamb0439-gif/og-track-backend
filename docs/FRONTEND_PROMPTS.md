@@ -1271,8 +1271,7 @@ answer "which physical unit did we send this customer" directly from the PO scre
 
 ## 24. CAJO Traceability — which serialized component built which specific assembly unit
 
-**Status: backend built. Read the coverage caveat below before implementing — it changes what
-you should expect to see on already-existing (older) assemblies vs newly-built ones.**
+**Status: backend built.**
 
 ```
 GET /api/:slug/manufacturing/assemblies/:id
@@ -1280,21 +1279,17 @@ GET /api/:slug/manufacturing/assemblies/:id
     componentsUsed: [{ componentItemId, componentItemName, serialNumber }]
   This is PER UNIT (e.g. "PACE R Unit #1" specifically), distinct from the existing top-level
   `componentsUsed` array on the response (which stays as the aggregate/total-used-per-component
-  summary — unchanged, still there).
+  summary — unchanged, still there). No quantity field on purpose — this is just "which
+  serialized component, with its already-assigned serial number", nothing to re-enter here.
 ```
 
-**Coverage caveat — why some units may show an empty `componentsUsed`:** this is recorded at
-BUILD time, per component, all-or-nothing. When an assembly is built, for each BOM component
-that's `serial_tracked`, the system checks whether there are enough unused serialized units
-(from `inv_purchase_serial_units`, see Prompts 21/23) on hand to cover the WHOLE build. If yes,
-every unit gets exact serial linkage for that component. If no (e.g. that component was only
-recently marked serial_tracked and its older stock hasn't been backfilled with serial numbers
-yet — see Prompt 23's manual "Add Serial Number" flow), that component falls back to ordinary
-(non-serial) tracking for that entire build, and `componentsUsed` simply won't include it for
-those units. Bottom line: to get full per-unit component traceability going forward, make sure
-a serial-tracked component's on-hand stock is fully covered by `inv_purchase_serial_units` rows
-(backfill via Prompt 23's manual add if needed) BEFORE building assemblies that use it — this
-can't be retroactively reconstructed for assemblies already built before that backfill.
+**How it's populated:** at build time, for every BOM component that's `serial_tracked`, each
+physical piece consumed gets linked to a real serialized unit (from `inv_purchase_serial_units`
+— assigned earlier via Inventory's Edit Item flow, Prompt 23) whenever one is available,
+oldest-first. This is per physical piece, not all-or-nothing per build — if a component only has
+partial serial coverage (say 3 of the 5 pieces needed have an assigned serial on hand), the
+units that got a real piece show it in `componentsUsed`; the rest are just omitted from that
+unit's list, nothing else about the build is blocked or held back either way.
 
 On the Traceability page (Prompt 21), in the unit detail box where a serial is assigned to a
 unit (e.g. "PACE R Unit #1"), add a small "Components used" list below it — one row per entry
