@@ -143,16 +143,18 @@ GO
 CREATE INDEX IX_inv_stock_issues_item ON dbo.inv_stock_issues(item_id);
 GO
 
--- One row per individual unit of a serial_tracked item received via a
--- purchase (see inv_items.serial_tracked) — mirrors mfg_assembly_units'
--- pattern (created with serial_number NULL, assigned later through the
--- Traceability page) but for PURCHASED units rather than manufactured ones.
--- Only created when the received item is serial_tracked; a non-tracked
--- item's lot never gets rows here.
+-- One row per individual unit of a serial_tracked item (see
+-- inv_items.serial_tracked) — mirrors mfg_assembly_units' pattern (created
+-- with serial_number NULL, assigned later through the Traceability page) but
+-- for PURCHASED/manually-added units rather than manufactured ones. Most rows
+-- come from /receive or /receive-lines (lot_id set); lot_id is nullable for
+-- units added manually via POST /items/:id/serial-units — e.g. stock that
+-- predates the item being marked serial_tracked, so there's no single
+-- receiving event to attribute it to.
 CREATE TABLE dbo.inv_purchase_serial_units (
     id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
     item_id             NVARCHAR(64)   NOT NULL,
-    lot_id              NVARCHAR(64)   NOT NULL,
+    lot_id              NVARCHAR(64)   NULL,
     purchase_item_id    NVARCHAR(64)   NULL,
     unit_number         INT            NOT NULL,
     serial_number       NVARCHAR(100)  NULL,

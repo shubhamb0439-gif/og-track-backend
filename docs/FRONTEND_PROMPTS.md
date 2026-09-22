@@ -1216,3 +1216,53 @@ Sitara's storefront actually have Google Analytics (or another analytics tool) c
 If yes, which one, and do you have (or can you get) API access to it — that's a separate
 integration with its own credentials, unrelated to the BigCommerce setup already in place. Not
 started until that's answered.
+
+---
+
+## 23. CAJO — manual serial-number add on Edit Item, BOM manufacturing price, PO delivery traceability
+
+**Status: backend built for all three.**
+
+**1. Edit Item (Inventory) — add a serial number right when marking an item serial_tracked:**
+```
+POST /api/:slug/inventory/items/:id/serial-units — body: { serialNumber? }
+  Manually registers one new traceable unit for this item — for stock that predates the item
+  being marked serial_tracked (so it never went through a Purchase receiving event). 400s if
+  the item isn't serial_tracked, or if serialNumber is already used anywhere (checked against
+  both purchased and manufactured units, same as the existing PATCH /serial-units/:unitId).
+  Real-time: inv:serial_unit_updated.
+
+GET /api/:slug/inventory/items?serialTracked=true
+  NEW filter on the existing items list endpoint — returns only serial_tracked items,
+  regardless of whether they have any serial units yet. Use this to populate a "browse
+  traceable items" dropdown on the Traceability page (from Prompt 21) — the existing
+  GET /serial-units only returns items that already HAVE at least one unit, so a
+  freshly-flagged item with zero units wouldn't appear there yet.
+```
+On the Edit Item modal: when the "Serial tracked" checkbox is ticked (whether just now or
+already was), show a small "Add serial number" input + button right there, calling the new
+POST endpoint. On the Traceability page: add a dropdown (sourced from the new `serialTracked`
+filter) to pick any traceable item and jump to/create its entry, even before it has units.
+
+**2. BOM detail — manufacturing price:**
+```
+GET /api/:slug/manufacturing/boms/:id now also returns: manufacturingPrice (number)
+  = sum across every BOM line of (component's current avg_cost × quantityPerUnit) — the
+  live production cost of one finished unit under this BOM. Computed fresh on every read from
+  each component's current cost, not stored, so it's always up to date if a component's cost
+  changes later.
+```
+Show this in the top-right corner of the BOM detail view, labeled something like "Production
+Cost" or "Manufacturing Price".
+
+**3. Customer PO — which serial-numbered unit was delivered:**
+```
+GET /api/:slug/crm/customer-purchase-orders/:id/history
+  Each entry in `sales` now also includes: items: [{ itemId, itemName, serialNumber, quantity,
+  unitPrice, lineTotal }] — serialNumber is the specific manufactured unit's serial (from
+  Manufacturing's mfg_assembly_units, via Prompt 21/Traceability's serial assignment), null if
+  that line item isn't linked to a serialized unit.
+```
+On the customer PO detail/history view (the expandable row mentioned in the existing endpoint's
+own comment), show each sale's line items with their serial numbers — this is what lets you
+answer "which physical unit did we send this customer" directly from the PO screen.

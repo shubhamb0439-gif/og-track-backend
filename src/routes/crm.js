@@ -520,9 +520,29 @@ router.get('/customer-purchase-orders/:id/history', async (req, res) => {
     const deliveries = saleIds.length
       ? await req.db('deliveries').whereIn('sale_id', saleIds).orderBy('created_at', 'desc')
       : [];
+    // Which serial-numbered finished-product unit went out under this PO —
+    // joined through sale_items -> mfg_assembly_units (every sale item is a
+    // specific manufactured unit, see src/routes/sales.js) so the PO's own
+    // history shows exactly what was delivered to this customer, by serial.
+    const saleItems = saleIds.length
+      ? await req.db('sale_items')
+          .whereIn('sale_items.sale_id', saleIds)
+          .leftJoin('mfg_assembly_units', 'sale_items.assembly_unit_id', 'mfg_assembly_units.id')
+          .leftJoin('inv_items', 'sale_items.item_id', 'inv_items.id')
+          .select('sale_items.*', 'mfg_assembly_units.serial_number as serial_number', 'inv_items.name as item_name')
+      : [];
+    const itemsBySale = {};
+    for (const si of saleItems) {
+      (itemsBySale[si.sale_id] ||= []).push({
+        itemId: si.item_id, itemName: si.item_name || null,
+        serialNumber: si.serial_number || null,
+        quantity: Number(si.quantity), unitPrice: Number(si.unit_price), lineTotal: Number(si.line_total),
+      });
+    }
     res.json({
       sales: sales.map(s => ({
         id: s.id, saleNumber: s.sale_number, saleDate: s.sale_date, total: Number(s.total || 0),
+        items: itemsBySale[s.id] || [],
       })),
       deliveries: deliveries.map(d => ({
         id: d.id, deliveryNumber: d.delivery_number, scheduledDate: d.scheduled_date,

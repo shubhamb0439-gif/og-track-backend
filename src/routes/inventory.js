@@ -192,6 +192,7 @@ router.get('/items', async (req, res) => {
   try {
     let q = req.db('inv_items');
     if (req.query.group) q = q.where({ item_group: req.query.group });
+    if (req.query.serialTracked === 'true') q = q.where({ serial_tracked: true });
     if (req.query.alerts === 'true') {
       // Only return items that are below min or at reorder level
       q = q.whereRaw('(stock_min > 0 AND stock < stock_min) OR (stock_reorder > 0 AND stock <= stock_reorder)');
@@ -738,6 +739,36 @@ router.get('/serial-units', async (req, res) => {
     }
     res.json(Object.values(byItem));
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/inventory/items/:id/serial-units — body: { serialNumber? }.
+// Manual add, for stock that predates this item being marked serial_tracked
+// (or any other case where a unit didn't come through /receive or
+// /receive-lines) — not tied to a specific lot, unlike the auto-created rows.
+router.post('/items/:id/serial-units', async (req, res) => {
+  try {
+    const item = await req.db('inv_items').where({ id: req.params.id }).first();
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+    if (!item.serial_tracked) return res.status(400).json({ error: 'This item is not marked serial_tracked.' });
+
+    const { serialNumber } = req.body;
+    if (serialNumber) {
+      const clash = await req.db('inv_purchase_serial_units').where({ serial_number: serialNumber }).first();
+      if (clash) return res.status(400).json({ error: `Serial number "${serialNumber}" is already in use` });
+      const clashAssembly = await req.db('mfg_assembly_units').where({ serial_number: serialNumber }).first();
+      if (clashAssembly) return res.status(400).json({ error: `Serial number "${serialNumber}" is already in use` });
+    }
+
+    const last = await req.db('inv_purchase_serial_units').where({ item_id: item.id }).orderBy('unit_number', 'desc').first();
+    const id = 'psu_' + Date.now() + Math.random().toString(36).slice(2, 6);
+    await req.db('inv_purchase_serial_units').insert({
+      id, item_id: item.id, lot_id: null, purchase_item_id: null,
+      unit_number: last ? last.unit_number + 1 : 1, serial_number: serialNumber || null,
+    });
+    const saved = await req.db('inv_purchase_serial_units').where({ id }).first();
+    req.io.to(req.company.slug).emit('inv:serial_unit_updated', mapSerialUnit(saved));
+    res.json(mapSerialUnit(saved));
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // PATCH /api/:slug/inventory/serial-units/:unitId — body: { serialNumber }.

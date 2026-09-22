@@ -41,12 +41,23 @@ router.get('/boms', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/:slug/manufacturing/boms/:id
+// manufacturingPrice: sum across every line of (component's current avg_cost
+// * quantityPerUnit) — the production cost of ONE finished unit under this
+// BOM, computed live from inv_items.avg_cost (the same maintained
+// weighted-average cost every other stock-cost figure in the app already
+// uses — see src/utils/stockLots.js's recomputeItemStock), not stored on the
+// BOM itself so it always reflects each component's current cost.
 router.get('/boms/:id', async (req, res) => {
   try {
     const bom = await req.db('mfg_boms').where({ id: req.params.id }).first();
     if (!bom) return res.status(404).json({ error: 'BOM not found' });
     const lines = await req.db('mfg_bom_lines').where({ bom_id: req.params.id });
-    res.json({ ...mapBom(bom), lines: lines.map(mapBomLine) });
+    const componentIds = [...new Set(lines.map(l => l.component_item_id))];
+    const components = componentIds.length ? await req.db('inv_items').whereIn('id', componentIds) : [];
+    const costById = Object.fromEntries(components.map(c => [c.id, Number(c.avg_cost || 0)]));
+    const manufacturingPrice = lines.reduce((sum, l) => sum + Number(l.quantity_per_unit) * (costById[l.component_item_id] || 0), 0);
+    res.json({ ...mapBom(bom), manufacturingPrice, lines: lines.map(mapBomLine) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
