@@ -1295,3 +1295,111 @@ On the Traceability page (Prompt 21), in the unit detail box where a serial is a
 unit (e.g. "PACE R Unit #1"), add a small "Components used" list below it — one row per entry
 in that unit's `componentsUsed`, showing the component's name and its serial number. Omit the
 section entirely (or show "No serialized components recorded") when the array is empty.
+
+---
+
+## 25. BUG — Edit Item's "Add Serial Number" fires before the serial_tracked checkbox is saved
+
+**Status: confirmed via direct DB inspection (2026-09-22) — PACE L and PACE R both show
+`serialTracked: false` in the database despite being ticked in the Edit Item modal and having a
+serial typed into "Add Serial Number". The POST silently succeeds against stale client state or
+the checkbox change was never actually persisted — either way, the item never really becomes
+serial_tracked, so nothing downstream (Traceability, BOM builds) can pick it up.**
+
+**Root cause:** ticking "Track Serial Numbers" in the Edit Item modal only changes local form
+state. `POST /api/:slug/inventory/items/:id/serial-units` (Prompt 23) requires
+`inv_items.serial_tracked` to already be `true` in the database (it 400s otherwise:
+`"This item is not marked serial_tracked."`) — but the modal lets you type into "Add Serial
+Number" and click Add before "Save Item" has ever run a `PATCH /items/:id` with
+`{ serialTracked: true }`.
+
+**Fix — pick one:**
+1. Disable/hide the "Add Serial Number" input until the item has actually been saved with
+   `serialTracked: true` (i.e. only show it when editing an already-serial-tracked item).
+2. Or, better UX: the instant "Track Serial Numbers" is ticked, immediately fire
+   `PATCH /items/:id` with `{ serialTracked: true }` on its own (before touching "Add Serial
+   Number"), so the backend is in sync right away without waiting for the full form save.
+
+Verify the fix by re-checking the item after ticking + adding a serial — `GET /items?serialTracked=true`
+(Prompt 23) should include it immediately.
+
+---
+
+## 26. LOGIC CHANGE (2026-09-22) — serials for BOM components are entered at build time, not pre-registered in Inventory
+
+**Status: backend built. This changes/retracts part of Prompt 23 and makes Prompt 25 moot —
+read this whole entry before touching either of those again.**
+
+**Why:** a component's real-world serial is different every single time a physical piece is
+actually used — pre-registering one serial "on the item" in Inventory (Prompt 23's "Add Serial
+Number" box) doesn't match that. Serials now get typed in fresh, per physical piece, at the
+moment an assembly is actually built.
+
+**1. Remove the "Add Serial Number" input from the Edit Item modal entirely.** Keep the "Track
+Serial Numbers" checkbox (still writes `serialTracked` via `PATCH /items/:id` same as before) —
+just delete the box/button next to it and the `POST /items/:id/serial-units` call tied to it.
+This also makes **Prompt 25 moot** — there's no longer a dependent action to sequence after the
+checkbox save, so that bug's fix isn't needed (skip it if not already done).
+
+**2. Build Assembly form — new serial inputs, driven by the BOM's own lines:**
+```
+GET /api/:slug/manufacturing/boms/:id
+  Each entry in `lines` now also includes: componentItemName, componentSerialTracked (bool).
+  Use componentSerialTracked to decide which lines need serial inputs at all.
+```
+For every BOM line where `componentSerialTracked` is true, the Build Assembly form needs
+`quantityPerUnit × quantityBuilt` individual serial-number text inputs for that component (not
+one — one PER PHYSICAL PIECE). E.g. a component used at quantityPerUnit=2, building
+quantityBuilt=5 units, needs 10 separate inputs. Recompute the input count live as the user
+changes quantityBuilt. Group them clearly per component (e.g. "Omron — piece 1", "piece 2", ...)
+so it's obvious which piece is which; order matters (see below).
+
+```
+POST /api/:slug/manufacturing/assemblies — body gains:
+  componentSerials: { [componentItemId]: ['SN-a', 'SN-b', ...] }
+  Flat array per component, in order: the first quantityPerUnit entries go to unit 1, the next
+  quantityPerUnit to unit 2, and so on. Any slot's serial is optional — send '' (or null) for a
+  piece whose serial isn't known, anywhere in the array, not just at the end; positions are
+  preserved so later entries still land on the right piece. That slot just won't have a
+  traceability link, nothing else about the build is blocked. 400s if any serial collides with
+  one already used anywhere (checked across every existing serial in the system) or is
+  duplicated within the same submission.
+```
+
+The unit's own serial-number assignment is unchanged. `componentsUsed`'s shape changes slightly
+— see Prompt 27 below, which supersedes Prompt 24's version of that field.
+
+---
+
+## 27. Traceability — retroactively assign/edit a component's serial on ANY unit (already-built or new)
+
+**Status: backend built. Supersedes Prompt 24's `componentsUsed` shape — re-read this instead
+of that one.**
+
+**Why:** entering a serial at build time (Prompt 26) and entering it later by hand, retroactively,
+on a unit that's already built (even one built weeks ago, before this feature existed) are now
+fully equivalent — same data, same result, either order.
+
+```
+GET /api/:slug/manufacturing/assemblies/:id
+  Each entry in `units[].componentsUsed` is now: { assemblyItemId, componentItemId,
+    componentItemName, serialNumber }
+  serialNumber is null for a slot that hasn't been filled in yet. Every physical piece of every
+  serial_tracked component used in that unit gets its OWN entry here now — including ones from
+  assemblies built before this feature existed, or pieces that were skipped at build time — not
+  just already-linked ones like before. assemblyItemId is what you PATCH (see below); note two
+  still-unassigned slots from the SAME component/unit can share the same assemblyItemId until
+  the first one is actually filled in (see the endpoint's own comment for why — each PATCH call
+  "peels off" one piece at a time from an old, not-yet-individually-serialized row).
+
+PATCH /api/:slug/manufacturing/assembly-items/:assemblyItemId/serial — body: { serialNumber }
+  Assigns (if serialNumber was null) or edits (if it already had a value) one component-piece's
+  serial. Works on any unit, any assembly, any age. 400s on a serial collision, same rules as
+  everywhere else (checked across the whole system).
+```
+
+On the Traceability page, in each unit's expanded "Components used" list, every entry (already
+in your DB or not) should now be editable: show the current serial (or an empty input if null),
+and call the PATCH endpoint with whatever the user types — same control for filling in a blank
+slot and correcting an existing value. This works uniformly for units built today and units
+built months ago; there's no separate "old assembly" UI needed.

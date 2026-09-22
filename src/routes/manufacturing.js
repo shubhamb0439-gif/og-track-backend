@@ -2,6 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { recomputeItemStock, consumeStockFIFO, createLot, distributeConsumptionAcrossUnits } = require('../utils/stockLots');
 
+async function nextSerialUnitNumber(db, itemId) {
+  const last = await db('inv_purchase_serial_units').where({ item_id: itemId }).orderBy('unit_number', 'desc').first();
+  return last ? last.unit_number + 1 : 1;
+}
+
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapBom = (r) => r && ({
   id: r.id, name: r.name, productItemId: r.product_item_id, notes: r.notes,
@@ -58,7 +63,17 @@ router.get('/boms/:id', async (req, res) => {
     const components = componentIds.length ? await req.db('inv_items').whereIn('id', componentIds) : [];
     const costById = Object.fromEntries(components.map(c => [c.id, Number(c.avg_cost || 0)]));
     const manufacturingPrice = lines.reduce((sum, l) => sum + Number(l.quantity_per_unit) * (costById[l.component_item_id] || 0), 0);
-    res.json({ ...mapBom(bom), manufacturingPrice, lines: lines.map(mapBomLine) });
+
+    // componentItemName/componentSerialTracked let the Build Assembly form
+    // know, without a second round trip, which lines need a serial-number
+    // input per physical piece (see POST /assemblies's componentSerials).
+    const componentById = Object.fromEntries(components.map(c => [c.id, c]));
+    const enrichedLines = lines.map(l => ({
+      ...mapBomLine(l),
+      componentItemName: componentById[l.component_item_id]?.name || null,
+      componentSerialTracked: !!componentById[l.component_item_id]?.serial_tracked,
+    }));
+    res.json({ ...mapBom(bom), manufacturingPrice, lines: enrichedLines });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -292,29 +307,109 @@ router.get('/assemblies/:id', async (req, res) => {
 
     // Per-UNIT component traceability — which specific serialized component
     // went into which specific finished unit (e.g. "PACE R Unit #1 used MCB
-    // serial cc12345"). Only rows with a consumed_serial_unit_id qualify;
-    // ordinary (non-serial or serial-coverage-incomplete) rows contribute
-    // nothing here since there's no specific unit to name.
+    // serial cc12345"). Covers every serial_tracked component's row for that
+    // unit, whether already linked to a real serial or not — an unlinked row
+    // (built before this feature existed, or a piece nobody typed a serial
+    // in for at build time) surfaces as one assignable slot per remaining
+    // physical piece (row.quantity), so it can be filled in retroactively via
+    // PATCH /manufacturing/assembly-items/:id/serial with no difference in
+    // outcome from having entered it at build time.
     const serialUnitIds = [...new Set(itemsEnriched.map(i => i.consumedSerialUnitId).filter(Boolean))];
     const serialUnits = serialUnitIds.length ? await req.db('inv_purchase_serial_units').whereIn('id', serialUnitIds) : [];
     const serialUnitById = Object.fromEntries(serialUnits.map(u => [u.id, u]));
     const componentIds = [...new Set(itemsEnriched.map(i => i.componentItemId))];
     const components = componentIds.length ? await req.db('inv_items').whereIn('id', componentIds) : [];
     const componentNameById = Object.fromEntries(components.map(c => [c.id, c.name]));
+    const componentSerialTrackedById = Object.fromEntries(components.map(c => [c.id, !!c.serial_tracked]));
 
-    const unitsWithComponents = units.map(u => ({
-      ...mapAssemblyUnit(u),
-      componentsUsed: itemsEnriched
-        .filter(i => i.assemblyUnitId === u.id && i.consumedSerialUnitId)
-        .map(i => ({
-          componentItemId: i.componentItemId,
-          componentItemName: componentNameById[i.componentItemId] || null,
-          serialNumber: serialUnitById[i.consumedSerialUnitId]?.serial_number || null,
-        })),
-    }));
+    const unitsWithComponents = units.map(u => {
+      const componentsUsed = [];
+      for (const i of itemsEnriched) {
+        if (i.assemblyUnitId !== u.id || !componentSerialTrackedById[i.componentItemId]) continue;
+        if (i.consumedSerialUnitId) {
+          componentsUsed.push({
+            assemblyItemId: i.id, componentItemId: i.componentItemId,
+            componentItemName: componentNameById[i.componentItemId] || null,
+            serialNumber: serialUnitById[i.consumedSerialUnitId]?.serial_number || null,
+          });
+        } else {
+          for (let k = 0; k < Math.round(i.quantity); k++) {
+            componentsUsed.push({
+              assemblyItemId: i.id, componentItemId: i.componentItemId,
+              componentItemName: componentNameById[i.componentItemId] || null,
+              serialNumber: null,
+            });
+          }
+        }
+      }
+      return { ...mapAssemblyUnit(u), componentsUsed };
+    });
 
     res.json({ ...mapAssembly(asm), units: unitsWithComponents, items: itemsEnriched, componentsUsed });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/:slug/manufacturing/assembly-items/:id/serial — body: { serialNumber }
+// Assigns or edits a component serial on an EXISTING mfg_assembly_items row —
+// works identically whether that row came from typing a serial in at build
+// time (Prompt 26) or is being filled in retroactively now, on a unit built
+// before this feature existed. Three cases:
+//   1. Row already links a serial unit -> edit that serial in place.
+//   2. Row is unlinked with quantity > 1 (an old aggregate row covering
+//      several physical pieces at once, never split) -> peel ONE piece off:
+//      decrement this row's quantity, create a new quantity=1 row carrying
+//      the new serial. Call this once per remaining piece to fully convert
+//      the aggregate into individually-serialized rows.
+//   3. Row is unlinked with quantity === 1 (already atomic — e.g. built via
+//      Prompt 26 with no serial typed in for that specific piece) -> link
+//      this same row directly, no split needed.
+router.patch('/assembly-items/:id/serial', async (req, res) => {
+  try {
+    const { serialNumber } = req.body;
+    if (!serialNumber) return res.status(400).json({ error: 'serialNumber is required' });
+
+    const row = await req.db('mfg_assembly_items').where({ id: req.params.id }).first();
+    if (!row) return res.status(404).json({ error: 'Assembly item not found' });
+
+    const clash1 = await req.db('inv_purchase_serial_units')
+      .where({ serial_number: serialNumber }).andWhereNot({ id: row.consumed_serial_unit_id || '' }).first();
+    if (clash1) return res.status(400).json({ error: `Serial number "${serialNumber}" is already in use` });
+    const clash2 = await req.db('mfg_assembly_units').where({ serial_number: serialNumber }).first();
+    if (clash2) return res.status(400).json({ error: `Serial number "${serialNumber}" is already in use` });
+
+    let resultId = row.id;
+    await req.db.transaction(async (trx) => {
+      if (row.consumed_serial_unit_id) {
+        await trx('inv_purchase_serial_units').where({ id: row.consumed_serial_unit_id }).update({ serial_number: serialNumber });
+      } else if (Number(row.quantity) > 1) {
+        await trx('mfg_assembly_items').where({ id: row.id }).update({ quantity: Number(row.quantity) - 1 });
+        const psuId = 'psu_' + Date.now() + Math.random().toString(36).slice(2, 6);
+        await trx('inv_purchase_serial_units').insert({
+          id: psuId, item_id: row.component_item_id, lot_id: row.consumed_lot_id || null,
+          purchase_item_id: null, unit_number: await nextSerialUnitNumber(trx, row.component_item_id),
+          serial_number: serialNumber, is_used: true,
+        });
+        resultId = 'ai_' + row.id + '_split' + Date.now() + Math.random().toString(36).slice(2, 4);
+        await trx('mfg_assembly_items').insert({
+          id: resultId, assembly_id: row.assembly_id, assembly_unit_id: row.assembly_unit_id,
+          component_item_id: row.component_item_id, consumed_lot_id: row.consumed_lot_id,
+          quantity: 1, consumed_serial_unit_id: psuId,
+        });
+      } else {
+        const psuId = 'psu_' + Date.now() + Math.random().toString(36).slice(2, 6);
+        await trx('inv_purchase_serial_units').insert({
+          id: psuId, item_id: row.component_item_id, lot_id: row.consumed_lot_id || null,
+          purchase_item_id: null, unit_number: await nextSerialUnitNumber(trx, row.component_item_id),
+          serial_number: serialNumber, is_used: true,
+        });
+        await trx('mfg_assembly_items').where({ id: row.id }).update({ consumed_serial_unit_id: psuId });
+      }
+    });
+
+    const saved = await req.db('mfg_assembly_items').where({ id: resultId }).first();
+    req.io.to(req.company.slug).emit('mfg:assembly_item_updated', mapAssemblyItem(saved));
+    res.json(mapAssemblyItem(saved));
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // GET /api/:slug/manufacturing/units/:serial — traceability: look up a unit by serial
@@ -330,10 +425,19 @@ router.get('/units/:serial', async (req, res) => {
 
 // POST /api/:slug/manufacturing/assemblies
 // Body: { bomId, quantityBuilt, name, customerPoNumber, notes,
-//          serialNumbers: ['SN001','SN002',...] (optional, one per unit) }
+//          serialNumbers: ['SN001','SN002',...] (optional, one per unit),
+//          componentSerials: { [componentItemId]: ['SN-a','SN-b',...] } }
+// componentSerials is entered fresh at build time, one entry per PHYSICAL
+// PIECE consumed of a serial_tracked component (not per unit) — e.g. a
+// component used at quantityPerUnit=2 needs 2 entries per unit built, in
+// order (first quantityPerUnit entries -> unit 1, next quantityPerUnit ->
+// unit 2, etc.). Optional per component; any component/slot without an
+// explicit entry falls back to an older pre-registered available serial
+// unit if one exists (see the fallback-queue comment below), or is left
+// unlinked otherwise — never blocks the build either way.
 router.post('/assemblies', async (req, res) => {
   try {
-    const { bomId, quantityBuilt, name, customerPoNumber, notes, serialNumbers } = req.body;
+    const { bomId, quantityBuilt, name, customerPoNumber, notes, serialNumbers, componentSerials } = req.body;
     if (!bomId || !quantityBuilt || Number(quantityBuilt) <= 0) {
       return res.status(400).json({ error: 'bomId and a positive quantityBuilt are required' });
     }
@@ -348,6 +452,21 @@ router.post('/assemblies', async (req, res) => {
         if (!sn) continue;
         const exists = await req.db('mfg_assembly_units').where({ serial_number: sn }).first();
         if (exists) return res.status(400).json({ error: `Serial number "${sn}" is already in use` });
+      }
+    }
+
+    // Validate component-piece serials don't collide with each other or with
+    // anything already recorded anywhere in the system.
+    if (componentSerials && typeof componentSerials === 'object') {
+      const allProvided = Object.values(componentSerials).flat().filter(Boolean);
+      const seen = new Set();
+      for (const sn of allProvided) {
+        if (seen.has(sn)) return res.status(400).json({ error: `Serial number "${sn}" is used more than once in this build` });
+        seen.add(sn);
+        const clash1 = await req.db('inv_purchase_serial_units').where({ serial_number: sn }).first();
+        if (clash1) return res.status(400).json({ error: `Serial number "${sn}" is already in use` });
+        const clash2 = await req.db('mfg_assembly_units').where({ serial_number: sn }).first();
+        if (clash2) return res.status(400).json({ error: `Serial number "${sn}" is already in use` });
       }
     }
 
@@ -384,20 +503,31 @@ router.post('/assemblies', async (req, res) => {
       let totalComponentCost = 0;
       const distributionByComponent = {}; // item.id -> per-unit [{lotId, quantity}] arrays
 
-      // Per-component queue of available (unused) serialized units, for
-      // every serial_tracked component regardless of whether coverage is
-      // complete — consumed FIFO (oldest unit_number first) as physical
-      // slots are filled below. A component can be PARTIALLY covered: some
-      // slots get a real serial link, others (once the queue runs dry, e.g.
-      // older stock that predates this item being marked serial_tracked and
-      // hasn't been backfilled via POST /inventory/items/:id/serial-units)
-      // just don't get one — never blocks the build either way.
-      const serialQueueByComponent = {};
+      // Serial-tracked components get their serial entered fresh, right now,
+      // per PHYSICAL PIECE (componentSerials from the request) — not
+      // pre-registered ahead of time in Inventory, since a component's real
+      // serial is different every single time a piece is actually used.
+      // explicitSerialsByComponent holds what was typed in for this build;
+      // fallbackQueueByComponent is a secondary source — any older
+      // pre-registered-but-unused serial units for that item (from before
+      // this flow existed, or added manually) — used only for slots this
+      // build didn't supply an explicit serial for. Neither source running
+      // short ever blocks the build; unfilled slots just have no serial link.
+      const explicitSerialsByComponent = {};
+      const fallbackQueueByComponent = {};
+      const nextUnitNumberByComponent = {};
       const usedSerialUnitIds = [];
       for (const { item } of requirements) {
         if (!item.serial_tracked) continue;
-        serialQueueByComponent[item.id] = await trx('inv_purchase_serial_units')
+        // Not filtered here — a blank/falsy entry mid-array must stay in
+        // place (consumed as "no serial for this slot") so later entries
+        // don't shift into the wrong physical piece's position.
+        explicitSerialsByComponent[item.id] = Array.isArray(componentSerials?.[item.id])
+          ? componentSerials[item.id].slice() : [];
+        fallbackQueueByComponent[item.id] = await trx('inv_purchase_serial_units')
           .where({ item_id: item.id, is_used: false }).orderBy('unit_number', 'asc');
+        const last = await trx('inv_purchase_serial_units').where({ item_id: item.id }).orderBy('unit_number', 'desc').first();
+        nextUnitNumberByComponent[item.id] = last ? last.unit_number + 1 : 1;
       }
 
       // Consume stock FIFO for each component, then work out — from that
@@ -464,28 +594,44 @@ router.post('/assemblies', async (req, res) => {
         // one if its share straddled a lot boundary). For a serial_tracked
         // component, that share is instead split into one row PER PHYSICAL
         // PIECE (safe — serial-tracked quantities are always whole units),
-        // each linked to a real serialized unit wherever the per-component
-        // queue still has one available (FIFO, oldest first) — once it runs
-        // dry, remaining pieces just fall back to an unlinked row referencing
-        // the same lot, never blocking the build.
+        // each piece getting the serial typed in for THIS build
+        // (explicitSerialsByComponent) if one was given, else an older
+        // pre-registered available unit as a fallback, else left unlinked —
+        // never blocks the build either way.
         for (const { item } of requirements) {
           const rowsForThisUnit = distributionByComponent[item.id][i - 1] || [];
           if (item.serial_tracked) {
-            const queue = serialQueueByComponent[item.id];
             // Flatten this unit's lot-quantity rows into one lotId per
             // physical piece — exact, since these quantities are integers.
             const pieceLotIds = rowsForThisUnit.flatMap(({ lotId, quantity }) => Array(Math.round(quantity)).fill(lotId));
             for (const [pieceIdx, fallbackLotId] of pieceLotIds.entries()) {
-              const serialUnit = queue.shift();
+              const explicitSerial = explicitSerialsByComponent[item.id].shift();
+              let serialUnitId = null;
+              let consumedLotId = fallbackLotId;
+              if (explicitSerial) {
+                const psuId = 'psu_' + Date.now() + Math.random().toString(36).slice(2, 6);
+                await trx('inv_purchase_serial_units').insert({
+                  id: psuId, item_id: item.id, lot_id: fallbackLotId || null, purchase_item_id: null,
+                  unit_number: nextUnitNumberByComponent[item.id]++,
+                  serial_number: explicitSerial, is_used: true,
+                });
+                serialUnitId = psuId;
+              } else {
+                const fallbackUnit = fallbackQueueByComponent[item.id].shift();
+                if (fallbackUnit) {
+                  serialUnitId = fallbackUnit.id;
+                  consumedLotId = fallbackUnit.lot_id || fallbackLotId;
+                  usedSerialUnitIds.push(fallbackUnit.id);
+                }
+              }
               await trx('mfg_assembly_items').insert({
                 id: 'ai_' + unitId + '_' + item.id.slice(-6) + '_s' + pieceIdx,
                 assembly_id: assemblyId, assembly_unit_id: unitId,
                 component_item_id: item.id,
-                consumed_lot_id: (serialUnit && serialUnit.lot_id) || fallbackLotId,
+                consumed_lot_id: consumedLotId,
                 quantity: 1,
-                consumed_serial_unit_id: serialUnit ? serialUnit.id : null,
+                consumed_serial_unit_id: serialUnitId,
               });
-              if (serialUnit) usedSerialUnitIds.push(serialUnit.id);
             }
             continue;
           }
