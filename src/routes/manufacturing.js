@@ -30,6 +30,7 @@ const mapAssemblyItem = (r) => r && ({
   id: r.id, assemblyId: r.assembly_id, assemblyUnitId: r.assembly_unit_id,
   componentItemId: r.component_item_id, consumedLotId: r.consumed_lot_id,
   quantity: Number(r.quantity), consumedUnitId: r.consumed_unit_id,
+  consumedSerialUnitId: r.consumed_serial_unit_id,
 });
 
 // ── BOMs ──────────────────────────────────────────────────────────────────────
@@ -289,7 +290,30 @@ router.get('/assemblies/:id', async (req, res) => {
       ...c, source: [...c.sources].join(', '), sources: undefined,
     }));
 
-    res.json({ ...mapAssembly(asm), units: units.map(mapAssemblyUnit), items: itemsEnriched, componentsUsed });
+    // Per-UNIT component traceability — which specific serialized component
+    // went into which specific finished unit (e.g. "PACE R Unit #1 used MCB
+    // serial cc12345"). Only rows with a consumed_serial_unit_id qualify;
+    // ordinary (non-serial or serial-coverage-incomplete) rows contribute
+    // nothing here since there's no specific unit to name.
+    const serialUnitIds = [...new Set(itemsEnriched.map(i => i.consumedSerialUnitId).filter(Boolean))];
+    const serialUnits = serialUnitIds.length ? await req.db('inv_purchase_serial_units').whereIn('id', serialUnitIds) : [];
+    const serialUnitById = Object.fromEntries(serialUnits.map(u => [u.id, u]));
+    const componentIds = [...new Set(itemsEnriched.map(i => i.componentItemId))];
+    const components = componentIds.length ? await req.db('inv_items').whereIn('id', componentIds) : [];
+    const componentNameById = Object.fromEntries(components.map(c => [c.id, c.name]));
+
+    const unitsWithComponents = units.map(u => ({
+      ...mapAssemblyUnit(u),
+      componentsUsed: itemsEnriched
+        .filter(i => i.assemblyUnitId === u.id && i.consumedSerialUnitId)
+        .map(i => ({
+          componentItemId: i.componentItemId,
+          componentItemName: componentNameById[i.componentItemId] || null,
+          serialNumber: serialUnitById[i.consumedSerialUnitId]?.serial_number || null,
+        })),
+    }));
+
+    res.json({ ...mapAssembly(asm), units: unitsWithComponents, items: itemsEnriched, componentsUsed });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -360,6 +384,24 @@ router.post('/assemblies', async (req, res) => {
       let totalComponentCost = 0;
       const distributionByComponent = {}; // item.id -> per-unit [{lotId, quantity}] arrays
 
+      // Per-component serial-unit queues, for components that are
+      // serial_tracked AND have enough unused inv_purchase_serial_units to
+      // cover this ENTIRE build. All-or-nothing per component: mixing
+      // serial-linked and generic lot-quantity rows within the same build
+      // risks double-counting a component's consumed quantity, so a
+      // component with incomplete serial coverage (e.g. older stock that
+      // predates it being marked serial_tracked, not yet backfilled via
+      // POST /inventory/items/:id/serial-units) falls back to the ordinary
+      // per-lot rows for the whole build instead.
+      const serialQueueByComponent = {};
+      const usedSerialUnitIds = [];
+      for (const { item, required } of requirements) {
+        if (!item.serial_tracked) continue;
+        const available = await trx('inv_purchase_serial_units')
+          .where({ item_id: item.id, is_used: false }).orderBy('unit_number', 'asc');
+        if (available.length >= Math.round(required)) serialQueueByComponent[item.id] = available;
+      }
+
       // Consume stock FIFO for each component, then work out — from that
       // SAME result, not a re-guessed re-query — exactly which lot(s) each
       // individual unit's share actually came from (see
@@ -421,8 +463,29 @@ router.post('/assemblies', async (req, res) => {
         // Per-unit component traceability: use this unit's actual share of
         // the FIFO consumption recorded above — one row per lot it was
         // really drawn from, which may be more than one if its share
-        // straddled a lot boundary.
-        for (const { item } of requirements) {
+        // straddled a lot boundary. Serial-tracked components with full
+        // serial coverage (serialQueueByComponent) instead get one row PER
+        // PHYSICAL SERIALIZED PIECE, so exactly which unit went where is
+        // recorded — see the queue-building comment above for the
+        // all-or-nothing rule this depends on.
+        for (const { item, quantityPerUnit } of requirements) {
+          const serialQueue = serialQueueByComponent[item.id];
+          if (serialQueue) {
+            const needed = Math.round(quantityPerUnit);
+            for (let k = 0; k < needed; k++) {
+              const serialUnit = serialQueue.shift();
+              await trx('mfg_assembly_items').insert({
+                id: 'ai_' + unitId + '_' + item.id.slice(-6) + '_s' + k,
+                assembly_id: assemblyId, assembly_unit_id: unitId,
+                component_item_id: item.id,
+                consumed_lot_id: serialUnit.lot_id || null,
+                quantity: 1,
+                consumed_serial_unit_id: serialUnit.id,
+              });
+              usedSerialUnitIds.push(serialUnit.id);
+            }
+            continue;
+          }
           const rowsForThisUnit = distributionByComponent[item.id][i - 1] || [];
           for (const [rowIdx, { lotId, quantity }] of rowsForThisUnit.entries()) {
             await trx('mfg_assembly_items').insert({
@@ -434,6 +497,10 @@ router.post('/assemblies', async (req, res) => {
             });
           }
         }
+      }
+
+      if (usedSerialUnitIds.length) {
+        await trx('inv_purchase_serial_units').whereIn('id', usedSerialUnitIds).update({ is_used: true });
       }
     });
 

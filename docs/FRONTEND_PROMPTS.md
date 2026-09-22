@@ -1266,3 +1266,37 @@ GET /api/:slug/crm/customer-purchase-orders/:id/history
 On the customer PO detail/history view (the expandable row mentioned in the existing endpoint's
 own comment), show each sale's line items with their serial numbers — this is what lets you
 answer "which physical unit did we send this customer" directly from the PO screen.
+
+---
+
+## 24. CAJO Traceability — which serialized component built which specific assembly unit
+
+**Status: backend built. Read the coverage caveat below before implementing — it changes what
+you should expect to see on already-existing (older) assemblies vs newly-built ones.**
+
+```
+GET /api/:slug/manufacturing/assemblies/:id
+  Each entry in `units` now also includes:
+    componentsUsed: [{ componentItemId, componentItemName, serialNumber }]
+  This is PER UNIT (e.g. "PACE R Unit #1" specifically), distinct from the existing top-level
+  `componentsUsed` array on the response (which stays as the aggregate/total-used-per-component
+  summary — unchanged, still there).
+```
+
+**Coverage caveat — why some units may show an empty `componentsUsed`:** this is recorded at
+BUILD time, per component, all-or-nothing. When an assembly is built, for each BOM component
+that's `serial_tracked`, the system checks whether there are enough unused serialized units
+(from `inv_purchase_serial_units`, see Prompts 21/23) on hand to cover the WHOLE build. If yes,
+every unit gets exact serial linkage for that component. If no (e.g. that component was only
+recently marked serial_tracked and its older stock hasn't been backfilled with serial numbers
+yet — see Prompt 23's manual "Add Serial Number" flow), that component falls back to ordinary
+(non-serial) tracking for that entire build, and `componentsUsed` simply won't include it for
+those units. Bottom line: to get full per-unit component traceability going forward, make sure
+a serial-tracked component's on-hand stock is fully covered by `inv_purchase_serial_units` rows
+(backfill via Prompt 23's manual add if needed) BEFORE building assemblies that use it — this
+can't be retroactively reconstructed for assemblies already built before that backfill.
+
+On the Traceability page (Prompt 21), in the unit detail box where a serial is assigned to a
+unit (e.g. "PACE R Unit #1"), add a small "Components used" list below it — one row per entry
+in that unit's `componentsUsed`, showing the component's name and its serial number. Omit the
+section entirely (or show "No serialized components recorded") when the array is empty.

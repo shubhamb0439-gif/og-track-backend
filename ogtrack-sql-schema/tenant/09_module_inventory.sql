@@ -158,6 +158,11 @@ CREATE TABLE dbo.inv_purchase_serial_units (
     purchase_item_id    NVARCHAR(64)   NULL,
     unit_number         INT            NOT NULL,
     serial_number       NVARCHAR(100)  NULL,
+    -- Set true once this specific unit has been consumed into a
+    -- manufactured assembly (see mfg_assembly_items.consumed_serial_unit_id)
+    -- — mirrors mfg_assembly_units.sold, just for the "consumed as a
+    -- component" side rather than "sold as a finished product" side.
+    is_used             BIT            NOT NULL DEFAULT 0,
     created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO

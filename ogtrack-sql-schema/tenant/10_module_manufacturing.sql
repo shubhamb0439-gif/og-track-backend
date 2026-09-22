@@ -69,13 +69,23 @@ CREATE INDEX IX_mfg_assembly_units_assembly ON dbo.mfg_assembly_units(assembly_i
 GO
 
 CREATE TABLE dbo.mfg_assembly_items (
-    id                  NVARCHAR(64)   NOT NULL PRIMARY KEY,
-    assembly_id         NVARCHAR(64)   NOT NULL,
-    assembly_unit_id    NVARCHAR(64)   NULL,
-    component_item_id   NVARCHAR(64)   NOT NULL,
-    consumed_lot_id     NVARCHAR(64)   NOT NULL,
-    quantity            DECIMAL(14,2)  NOT NULL,
-    consumed_unit_id    NVARCHAR(64)   NULL
+    id                      NVARCHAR(64)   NOT NULL PRIMARY KEY,
+    assembly_id             NVARCHAR(64)   NOT NULL,
+    assembly_unit_id        NVARCHAR(64)   NULL,
+    component_item_id       NVARCHAR(64)   NOT NULL,
+    -- Nullable: a row for a serial-tracked component whose specific serial
+    -- unit had no recorded lot (e.g. added manually via
+    -- POST /inventory/items/:id/serial-units, predating any purchase lot).
+    consumed_lot_id         NVARCHAR(64)   NULL,
+    quantity                DECIMAL(14,2)  NOT NULL,
+    consumed_unit_id        NVARCHAR(64)   NULL,
+    -- The SPECIFIC serialized component unit (dbo.inv_purchase_serial_units)
+    -- consumed into this row's assembly_unit_id — only set when the
+    -- component is serial_tracked AND enough serial units were available to
+    -- cover the whole build (see POST /assemblies for the all-or-nothing-
+    -- per-component rule). NULL for ordinary non-serial components, and for
+    -- serial-tracked components built before serial coverage existed.
+    consumed_serial_unit_id NVARCHAR(64)   NULL
 );
 GO
 CREATE INDEX IX_mfg_assembly_items_assembly ON dbo.mfg_assembly_items(assembly_id);
@@ -111,6 +121,8 @@ GO
 ALTER TABLE dbo.mfg_assembly_items ADD CONSTRAINT FK_mfg_ai_comp FOREIGN KEY (component_item_id) REFERENCES dbo.inv_items(id);
 GO
 ALTER TABLE dbo.mfg_assembly_items ADD CONSTRAINT FK_mfg_ai_lot FOREIGN KEY (consumed_lot_id) REFERENCES dbo.inv_stock_lots(id);
+GO
+ALTER TABLE dbo.mfg_assembly_items ADD CONSTRAINT FK_mfg_ai_serial_unit FOREIGN KEY (consumed_serial_unit_id) REFERENCES dbo.inv_purchase_serial_units(id);
 GO
 
 -- User FKs
