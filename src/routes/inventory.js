@@ -47,6 +47,7 @@ const mapPurchase = (r) => r && ({
   id: r.id, poNumber: r.po_number, vendorId: r.vendor_id, status: r.status,
   orderDate: r.order_date, expectedDate: r.expected_date,
   receivedDate: r.received_date, invoiceNumber: r.invoice_number,
+  currency: r.currency,
   notes: r.notes, createdBy: r.created_by,
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
@@ -436,7 +437,7 @@ router.get('/purchases/:id', async (req, res) => {
 
 router.post('/purchases', async (req, res) => {
   try {
-    const { poNumber, vendorId, orderDate, expectedDate, invoiceNumber, notes, lines } = req.body;
+    const { poNumber, vendorId, orderDate, expectedDate, invoiceNumber, currency, notes, lines } = req.body;
     if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'At least one line item is required' });
     if (!vendorId) return res.status(400).json({ error: 'vendorId is required' });
     const vendor = await req.db('inv_vendors').where({ id: vendorId }).first();
@@ -447,6 +448,10 @@ router.post('/purchases', async (req, res) => {
       id, po_number: poNumber || null, vendor_id: vendorId, status: 'pending',
       order_date: orderDate || new Date(), expected_date: expectedDate || null,
       invoice_number: invoiceNumber || null,
+      // Defaults to the vendor's own currency, but selectable/overridable per
+      // PO — the same vendor can still be paid in a different currency on a
+      // given order.
+      currency: currency || vendor.currency || 'INR',
       notes: notes || null, created_by: req.user?.userId || null,
     });
     for (const line of lines) {
@@ -480,6 +485,7 @@ router.patch('/purchases/:id', async (req, res) => {
     if (b.notes !== undefined) updates.notes = b.notes;
     if (b.expectedDate !== undefined) updates.expected_date = b.expectedDate;
     if (b.invoiceNumber !== undefined) updates.invoice_number = b.invoiceNumber;
+    if (b.currency !== undefined) updates.currency = b.currency;
     // Manual override — /receive and /receive-lines already auto-stamp this to
     // "now" when a purchase is marked received, but the Edit Purchase modal
     // needs to let someone correct it to the real delivery date after the fact.

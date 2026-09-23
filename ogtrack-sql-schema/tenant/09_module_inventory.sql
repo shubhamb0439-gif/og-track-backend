@@ -81,6 +81,10 @@ CREATE TABLE dbo.inv_purchases (
     expected_date   DATE           NULL,
     received_date   DATE           NULL,
     invoice_number  NVARCHAR(100)  NULL,
+    -- ISO 4217 code (USD, EUR, INR, ...) — not CHECK-constrained (same as
+    -- inv_vendors.currency) since the full ISO list is ~180 codes; the
+    -- frontend dropdown is what limits it to real currency codes.
+    currency        NVARCHAR(10)   NOT NULL DEFAULT 'INR',
     notes           NVARCHAR(MAX)  NULL,
     created_by      NVARCHAR(64)   NULL,
     created_at      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),

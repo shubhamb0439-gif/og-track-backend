@@ -169,6 +169,7 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   if (scriptsNeeded.has('09_module_inventory.sql')) orderedScripts.push('patch_03_inventory_optional_po_and_vendor.sql');
   if (scriptsNeeded.has('09_module_inventory.sql')) orderedScripts.push('patch_10_inv_purchase_serial_units.sql');
   if (scriptsNeeded.has('09_module_inventory.sql')) orderedScripts.push('patch_12_inv_psu_lot_nullable.sql');
+  if (scriptsNeeded.has('09_module_inventory.sql')) orderedScripts.push('patch_14_inv_purchases_currency.sql');
   if (scriptsNeeded.has('10_module_manufacturing.sql')) orderedScripts.push('patch_13_mfg_component_serial_traceability.sql');
   if (scriptsNeeded.has('12_module_test_cases.sql')) orderedScripts.push('patch_06_test_cases_precondition_and_bugged_columns.sql');
   if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('patch_08_sitara_customer_city.sql');
