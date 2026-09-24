@@ -250,9 +250,13 @@ function createAidaRouter({ requireAuth, buildContext }) {
 
   // GET /models — the provider/model dropdown's data source (AIDA roadmap
   // item 1). Single source of truth: the frontend never hardcodes this list.
+  // A provider is "configured" when its own `<name>ApiKey` field in
+  // config.aida is set — generic by naming convention so adding a new
+  // provider (see providerApiKey below) never needs a change here.
+  const providerApiKey = (name) => config.aida[`${name}ApiKey`];
   router.get('/models', (req, res) => {
     res.json({
-      providers: Object.keys(config.aida.models).filter((p) => (p === 'openai' ? config.aida.openaiApiKey : config.aida.anthropicApiKey)),
+      providers: Object.keys(config.aida.models).filter(providerApiKey),
       models: config.aida.models,
       default: { provider: config.aida.provider, model: config.aida.model },
     });
@@ -260,7 +264,7 @@ function createAidaRouter({ requireAuth, buildContext }) {
 
   // POST /chat — the one endpoint the conversation UI talks to.
   // Body: { message: string, pageContext?: { page, module, route, activeEntity },
-  //         provider?: 'anthropic'|'openai', model?: string }
+  //         provider?: string, model?: string }
   // provider/model are optional per-message overrides — omit both to use the
   // server's configured default, exactly as before this existed.
   router.post('/chat', async (req, res) => {
@@ -270,11 +274,11 @@ function createAidaRouter({ requireAuth, buildContext }) {
         return res.status(400).json({ error: 'message is required' });
       }
       if (provider !== undefined) {
-        if (!['anthropic', 'openai'].includes(provider)) {
-          return res.status(400).json({ error: `provider must be one of: anthropic, openai` });
+        const knownProviders = Object.keys(config.aida.models);
+        if (!knownProviders.includes(provider)) {
+          return res.status(400).json({ error: `provider must be one of: ${knownProviders.join(', ')}` });
         }
-        const providerKey = provider === 'openai' ? config.aida.openaiApiKey : config.aida.anthropicApiKey;
-        if (!providerKey) {
+        if (!providerApiKey(provider)) {
           return res.status(400).json({ error: `AIDA isn't configured for ${provider} on this server yet.` });
         }
       }

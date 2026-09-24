@@ -76,6 +76,25 @@ function toOpenAITools(context) {
   }));
 }
 
+/**
+ * Gemini function-calling schema — a single tools[0].functionDeclarations
+ * array (not one tools entry per function, unlike Anthropic/OpenAI), per
+ * Google's documented request shape. Returns undefined (not []) when there
+ * are no tools, since Gemini's API expects the `tools` field to be omitted
+ * entirely rather than an empty array.
+ */
+function toGeminiTools(context) {
+  const available = listAvailableTools(context);
+  if (!available.length) return undefined;
+  return [{
+    functionDeclarations: available.map((t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: t.inputSchema,
+    })),
+  }];
+}
+
 // Some underlying OG Track endpoints return an entire table with no limit
 // (e.g. inventory items for a company with 900+ rows is ~400KB of JSON,
 // ~100k tokens — found by testing against real Cajo data, and it blew past
@@ -138,4 +157,4 @@ function _reset() {
   tools.clear();
 } // test-only escape hatch
 
-module.exports = { registerTool, registerTools, listAvailableTools, toAnthropicTools, toOpenAITools, executeTool, _reset };
+module.exports = { registerTool, registerTools, listAvailableTools, toAnthropicTools, toOpenAITools, toGeminiTools, executeTool, _reset };

@@ -65,9 +65,13 @@ module.exports = {
   // tenant even if AIDA hasn't been configured yet. Routes check
   // config.aida.enabled themselves and return 503 rather than crashing here.
   //
-  // Provider is picked via AIDA_PROVIDER ('anthropic' | 'openai', defaults to
-  // anthropic) — src/aida/engine.js dispatches to the matching adapter under
-  // src/aida/providers/. Only that provider's API key needs to be set.
+  // Provider is picked via AIDA_PROVIDER (one of 'anthropic' | 'openai' |
+  // 'groq' | 'openrouter' | 'gemini', defaults to anthropic) — src/aida/
+  // engine.js dispatches to the matching adapter under src/aida/providers/.
+  // This only sets the PROCESS-WIDE default; any of the five can also be
+  // picked per-request (see POST /chat's provider/model fields). Only
+  // whichever provider(s) actually have their own API key set are usable —
+  // GET /aida/models' `providers` list filters to those automatically.
   aida: (() => {
     const provider = (process.env.AIDA_PROVIDER || 'anthropic').toLowerCase();
     // Both keys are kept available regardless of which provider is the
@@ -79,12 +83,26 @@ module.exports = {
     // config.aida.enabled gate below).
     const anthropicApiKey = process.env.ANTHROPIC_API_KEY || null;
     const openaiApiKey = process.env.OPENAI_API_KEY || null;
+    // Groq/OpenRouter/Gemini keys don't exist in any environment yet (added
+    // 2026-09-24, code-first per explicit instruction) — these will read
+    // null until the corresponding env var is actually set, at which point
+    // `enabled` in GET /aida/models' `providers` filter picks them up
+    // automatically, no further code change needed.
+    const groqApiKey = process.env.GROQ_API_KEY || null;
+    const openrouterApiKey = process.env.OPENROUTER_API_KEY || null;
+    const geminiApiKey = process.env.GEMINI_API_KEY || null;
     const apiKey = provider === 'openai' ? openaiApiKey : anthropicApiKey;
     // Per-provider defaults, independent of whichever provider is the
     // process-wide default — config.aida.model (below) can hold an OpenAI
     // model name while provider='openai' is the default, so a per-message
     // override to 'anthropic' must NOT fall back to that value.
-    const defaultModels = { anthropic: 'claude-sonnet-5', openai: 'gpt-4o' };
+    const defaultModels = {
+      anthropic: 'claude-sonnet-5',
+      openai: 'gpt-4o',
+      groq: 'llama-3.3-70b-versatile',
+      openrouter: 'moonshotai/kimi-k2',
+      gemini: 'gemini-3.8-flash',
+    };
     const defaultModel = defaultModels[provider];
     return {
       provider,
@@ -92,14 +110,20 @@ module.exports = {
       apiKey,
       anthropicApiKey,
       openaiApiKey,
+      groqApiKey,
+      openrouterApiKey,
+      geminiApiKey,
       model: process.env.AIDA_MODEL || defaultModel,
       defaultModels,
       // Selectable models per provider — what the chat UI's provider/model
-      // dropdown offers (AIDA roadmap item 1). Both lists confirmed live
-      // against each provider's own API on 2026-09-24 (GET /v1/models for
-      // OpenAI, a real chat completion round-trip for gpt-6-astra
-      // specifically since its naming looked unusual enough to verify
-      // rather than trust) — not guessed from training-data knowledge.
+      // dropdown offers (AIDA roadmap item 1). Anthropic + OpenAI lists
+      // confirmed live via a real API round-trip on 2026-09-24 (see
+      // providers/openai.js's history). Groq/OpenRouter/Gemini lists were
+      // sourced from each provider's own live docs the same day but NOT yet
+      // round-tripped against a real key (none exists yet — these were
+      // built ahead of getting the keys, per explicit instruction). Treat
+      // these three lists as "best known as of build time, not hands-on
+      // verified" until someone actually adds the real keys and confirms.
       models: {
         anthropic: [
           { id: 'claude-sonnet-5', label: 'Sonnet 5' },
@@ -113,6 +137,32 @@ module.exports = {
           { id: 'gpt-5', label: 'GPT-5' },
           { id: 'gpt-5-mini', label: 'GPT-5 Mini' },
           { id: 'gpt-6-astra', label: 'GPT-6 Astra' },
+        ],
+        // Free tier available (rate-limited) — hosts open-weight models,
+        // OpenAI-compatible API. Confirmed against console.groq.com/docs/models.
+        groq: [
+          { id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B' },
+          { id: 'llama-3.1-8b-instant', label: 'Llama 3.1 8B (fast)' },
+          { id: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B' },
+          { id: 'openai/gpt-oss-20b', label: 'GPT-OSS 20B (fast)' },
+        ],
+        // One key, many underlying providers — includes Kimi (Moonshot),
+        // DeepSeek, Llama, and several genuinely free-tier models. OpenAI-
+        // compatible API. Some model ids on OpenRouter have a ":free" variant
+        // when the underlying provider sponsors one — check openrouter.ai/models
+        // for current availability before relying on that for a specific id.
+        openrouter: [
+          { id: 'moonshotai/kimi-k2', label: 'Kimi K2 (Moonshot)' },
+          { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' },
+          { id: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B' },
+        ],
+        // NOT OpenAI-compatible — has its own real adapter (providers/gemini.js).
+        // Has a genuinely free tier (rate-limited). Confirmed against
+        // ai.google.dev/gemini-api/docs/models.
+        gemini: [
+          { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+          { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite' },
+          { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro (Preview)' },
         ],
       },
       maxToolIterations: parseInt(process.env.AIDA_MAX_TOOL_ITERATIONS || '4', 10),

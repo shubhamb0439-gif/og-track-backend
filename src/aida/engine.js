@@ -1,7 +1,13 @@
 const config = require('../config');
-const anthropicProvider = require('./providers/anthropic');
-const openaiProvider = require('./providers/openai');
 const { BASELINE_PROMPT_LINE, AVOID_OPENERS_LINE } = require('./personality');
+
+const PROVIDERS = {
+  anthropic: require('./providers/anthropic'),
+  openai: require('./providers/openai'),
+  groq: require('./providers/groq'),
+  openrouter: require('./providers/openrouter'),
+  gemini: require('./providers/gemini'),
+};
 
 /** First handful of words of the assistant's most recent reply in this conversation, or null if there isn't one. */
 function lastAssistantOpener(history) {
@@ -91,13 +97,15 @@ function buildSystemPrompt(context, { history, directive } = {}) {
 
 // providerName is an optional per-conversation override (AIDA roadmap item
 // 1) — falls back to config.aida.provider (the process-wide default) when
-// absent, exactly as before.
+// absent, exactly as before. Falls back to 'anthropic' for anything
+// unrecognized too, same as the original openai-or-anthropic check did.
 function resolveProviderName(providerName) {
-  return (providerName || config.aida.provider || '').toLowerCase() === 'openai' ? 'openai' : 'anthropic';
+  const name = (providerName || config.aida.provider || '').toLowerCase();
+  return PROVIDERS[name] ? name : 'anthropic';
 }
 
 function getProvider(providerName) {
-  return resolveProviderName(providerName) === 'openai' ? openaiProvider : anthropicProvider;
+  return PROVIDERS[resolveProviderName(providerName)];
 }
 
 // Resolves what a turn will ACTUALLY run on before the provider call is made

@@ -1556,14 +1556,28 @@ sales numbers.
 
 ## 30. AIDA — pick the LLM provider and model per conversation
 
-**Status: backend built (2026-09-24), not yet wired into any frontend.**
+**Status: backend built AND frontend implemented (2026-09-24, confirmed done in both
+`index.html` and `masteradmin.html`) for Anthropic + OpenAI. Backend support for 3 MORE
+providers (Groq, OpenRouter, Gemini) was added the same day, code-complete but with no API
+keys configured yet — see the note below. No frontend change needed for these three: the
+existing dropdown already renders whatever `GET /aida/models` returns, so they'll just appear
+once their keys are added server-side.**
 
-**Why this exists:** AIDA can now run a turn on Anthropic OR OpenAI, and on a specific model
-within whichever provider is picked, instead of always using one fixed model baked into the
+**Why this exists:** AIDA can now run a turn on any of 5 providers, and on a specific model
+within whichever one is picked, instead of always using one fixed model baked into the
 server's environment config. This is a manual, per-request choice for now — there's no
 automatic "use GPT for X, Claude for Y" routing, and no per-user persistence yet (the picked
 provider/model applies only to the request it's sent with — treat it as a plain in-memory
 selection in the chat UI's state, not something that needs to survive a page reload yet).
+
+**Note on Groq/OpenRouter/Gemini specifically:** none of the three have an API key configured
+in any environment yet, so `GET /models`' `providers` array won't include them until that
+happens (it filters to only providers with a real key set — see below). Groq and OpenRouter
+have free tiers; OpenRouter's single key is also the easiest way to get Kimi K2 (Moonshot AI)
+without a dedicated integration. Their model lists were sourced from each provider's own live
+docs on 2026-09-24 but NOT hands-on tested against a real key yet (unlike Anthropic/OpenAI's
+lists, which were verified with a real API round-trip) — treat the exact model ids as
+best-known-at-build-time until someone adds real keys and confirms them.
 
 ```
 GET /api/:slug/aida/models   (also mounted for masteradmin's AIDA router the same way)
@@ -1582,6 +1596,22 @@ GET /api/:slug/aida/models   (also mounted for masteradmin's AIDA router the sam
           { id: "gpt-5", label: "GPT-5" },
           { id: "gpt-5-mini", label: "GPT-5 Mini" },
           { id: "gpt-6-astra", label: "GPT-6 Astra" }
+        ],
+        groq: [ /* only appears in `providers` once GROQ_API_KEY is set */
+          { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B" },
+          { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B (fast)" },
+          { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
+          { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B (fast)" }
+        ],
+        openrouter: [ /* only appears in `providers` once OPENROUTER_API_KEY is set */
+          { id: "moonshotai/kimi-k2", label: "Kimi K2 (Moonshot)" },
+          { id: "deepseek/deepseek-chat", label: "DeepSeek Chat" },
+          { id: "meta-llama/llama-3.3-70b-instruct", label: "Llama 3.3 70B" }
+        ],
+        gemini: [ /* only appears in `providers` once GEMINI_API_KEY is set */
+          { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+          { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite" },
+          { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (Preview)" }
         ]
       },
       default: { provider: "anthropic", model: "claude-sonnet-5" }   // whatever this server's env defaults to
