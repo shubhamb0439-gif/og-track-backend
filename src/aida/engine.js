@@ -92,14 +92,29 @@ function buildSystemPrompt(context, { history, directive } = {}) {
 // providerName is an optional per-conversation override (AIDA roadmap item
 // 1) — falls back to config.aida.provider (the process-wide default) when
 // absent, exactly as before.
+function resolveProviderName(providerName) {
+  return (providerName || config.aida.provider || '').toLowerCase() === 'openai' ? 'openai' : 'anthropic';
+}
+
 function getProvider(providerName) {
-  const name = (providerName || config.aida.provider || '').toLowerCase();
-  return name === 'openai' ? openaiProvider : anthropicProvider;
+  return resolveProviderName(providerName) === 'openai' ? openaiProvider : anthropicProvider;
+}
+
+// Resolves what a turn will ACTUALLY run on before the provider call is made
+// — the caller (routes/aida.js) echoes this back in the response and the
+// server log, since asking the LLM itself "which model are you" is not a
+// reliable way to confirm it (the system prompt never tells it, and a model
+// will happily self-identify based on its own training either way).
+function resolveProviderAndModel(providerName, model) {
+  const provider = resolveProviderName(providerName);
+  return { provider, model: model || config.aida.defaultModels[provider] };
 }
 
 async function runTurn(context, userMessage, history, directive, options = {}) {
   const system = buildSystemPrompt(context, { history, directive });
-  return getProvider(options.provider).runTurn({ system, history, userMessage, context, model: options.model });
+  const { provider, model } = resolveProviderAndModel(options.provider, options.model);
+  const result = await getProvider(provider).runTurn({ system, history, userMessage, context, model });
+  return { ...result, provider, model };
 }
 
 /**
@@ -126,12 +141,12 @@ async function runTurn(context, userMessage, history, directive, options = {}) {
  */
 async function runTurnStream(context, userMessage, history, hooks = {}) {
   const system = buildSystemPrompt(context, { history, directive: hooks.directive });
-  const provider = getProvider(hooks.provider);
-  const model = hooks.model;
+  const { provider: providerName, model } = resolveProviderAndModel(hooks.provider, hooks.model);
+  const provider = getProvider(providerName);
 
   if (!provider.runTurnStream) {
     const result = await provider.runTurn({ system, history, userMessage, context, model });
-    return { ...result, streamed: false };
+    return { ...result, provider: providerName, model, streamed: false };
   }
 
   let anyDelta = false;
@@ -147,17 +162,17 @@ async function runTurnStream(context, userMessage, history, hooks = {}) {
       onFirstToken: hooks.onFirstToken,
       signal: hooks.signal,
     });
-    return { ...result, streamed: true };
+    return { ...result, provider: providerName, model, streamed: true };
   } catch (e) {
     if (e.name === 'AbortError') throw e; // interruption — the caller (routes/aida.js) treats this as a clean stop, not a failure
     if (anyDelta) {
       console.error('[aida] streaming reply failed mid-stream:', e);
-      return { reply: '', toolCalls: [], streamed: true, degraded: true };
+      return { reply: '', toolCalls: [], provider: providerName, model, streamed: true, degraded: true };
     }
     console.error('[aida] streaming reply failed before any output, falling back to non-streaming:', e);
     const fallback = await provider.runTurn({ system, history, userMessage, context, model });
-    return { ...fallback, streamed: false, degraded: true };
+    return { ...fallback, provider: providerName, model, streamed: false, degraded: true };
   }
 }
 
-module.exports = { runTurn, runTurnStream, buildSystemPrompt };
+module.exports = { runTurn, runTurnStream, buildSystemPrompt, resolveProviderAndModel };

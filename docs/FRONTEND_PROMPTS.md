@@ -1599,6 +1599,16 @@ POST /api/:slug/aida/chat   (also masteradmin's AIDA chat endpoint — same shap
     - { error: "provider must be one of: anthropic, openai" }
     - { error: "AIDA isn't configured for openai on this server yet." }  (key not configured)
     - { error: "model must be one of: claude-sonnet-5, claude-opus-5, ... (for provider \"anthropic\")" }
+
+  → 200 response now ALSO includes: { reply, toolCalls, provider, model, ... }
+    `provider`/`model` here are the ACTUAL ones the server resolved and ran this turn on —
+    not just an echo of what you sent. This is the only reliable way to confirm which model
+    answered a given message: don't trust the reply text itself (asking AIDA "which model are
+    you" is not reliable — it'll self-identify based on its own training, not on server state,
+    and can be wrong or inconsistent turn to turn). Show this next to each AIDA reply, even
+    subtly (e.g. a small caption under the message bubble: "Sonnet 5" / "GPT-4o" — map the
+    returned `model` id to its `label` from `GET /models`' list) — this was a real gap users hit:
+    picking a model in the UI with no way to confirm afterward that it was actually used.
 ```
 
 **Frontend prompt:** in the AIDA chat UI — masteradmin's AIDA panel first, tenant-facing AIDA
@@ -1613,3 +1623,8 @@ No need to persist the choice anywhere (session storage, backend, etc.) for this
 fine if it resets to the server default on a fresh page load. If a chat request comes back with
 one of the 400 errors above, surface it as a small inline notice near the dropdown (not a
 generic "message failed" toast), since it means the selection itself is the problem.
+Additionally, render the response's `provider`/`model` fields as a small caption under (or
+next to) each AIDA reply bubble, using the matching `label` from `GET /models`, so the user can
+always confirm afterward which model actually generated a given reply — the dropdown selection
+alone isn't proof of that, since a request can silently fail validation, fall back, or be sent
+before a selection change is applied.

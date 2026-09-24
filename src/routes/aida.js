@@ -5,7 +5,7 @@ const { requireTenantAidaAuth, requireMasterAdminAidaAuth } = require('../aida/a
 const { buildTenantContext, buildMasterAdminContext } = require('../aida/contextBuilder');
 const { registerAllTools } = require('../aida/tools');
 const { listAvailableTools } = require('../aida/toolRegistry');
-const { runTurn, runTurnStream } = require('../aida/engine');
+const { runTurn, runTurnStream, resolveProviderAndModel } = require('../aida/engine');
 const sessionMemory = require('../aida/sessionMemory');
 const jobStore = require('../aida/jobs/jobStore');
 const jobRunner = require('../aida/jobs/jobRunner');
@@ -130,7 +130,8 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
   // internal-only id never exposed in the response — the response contract
   // for non-voice chat is unchanged, this is purely for the server log.
   const logTurnId = turnId ?? `text_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const timer = pre?.timer ?? createTurnTimer(logTurnId, { provider: llmProvider || config.aida.provider, streaming: useStreaming, voice: wantsVoice });
+  const resolved = resolveProviderAndModel(llmProvider, llmModel);
+  const timer = pre?.timer ?? createTurnTimer(logTurnId, { provider: resolved.provider, model: resolved.model, streaming: useStreaming, voice: wantsVoice });
   // Computed for EVERY turn now, not just voice ones — the emotion classification
   // also shapes word choice/tone in the actual text reply (see engine.js's
   // system prompt), not just TTS delivery, so a text-only chat benefits too.
@@ -198,7 +199,7 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
       // cancellation check that no longer sees the turn as cancelled.
       if (speaker) speaker.finish().catch(() => {});
       else if (wantsVoice) voiceSession.releaseTurn(turnId);
-      return { reply: '', toolCalls: [], turnId, interrupted: true };
+      return { reply: '', toolCalls: [], turnId, interrupted: true, provider: resolved.provider, model: resolved.model };
     }
     if (wantsVoice) voiceSession.releaseTurn(turnId);
     throw e;
@@ -287,7 +288,10 @@ function createAidaRouter({ requireAuth, buildContext }) {
       const context = buildContext(req);
       const wantsVoice = voice === true && config.aida.voice.enabled;
 
-      const { reply, toolCalls, turnId, interrupted, degraded } = await runConversationTurn({
+      const {
+        reply, toolCalls, turnId, interrupted, degraded,
+        provider: usedProvider, model: usedModel,
+      } = await runConversationTurn({
         req, context, userMessage: message.trim(), wantsVoice, llmProvider: provider, llmModel: model,
       });
 
@@ -295,7 +299,10 @@ function createAidaRouter({ requireAuth, buildContext }) {
       // (already under way by the time we get here when streaming is on),
       // and the text response is sent regardless of whether speech
       // synthesis succeeds, fails, or isn't configured at all.
-      const responseBody = { reply, toolCalls };
+      // provider/model are the ACTUAL ones this turn ran on (resolved server-side,
+      // not just an echo of the request) — the only reliable way to confirm which
+      // model answered, since the reply text itself can't be trusted for that.
+      const responseBody = { reply, toolCalls, provider: usedProvider, model: usedModel };
       if (wantsVoice) responseBody.turnId = turnId;
       if (interrupted) responseBody.interrupted = true;
       if (degraded) responseBody.degraded = true;
