@@ -95,9 +95,11 @@ module.exports = {
       model: process.env.AIDA_MODEL || defaultModel,
       defaultModels,
       // Selectable models per provider — what the chat UI's provider/model
-      // dropdown offers (AIDA roadmap item 1). Anthropic's list is the real,
-      // current model lineup; OpenAI's should be reconfirmed against the
-      // account's actual available models before relying on it long-term.
+      // dropdown offers (AIDA roadmap item 1). Both lists confirmed live
+      // against each provider's own API on 2026-09-24 (GET /v1/models for
+      // OpenAI, a real chat completion round-trip for gpt-6-astra
+      // specifically since its naming looked unusual enough to verify
+      // rather than trust) — not guessed from training-data knowledge.
       models: {
         anthropic: [
           { id: 'claude-sonnet-5', label: 'Sonnet 5' },
@@ -107,6 +109,10 @@ module.exports = {
         ],
         openai: [
           { id: 'gpt-4o', label: 'GPT-4o' },
+          { id: 'gpt-4o-mini', label: 'GPT-4o Mini' },
+          { id: 'gpt-5', label: 'GPT-5' },
+          { id: 'gpt-5-mini', label: 'GPT-5 Mini' },
+          { id: 'gpt-6-astra', label: 'GPT-6 Astra' },
         ],
       },
       maxToolIterations: parseInt(process.env.AIDA_MAX_TOOL_ITERATIONS || '4', 10),

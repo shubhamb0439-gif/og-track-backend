@@ -1577,7 +1577,11 @@ GET /api/:slug/aida/models   (also mounted for masteradmin's AIDA router the sam
           { id: "claude-fable-5-1", label: "Fable 5.1" }
         ],
         openai: [
-          { id: "gpt-4o", label: "GPT-4o" }
+          { id: "gpt-4o", label: "GPT-4o" },
+          { id: "gpt-4o-mini", label: "GPT-4o Mini" },
+          { id: "gpt-5", label: "GPT-5" },
+          { id: "gpt-5-mini", label: "GPT-5 Mini" },
+          { id: "gpt-6-astra", label: "GPT-6 Astra" }
         ]
       },
       default: { provider: "anthropic", model: "claude-sonnet-5" }   // whatever this server's env defaults to
