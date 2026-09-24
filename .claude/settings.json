@@ -19,7 +19,12 @@
       "Bash(node \"C:\\\\Users\\\\SHUBHA~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--OG-track-OG-track-updated-main-Og-track-new-ogtrack-backend-new-ogtrack-backend\\\\30e1f414-0d91-49c7-8bf0-1ce6c18c5584\\\\scratchpad\\\\repeatToolCallTest.js\")",
       "Bash(node -c src/aida/toolRegistry.js)",
       "Bash(node -c src/aida/jobs/jobKinds/devDiagnose.js)",
-      "Bash(taskkill //PID 41532 //F)"
+      "Bash(taskkill //PID 41532 //F)",
+      "Bash(node scripts/_tmp_debug_sitara_dashboard.js)",
+      "Bash(rm \"C:\\\\OG track\\\\OG track updated main\\\\Og track new\\\\ogtrack-backend-new\\\\ogtrack-backend\\\\scripts\\\\_tmp_debug_sitara_dashboard.js\")"
+    ],
+    "additionalDirectories": [
+      "C:\\OG track\\OG track updated main\\Og track new\\ogtrack-backend-new\\ogtrack-backend\\scripts"
     ]
   }
 }

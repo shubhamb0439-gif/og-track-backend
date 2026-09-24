@@ -616,20 +616,27 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
   const existing = await db('sitara_orders').where({ bigcommerce_order_id: String(bcOrderId) }).first();
   const statusChanged = !existing || existing.status !== mappedStatus;
 
+  // BigCommerce's own order date — without this, created_at defaults to
+  // whenever THIS sync happened (webhook fire, or backfill run), not the
+  // real order date. That silently broke "Sales This Month" (and any other
+  // date-based grouping): a backfilled year of historical orders all landed
+  // with a created_at of "today", making "this month" == "all time".
+  const realOrderDate = bcOrder.date_created ? new Date(bcOrder.date_created) : new Date();
+
   let orderId = existing?.id;
   if (!existing) {
     orderId = newId('sord');
     await db('sitara_orders').insert({
       id: orderId, bigcommerce_order_id: String(bcOrderId), order_number: `BC-${bcOrderId}`,
       customer_id: customerId, status: mappedStatus, total: Number(bcOrder.total_inc_tax || 0),
-      source: 'bigcommerce', status_changed_at: new Date(),
+      source: 'bigcommerce', status_changed_at: new Date(), created_at: realOrderDate,
     });
   } else {
     await db('sitara_orders').where({ id: orderId }).update({
       customer_id: customerId, status: mappedStatus, total: Number(bcOrder.total_inc_tax || 0),
       status_changed_at: statusChanged ? new Date() : existing.status_changed_at,
       flagged: statusChanged ? 0 : existing.flagged,
-      updated_at: new Date(),
+      created_at: realOrderDate, updated_at: new Date(),
     });
     await db('sitara_order_items').where({ order_id: orderId }).delete();
   }
