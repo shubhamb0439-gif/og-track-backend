@@ -81,7 +81,7 @@ function voiceTargetFor(context) {
  * turnId }) and audio still arrives over the same socket.io events — nothing
  * downstream needs to know which path ran.
  */
-async function runConversationTurn({ req, context, userMessage, wantsVoice, pre }) {
+async function runConversationTurn({ req, context, userMessage, wantsVoice, pre, llmProvider, llmModel }) {
   const history = sessionMemory.getHistory(context);
   const useStreaming = wantsVoice && config.aida.streamingEnabled;
 
@@ -130,7 +130,7 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre 
   // internal-only id never exposed in the response — the response contract
   // for non-voice chat is unchanged, this is purely for the server log.
   const logTurnId = turnId ?? `text_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const timer = pre?.timer ?? createTurnTimer(logTurnId, { provider: config.aida.provider, streaming: useStreaming, voice: wantsVoice });
+  const timer = pre?.timer ?? createTurnTimer(logTurnId, { provider: llmProvider || config.aida.provider, streaming: useStreaming, voice: wantsVoice });
   // Computed for EVERY turn now, not just voice ones — the emotion classification
   // also shapes word choice/tone in the actual text reply (see engine.js's
   // system prompt), not just TTS delivery, so a text-only chat benefits too.
@@ -180,9 +180,11 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre 
         onFirstToken: () => timer.mark('llmFirstChunk'),
         signal: controller.signal,
         directive,
+        provider: llmProvider,
+        model: llmModel,
       });
     } else {
-      result = await runTurn(context, userMessage, history, directive);
+      result = await runTurn(context, userMessage, history, directive, { provider: llmProvider, model: llmModel });
     }
   } catch (e) {
     clearTimeout(fillerTimer);
@@ -245,19 +247,48 @@ function createAidaRouter({ requireAuth, buildContext }) {
 
   router.use(requireAuth);
 
+  // GET /models — the provider/model dropdown's data source (AIDA roadmap
+  // item 1). Single source of truth: the frontend never hardcodes this list.
+  router.get('/models', (req, res) => {
+    res.json({
+      providers: Object.keys(config.aida.models).filter((p) => (p === 'openai' ? config.aida.openaiApiKey : config.aida.anthropicApiKey)),
+      models: config.aida.models,
+      default: { provider: config.aida.provider, model: config.aida.model },
+    });
+  });
+
   // POST /chat — the one endpoint the conversation UI talks to.
-  // Body: { message: string, pageContext?: { page, module, route, activeEntity } }
+  // Body: { message: string, pageContext?: { page, module, route, activeEntity },
+  //         provider?: 'anthropic'|'openai', model?: string }
+  // provider/model are optional per-message overrides — omit both to use the
+  // server's configured default, exactly as before this existed.
   router.post('/chat', async (req, res) => {
     try {
-      const { message, voice } = req.body || {};
+      const { message, voice, provider, model } = req.body || {};
       if (!message || typeof message !== 'string' || !message.trim()) {
         return res.status(400).json({ error: 'message is required' });
+      }
+      if (provider !== undefined) {
+        if (!['anthropic', 'openai'].includes(provider)) {
+          return res.status(400).json({ error: `provider must be one of: anthropic, openai` });
+        }
+        const providerKey = provider === 'openai' ? config.aida.openaiApiKey : config.aida.anthropicApiKey;
+        if (!providerKey) {
+          return res.status(400).json({ error: `AIDA isn't configured for ${provider} on this server yet.` });
+        }
+      }
+      if (model !== undefined) {
+        const effectiveProvider = provider || config.aida.provider;
+        const validModels = (config.aida.models[effectiveProvider] || []).map((m) => m.id);
+        if (!validModels.includes(model)) {
+          return res.status(400).json({ error: `model must be one of: ${validModels.join(', ')} (for provider "${effectiveProvider}")` });
+        }
       }
       const context = buildContext(req);
       const wantsVoice = voice === true && config.aida.voice.enabled;
 
       const { reply, toolCalls, turnId, interrupted, degraded } = await runConversationTurn({
-        req, context, userMessage: message.trim(), wantsVoice,
+        req, context, userMessage: message.trim(), wantsVoice, llmProvider: provider, llmModel: model,
       });
 
       // Voice is entirely additive: audio is fire-and-forget over socket.io

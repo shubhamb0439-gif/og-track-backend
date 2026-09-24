@@ -89,13 +89,17 @@ function buildSystemPrompt(context, { history, directive } = {}) {
   return contextLines.join('\n');
 }
 
-function getProvider() {
-  return config.aida.provider === 'openai' ? openaiProvider : anthropicProvider;
+// providerName is an optional per-conversation override (AIDA roadmap item
+// 1) — falls back to config.aida.provider (the process-wide default) when
+// absent, exactly as before.
+function getProvider(providerName) {
+  const name = (providerName || config.aida.provider || '').toLowerCase();
+  return name === 'openai' ? openaiProvider : anthropicProvider;
 }
 
-async function runTurn(context, userMessage, history, directive) {
+async function runTurn(context, userMessage, history, directive, options = {}) {
   const system = buildSystemPrompt(context, { history, directive });
-  return getProvider().runTurn({ system, history, userMessage, context });
+  return getProvider(options.provider).runTurn({ system, history, userMessage, context, model: options.model });
 }
 
 /**
@@ -122,10 +126,11 @@ async function runTurn(context, userMessage, history, directive) {
  */
 async function runTurnStream(context, userMessage, history, hooks = {}) {
   const system = buildSystemPrompt(context, { history, directive: hooks.directive });
-  const provider = getProvider();
+  const provider = getProvider(hooks.provider);
+  const model = hooks.model;
 
   if (!provider.runTurnStream) {
-    const result = await provider.runTurn({ system, history, userMessage, context });
+    const result = await provider.runTurn({ system, history, userMessage, context, model });
     return { ...result, streamed: false };
   }
 
@@ -137,7 +142,7 @@ async function runTurnStream(context, userMessage, history, hooks = {}) {
 
   try {
     const result = await provider.runTurnStream({
-      system, history, userMessage, context,
+      system, history, userMessage, context, model,
       onDelta: wrappedOnDelta,
       onFirstToken: hooks.onFirstToken,
       signal: hooks.signal,
@@ -150,7 +155,7 @@ async function runTurnStream(context, userMessage, history, hooks = {}) {
       return { reply: '', toolCalls: [], streamed: true, degraded: true };
     }
     console.error('[aida] streaming reply failed before any output, falling back to non-streaming:', e);
-    const fallback = await provider.runTurn({ system, history, userMessage, context });
+    const fallback = await provider.runTurn({ system, history, userMessage, context, model });
     return { ...fallback, streamed: false, degraded: true };
   }
 }

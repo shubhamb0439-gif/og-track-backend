@@ -70,13 +70,45 @@ module.exports = {
   // src/aida/providers/. Only that provider's API key needs to be set.
   aida: (() => {
     const provider = (process.env.AIDA_PROVIDER || 'anthropic').toLowerCase();
-    const apiKey = provider === 'openai' ? (process.env.OPENAI_API_KEY || null) : (process.env.ANTHROPIC_API_KEY || null);
-    const defaultModel = provider === 'openai' ? 'gpt-4o' : 'claude-sonnet-5';
+    // Both keys are kept available regardless of which provider is the
+    // process-wide default — a per-conversation override (see engine.js's
+    // getProvider(providerName)) needs to actually reach the OTHER
+    // provider's real client, not just read whichever single key happened
+    // to be selected at boot. `apiKey` stays as the default-provider's key,
+    // unchanged, for anything still reading it directly (e.g. the
+    // config.aida.enabled gate below).
+    const anthropicApiKey = process.env.ANTHROPIC_API_KEY || null;
+    const openaiApiKey = process.env.OPENAI_API_KEY || null;
+    const apiKey = provider === 'openai' ? openaiApiKey : anthropicApiKey;
+    // Per-provider defaults, independent of whichever provider is the
+    // process-wide default — config.aida.model (below) can hold an OpenAI
+    // model name while provider='openai' is the default, so a per-message
+    // override to 'anthropic' must NOT fall back to that value.
+    const defaultModels = { anthropic: 'claude-sonnet-5', openai: 'gpt-4o' };
+    const defaultModel = defaultModels[provider];
     return {
       provider,
       enabled: !!apiKey,
       apiKey,
+      anthropicApiKey,
+      openaiApiKey,
       model: process.env.AIDA_MODEL || defaultModel,
+      defaultModels,
+      // Selectable models per provider — what the chat UI's provider/model
+      // dropdown offers (AIDA roadmap item 1). Anthropic's list is the real,
+      // current model lineup; OpenAI's should be reconfirmed against the
+      // account's actual available models before relying on it long-term.
+      models: {
+        anthropic: [
+          { id: 'claude-sonnet-5', label: 'Sonnet 5' },
+          { id: 'claude-opus-5', label: 'Opus 5' },
+          { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+          { id: 'claude-fable-5-1', label: 'Fable 5.1' },
+        ],
+        openai: [
+          { id: 'gpt-4o', label: 'GPT-4o' },
+        ],
+      },
       maxToolIterations: parseInt(process.env.AIDA_MAX_TOOL_ITERATIONS || '4', 10),
       sessionTtlMs: parseInt(process.env.AIDA_SESSION_TTL_MINUTES || '120', 10) * 60 * 1000,
       maxHistoryMessages: parseInt(process.env.AIDA_MAX_HISTORY_MESSAGES || '20', 10),

@@ -1551,3 +1551,65 @@ prominent button, since this is a rare/administrative action) — calling the PA
 above. Show a subtle badge (e.g. "Excluded" or a muted icon) on any order that already has
 `excludedFromReporting: true`, so it's clear at a glance why an order isn't reflected in the
 sales numbers.
+
+---
+
+## 30. AIDA — pick the LLM provider and model per conversation
+
+**Status: backend built (2026-09-24), not yet wired into any frontend.**
+
+**Why this exists:** AIDA can now run a turn on Anthropic OR OpenAI, and on a specific model
+within whichever provider is picked, instead of always using one fixed model baked into the
+server's environment config. This is a manual, per-request choice for now — there's no
+automatic "use GPT for X, Claude for Y" routing, and no per-user persistence yet (the picked
+provider/model applies only to the request it's sent with — treat it as a plain in-memory
+selection in the chat UI's state, not something that needs to survive a page reload yet).
+
+```
+GET /api/:slug/aida/models   (also mounted for masteradmin's AIDA router the same way)
+  → 200 {
+      providers: ["anthropic", "openai"],       // only providers this server actually has a key for
+      models: {
+        anthropic: [
+          { id: "claude-sonnet-5", label: "Sonnet 5" },
+          { id: "claude-opus-5", label: "Opus 5" },
+          { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+          { id: "claude-fable-5-1", label: "Fable 5.1" }
+        ],
+        openai: [
+          { id: "gpt-4o", label: "GPT-4o" }
+        ]
+      },
+      default: { provider: "anthropic", model: "claude-sonnet-5" }   // whatever this server's env defaults to
+    }
+  Call this once when the AIDA chat panel opens, to populate the dropdown. `providers` is
+  filtered server-side to whichever provider(s) actually have an API key configured — don't
+  assume both are always present (a server with only an Anthropic key configured will return
+  `providers: ["anthropic"]` and `models` will only have that one key populated with entries;
+  render only what's in `providers`).
+
+POST /api/:slug/aida/chat   (also masteradmin's AIDA chat endpoint — same shape)
+  body: { message: string, voice?: boolean, provider?: "anthropic"|"openai", model?: string }
+  `provider` and `model` are both OPTIONAL — omit both to get this server's configured default
+  (existing behavior, unchanged for any caller that doesn't send them). If you send `model`
+  without `provider`, it's validated against the SERVER's default provider's model list, not
+  the one you might expect — always send both together once the user has picked a specific
+  model, to avoid that mismatch.
+  400 errors you should show inline near the dropdown, not as a generic chat error:
+    - { error: "provider must be one of: anthropic, openai" }
+    - { error: "AIDA isn't configured for openai on this server yet." }  (key not configured)
+    - { error: "model must be one of: claude-sonnet-5, claude-opus-5, ... (for provider \"anthropic\")" }
+```
+
+**Frontend prompt:** in the AIDA chat UI — masteradmin's AIDA panel first, tenant-facing AIDA
+chat second — add a compact two-level dropdown near the chat input (e.g. a small pill/button
+showing the current model name, opening a menu grouped by provider). On open, call
+`GET /aida/models` once and render one group per entry in `providers`, each listing that
+provider's models from `models[provider]` with their `label` (not the raw `id`) as the visible
+text. Default the selection to the `default` field from that same response. Keep the
+selection in local component state; on every `POST /chat` (and the streaming/voice call, if the
+UI supports voice) include the currently-selected `provider` and `model` in the request body.
+No need to persist the choice anywhere (session storage, backend, etc.) for this phase — it's
+fine if it resets to the server default on a fresh page load. If a chat request comes back with
+one of the 400 errors above, surface it as a small inline notice near the dropdown (not a
+generic "message failed" toast), since it means the selection itself is the problem.

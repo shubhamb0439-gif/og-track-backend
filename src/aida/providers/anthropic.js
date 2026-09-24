@@ -4,7 +4,7 @@ const { toAnthropicTools, executeTool } = require('../toolRegistry');
 
 let client = null;
 function getClient() {
-  if (!client) client = new Anthropic({ apiKey: config.aida.apiKey });
+  if (!client) client = new Anthropic({ apiKey: config.aida.anthropicApiKey || config.aida.apiKey });
   return client;
 }
 
@@ -18,14 +18,15 @@ const TIMEOUT_REPLY =
  * iteration cap. Multiple tool_use blocks in one response are executed
  * concurrently — that's what lets a single turn cover several modules.
  */
-async function runTurn({ system, history, userMessage, context }) {
+async function runTurn({ system, history, userMessage, context, model }) {
   const tools = toAnthropicTools(context);
   const messages = [...history, { role: 'user', content: userMessage }];
   const toolCallLog = [];
+  const resolvedModel = model || config.aida.defaultModels.anthropic;
 
   for (let iteration = 0; iteration < config.aida.maxToolIterations; iteration++) {
     const response = await getClient().messages.create({
-      model: config.aida.model,
+      model: resolvedModel,
       max_tokens: 1536,
       system,
       messages,
@@ -78,14 +79,15 @@ function safeParseJson(s) {
  * was generated; a failure before any text propagates so engine.js can fall
  * back to the non-streaming runTurn() with nothing lost).
  */
-async function runTurnStream({ system, history, userMessage, context, onDelta, onFirstToken, signal }) {
+async function runTurnStream({ system, history, userMessage, context, model, onDelta, onFirstToken, signal }) {
   const tools = toAnthropicTools(context);
   const messages = [...history, { role: 'user', content: userMessage }];
   const toolCallLog = [];
+  const resolvedModel = model || config.aida.defaultModels.anthropic;
 
   for (let iteration = 0; iteration < config.aida.maxToolIterations; iteration++) {
     const stream = await getClient().messages.create(
-      { model: config.aida.model, max_tokens: 1536, system, messages, tools: tools.length ? tools : undefined, stream: true },
+      { model: resolvedModel, max_tokens: 1536, system, messages, tools: tools.length ? tools : undefined, stream: true },
       { signal }
     );
 

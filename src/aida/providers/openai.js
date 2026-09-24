@@ -4,7 +4,7 @@ const { toOpenAITools, executeTool } = require('../toolRegistry');
 
 let client = null;
 function getClient() {
-  if (!client) client = new OpenAI({ apiKey: config.aida.apiKey });
+  if (!client) client = new OpenAI({ apiKey: config.aida.openaiApiKey || config.aida.apiKey });
   return client;
 }
 
@@ -18,7 +18,7 @@ const TIMEOUT_REPLY =
  * go back as separate role:'tool' messages keyed by tool_call_id — there's
  * no single "tool_result block" concept like Anthropic's.
  */
-async function runTurn({ system, history, userMessage, context }) {
+async function runTurn({ system, history, userMessage, context, model }) {
   const tools = toOpenAITools(context);
   const messages = [
     { role: 'system', content: system },
@@ -26,10 +26,11 @@ async function runTurn({ system, history, userMessage, context }) {
     { role: 'user', content: userMessage },
   ];
   const toolCallLog = [];
+  const resolvedModel = model || config.aida.defaultModels.openai;
 
   for (let iteration = 0; iteration < config.aida.maxToolIterations; iteration++) {
     const response = await getClient().chat.completions.create({
-      model: config.aida.model,
+      model: resolvedModel,
       messages,
       tools: tools.length ? tools : undefined,
     });
@@ -82,7 +83,7 @@ async function runTurn({ system, history, userMessage, context }) {
  * content was ever produced instead propagates, so engine.js can fall back
  * to the plain non-streaming runTurn() with nothing to unwind.
  */
-async function runTurnStream({ system, history, userMessage, context, onDelta, onFirstToken, signal }) {
+async function runTurnStream({ system, history, userMessage, context, model, onDelta, onFirstToken, signal }) {
   const tools = toOpenAITools(context);
   const messages = [
     { role: 'system', content: system },
@@ -90,10 +91,11 @@ async function runTurnStream({ system, history, userMessage, context, onDelta, o
     { role: 'user', content: userMessage },
   ];
   const toolCallLog = [];
+  const resolvedModel = model || config.aida.defaultModels.openai;
 
   for (let iteration = 0; iteration < config.aida.maxToolIterations; iteration++) {
     const stream = await getClient().chat.completions.create(
-      { model: config.aida.model, messages, tools: tools.length ? tools : undefined, stream: true },
+      { model: resolvedModel, messages, tools: tools.length ? tools : undefined, stream: true },
       { signal }
     );
 
