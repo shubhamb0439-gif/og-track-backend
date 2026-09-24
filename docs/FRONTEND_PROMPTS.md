@@ -1513,3 +1513,41 @@ const CURRENCIES = [
 
 Render each option as e.g. "INR — Indian Rupee". Store/send just the `code` field as the
 `currency` value.
+
+---
+
+## 29. Sitara Bespoke — mark an order excluded from sales reporting
+
+**Status: backend built, applied to the live database (2026-09-24). Root cause was NOT a backend
+double-counting bug — see the note below if you're wondering why the dashboard numbers looked
+wrong.**
+
+**Why this exists:** BC-100, 101, 102, 103, 105, 106, 107, 108 turned out to be real checkout
+tests the merchant ran on the live BigCommerce store — one of them alone (BC-101) was ₹1,97,750,
+wildly out of line with every real order. Deleting them locally didn't help — since they still
+exist on BigCommerce itself, every backfill re-created them. This flag lets an order stay fully
+visible and keep syncing normally, while being excluded from the dashboard's sales figures for
+good (it's never touched again by the BigCommerce sync, so it survives every future re-sync of
+that same order).
+
+```
+Order objects (from GET /orders, GET /orders/:id, dashboard's recentSales, create/update
+responses) now include: excludedFromReporting (boolean).
+
+PATCH /api/:slug/sitara/orders/:id/exclude-from-reporting — body: { excluded: boolean }
+  Toggles the flag. Real-time: sitara:order_updated socket event, same as every other order
+  update.
+```
+
+**What changed on the dashboard:** `GET /dashboard`'s `totalSales`, `totalSalesThisMonth`,
+`orderCount`, `pendingOrderCount`, `recentSales`, `topProducts`, and `topRegions` all now
+silently exclude any order with this flag set. The 8 known test orders above are already
+flagged in the live database — you should see the dashboard numbers correct themselves without
+any frontend change needed for that part.
+
+**Frontend prompt:** on the Orders list/detail view, add a small "Exclude from reporting"
+toggle or menu action per order (maybe tucked into a row's overflow menu rather than a
+prominent button, since this is a rare/administrative action) — calling the PATCH endpoint
+above. Show a subtle badge (e.g. "Excluded" or a muted icon) on any order that already has
+`excludedFromReporting: true`, so it's clear at a glance why an order isn't reflected in the
+sales numbers.

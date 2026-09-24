@@ -54,6 +54,7 @@ const mapOrder = (r) => r && ({
   customerId: r.customer_id, customerName: r.customer_name ?? null, customerCity: r.customer_city ?? null,
   status: r.status, total: Number(r.total || 0), source: r.source,
   statusChangedAt: r.status_changed_at, flagged: !!r.flagged, notes: r.notes,
+  excludedFromReporting: !!r.excluded_from_reporting,
   isStale: isOrderStale(r.status, r.status_changed_at),
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
@@ -1170,13 +1171,33 @@ router.patch('/orders/:id/status', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// PATCH /api/:slug/sitara/orders/:id/exclude-from-reporting — body: { excluded }
+// For a real BigCommerce order (a checkout test, etc.) the merchant can't or
+// won't delete from BigCommerce itself — it stays visible and keeps syncing
+// normally, it just stops counting toward GET /dashboard's sales figures.
+// Deliberately NOT touched by syncBigCommerceOrder's update path, so setting
+// this survives every future re-sync of the same order.
+router.patch('/orders/:id/exclude-from-reporting', async (req, res) => {
+  try {
+    const { excluded } = req.body;
+    if (typeof excluded !== 'boolean') return res.status(400).json({ error: 'excluded (boolean) is required' });
+    await req.db('sitara_orders').where({ id: req.params.id }).update({
+      excluded_from_reporting: excluded, updated_at: new Date(),
+    });
+    const saved = await ordersQuery(req.db).where({ 'sitara_orders.id': req.params.id }).first();
+    if (!saved) return res.status(404).json({ error: 'Order not found' });
+    req.io.to(req.company.slug).emit('sitara:order_updated', mapOrder(saved));
+    res.json(mapOrder(saved));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Dashboard ──────────────────────────────────────────────────────────────────
 router.get('/dashboard', async (req, res) => {
   try {
     const now = new Date();
     const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 
-    const allOrders = await req.db('sitara_orders').select('id', 'total', 'status', 'created_at');
+    const allOrders = await req.db('sitara_orders').select('id', 'total', 'status', 'created_at', 'excluded_from_reporting');
     // Only a genuinely paid/confirmed order counts as a "sale" — excludes
     // incomplete (abandoned cart, no payment ever happened), pending,
     // awaiting_payment, declined, cancelled, refunded, partially_refunded,
@@ -1185,7 +1206,10 @@ router.get('/dashboard', async (req, res) => {
       'awaiting_fulfillment', 'awaiting_shipment', 'awaiting_pickup',
       'partially_shipped', 'shipped', 'completed', 'verified',
     ];
-    const countedOrders = allOrders.filter((o) => REAL_SALE_STATUSES.includes(o.status));
+    // excluded_from_reporting: a real BigCommerce order (e.g. a checkout
+    // test) the merchant can't/won't delete from BigCommerce, so it keeps
+    // syncing — flagged out of every figure below instead.
+    const countedOrders = allOrders.filter((o) => REAL_SALE_STATUSES.includes(o.status) && !o.excluded_from_reporting);
     const totalSales = countedOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
     const monthSales = countedOrders
       .filter((o) => new Date(o.created_at) >= monthStart)
@@ -1193,7 +1217,9 @@ router.get('/dashboard', async (req, res) => {
     // Same stale-first ordering as GET /orders — pulled un-limited then cut
     // to 10 after sorting, so a stale order doesn't get pushed out of the
     // dashboard's recent list just because 10 newer orders arrived since.
-    const recentOrdersRaw = await ordersQuery(req.db).orderBy('sitara_orders.created_at', 'desc').limit(50);
+    const recentOrdersRaw = await ordersQuery(req.db)
+      .where('sitara_orders.excluded_from_reporting', false)
+      .orderBy('sitara_orders.created_at', 'desc').limit(50);
     const recentOrders = recentOrdersRaw.map(mapOrder).sort((a, b) => {
       if (a.isStale !== b.isStale) return a.isStale ? -1 : 1;
       if (a.isStale && b.isStale) return new Date(a.statusChangedAt) - new Date(b.statusChangedAt);
@@ -1209,10 +1235,12 @@ router.get('/dashboard', async (req, res) => {
     // real name and should still count; joining on product_id alone would
     // silently drop those.
     const topProducts = await req.db('sitara_order_items')
-      .select('product_name')
-      .sum('quantity as totalQuantity')
-      .sum('line_total as totalRevenue')
-      .groupBy('product_name')
+      .join('sitara_orders', 'sitara_order_items.order_id', 'sitara_orders.id')
+      .where('sitara_orders.excluded_from_reporting', false)
+      .select('sitara_order_items.product_name')
+      .sum('sitara_order_items.quantity as totalQuantity')
+      .sum('sitara_order_items.line_total as totalRevenue')
+      .groupBy('sitara_order_items.product_name')
       .orderBy('totalQuantity', 'desc')
       .limit(10);
 
@@ -1222,6 +1250,7 @@ router.get('/dashboard', async (req, res) => {
     const topRegions = await req.db('sitara_orders')
       .join('sitara_customers', 'sitara_orders.customer_id', 'sitara_customers.id')
       .whereNotNull('sitara_customers.city')
+      .where('sitara_orders.excluded_from_reporting', false)
       .select('sitara_customers.city as city')
       .count('sitara_orders.id as orderCount')
       .sum('sitara_orders.total as revenue')

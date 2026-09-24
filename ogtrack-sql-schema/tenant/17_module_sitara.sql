@@ -130,6 +130,13 @@ CREATE TABLE dbo.sitara_orders (
     -- this to flag anything stuck in the same status too long.
     status_changed_at       DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
     flagged                 BIT            NOT NULL DEFAULT 0,
+    -- Set manually, once, for an order that's real on BigCommerce (so it
+    -- keeps getting synced/updated) but shouldn't count toward sales
+    -- reporting — e.g. a checkout test the merchant ran that they can't or
+    -- don't want deleted from BigCommerce itself. Never touched again by
+    -- syncBigCommerceOrder's update path once set, so it survives every
+    -- future re-sync of the same order.
+    excluded_from_reporting BIT            NOT NULL DEFAULT 0,
     notes                   NVARCHAR(MAX)  NULL,
     created_by              NVARCHAR(64)   NULL,
     created_at              DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
