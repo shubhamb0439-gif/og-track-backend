@@ -28,7 +28,7 @@ const inventoryRoutes = require('./routes/inventory');
 const manufacturingRoutes = require('./routes/manufacturing');
 const salesRoutes = require('./routes/sales');
 const uploadRoutes = require('./routes/upload');
-const { tenantAidaRouter, masterAdminAidaRouter } = require('./routes/aida');
+const { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter } = require('./routes/aida');
 const whatsappRoutes = require('./routes/whatsapp');
 const aidaJobRunner = require('./aida/jobs/jobRunner');
 const to_do_listRoutes = require('./routes/to_do_list');
@@ -121,6 +121,12 @@ app.use('/api/:slug/upload', resolveTenant, uploadRoutes);
 // Not gated by requireModule: it's not a module, it's a layer over every
 // module. Each individual tool self-gates against req.company.enabled_modules.
 app.use('/api/:slug/aida', resolveTenant, tenantAidaRouter);
+// Separate from tenantAidaRouter/masterAdminAidaRouter above — this ONE
+// endpoint pair accepts EITHER a tenant token (this company's manager/
+// developer/tester only) OR a master-admin token, via its own combined
+// auth middleware (see requireReportIssueApprover in routes/aida.js), so it
+// isn't mounted behind either router's single fixed requireAuth.
+app.use('/api/:slug/aida/report-issue-jobs', reportIssueApprovalRouter);
 app.use('/api/:slug/to_do_list', resolveTenant, requireModule('to_do_list'), to_do_listRoutes);
 app.use('/api/:slug/token', resolveTenant, requireModule('token'), tokenRoutes);
 app.use('/api/:slug/notes', resolveTenant, requireModule('notes'), notesRoutes);

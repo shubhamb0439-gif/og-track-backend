@@ -1,5 +1,6 @@
 const express = require('express');
 const multer = require('multer');
+const jwt = require('jsonwebtoken');
 const config = require('../config');
 const { requireTenantAidaAuth, requireMasterAdminAidaAuth } = require('../aida/auth');
 const { buildTenantContext, buildMasterAdminContext } = require('../aida/contextBuilder');
@@ -466,15 +467,42 @@ function createAidaRouter({ requireAuth, buildContext }) {
 const tenantAidaRouter = createAidaRouter({ requireAuth: requireTenantAidaAuth, buildContext: buildTenantContext });
 const masterAdminAidaRouter = createAidaRouter({ requireAuth: requireMasterAdminAidaAuth, buildContext: buildMasterAdminContext });
 
+// ── Tenant-facing report-a-bug/feature button (AIDA roadmap item 4b) ────────
+// The one tenant-side way to CREATE a job — everything about managing it
+// afterward (list/approve/reject) is still master-admin only, below. Added
+// directly onto the already-built router, same pattern as the master-admin
+// job endpoints further down — still behind createAidaRouter's 'enabled'
+// check + requireTenantAidaAuth.
+tenantAidaRouter.post('/report-issue', async (req, res) => {
+  try {
+    const { type, description, screenshotUrl } = req.body || {};
+    if (!['bug', 'feature'].includes(type)) {
+      return res.status(400).json({ error: 'type must be "bug" or "feature"' });
+    }
+    if (!description || typeof description !== 'string' || !description.trim()) {
+      return res.status(400).json({ error: 'description is required' });
+    }
+    const job = await jobStore.createJob({
+      kind: 'user_reported_issue',
+      companySlug: req.company.slug,
+      createdByUserId: req.auth.userId,
+      payload: { type, description: description.trim(), screenshotUrl: screenshotUrl || null },
+    });
+    res.json({ jobId: job.id, status: job.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Async job endpoints — master admin only for now ──────────────────────────
 // Added directly to the already-built router (still behind its 'enabled'
 // check + requireMasterAdminAidaAuth from createAidaRouter above) rather than
-// a createAidaRouter option, since jobs don't exist on the tenant side at all
-// yet — every capability that creates one (repo diagnosis/fixing, cross-
-// tenant writes, new-app deployment) is master-admin-scoped per the AIDA
-// power-tier plan. Any authenticated master admin can see/act on any job —
-// there's no per-admin ownership restriction, matching "master admin has
-// full access" elsewhere in that plan.
+// a createAidaRouter option. Every OTHER capability that creates a job (repo
+// diagnosis/fixing, cross-tenant writes, new-app deployment) is still
+// master-admin-scoped per the AIDA power-tier plan — report-issue above is
+// the one tenant-side exception, and even it only creates the job; managing
+// it afterward stays master-admin only, same as every other kind. Any
+// authenticated master admin can see/act on any job — there's no per-admin
+// ownership restriction, matching "master admin has full access" elsewhere
+// in that plan.
 
 // GET /jobs?kind=dev_repo_fix&status=awaiting_approval&limit=20 — browse jobs
 // without already knowing an id. This is what the "AIDA Job" panel (long-
@@ -571,8 +599,83 @@ masterAdminAidaRouter.post('/jobs/:id/reject', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Plan-approval gate for user_reported_issue jobs (AIDA roadmap item 4b,
+// revised) — the ONE place a tenant user (not just master admin) can approve
+// or reject an AIDA job, and even then only the PLAN stage of their OWN
+// company's bug/feature reports, never the later PR-merge stage (stage 2,
+// user_reported_issue_build, stays master-admin-only via the routes above)
+// and never any other job kind. Both token types share one JWT secret (see
+// src/utils/auth.js's issueToken / src/routes/masteradmin.js's admin sign),
+// so one verify + branch-on-role covers both instead of needing two gates.
+function requireReportIssueApprover(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing Authorization header' });
+  let payload;
+  try { payload = jwt.verify(token, config.app.jwtSecret); }
+  catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
+
+  if (payload.role === 'masteradmin') {
+    req.approver = { type: 'masteradmin', id: payload.adminId, name: payload.name };
+    return next();
+  }
+  if (payload.slug === req.params.slug && ['manager', 'developer', 'tester'].includes(payload.role)) {
+    req.approver = { type: 'tenant', id: payload.userId, role: payload.role, slug: payload.slug };
+    return next();
+  }
+  return res.status(403).json({ error: "Only this company's manager/developer/tester, or a master admin, can approve or reject this." });
+}
+
+const reportIssueApprovalRouter = express.Router({ mergeParams: true });
+reportIssueApprovalRouter.use((req, res, next) => {
+  if (!config.aida.enabled) return res.status(503).json({ error: 'AIDA is not configured on this server yet.' });
+  next();
+});
+reportIssueApprovalRouter.use(requireReportIssueApprover);
+
+function validateReportIssuePlanJob(req, res, job) {
+  if (!job) { res.status(404).json({ error: 'Job not found' }); return false; }
+  if (job.kind !== 'user_reported_issue') {
+    res.status(400).json({ error: 'This endpoint only approves/rejects the plan stage of a user_reported_issue job.' });
+    return false;
+  }
+  if (job.companySlug !== req.params.slug) {
+    res.status(403).json({ error: 'This job does not belong to this company.' });
+    return false;
+  }
+  if (job.status !== 'awaiting_approval') {
+    res.status(400).json({ error: `Job is not awaiting approval (status: ${job.status})` });
+    return false;
+  }
+  return true;
+}
+
+reportIssueApprovalRouter.post('/:id/approve', async (req, res) => {
+  try {
+    const job = await jobStore.getJob(req.params.id);
+    if (!validateReportIssuePlanJob(req, res, job)) return;
+    const approved = await jobStore.updateJobStatus(job.id, 'approved');
+    await jobStore.appendEvent(job.id, 'approved', { approvedBy: req.approver });
+    jobRunner.emitJobUpdate(approved);
+    const final = await jobRunner.resumeApproved(approved);
+    res.json({ job: final });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+reportIssueApprovalRouter.post('/:id/reject', async (req, res) => {
+  try {
+    const job = await jobStore.getJob(req.params.id);
+    if (!validateReportIssuePlanJob(req, res, job)) return;
+    await jobRunner.runOnReject(job);
+    const rejected = await jobStore.updateJobStatus(job.id, 'rejected');
+    await jobStore.appendEvent(job.id, 'rejected', { rejectedBy: req.approver });
+    jobRunner.emitJobUpdate(rejected);
+    res.json({ job: rejected });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // runConversationTurn is exported alongside the routers purely for testing —
 // it lets test/liveConversationTurn-style scripts exercise the REAL
 // streaming/filler/interruption wiring directly, without needing a full
 // HTTP+DB+socket.io harness. Not used by any other module in the app.
-module.exports = { tenantAidaRouter, masterAdminAidaRouter, runConversationTurn };
+module.exports = { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, runConversationTurn };

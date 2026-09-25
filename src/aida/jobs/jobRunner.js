@@ -25,6 +25,14 @@ function emitJobUpdate(job) {
   io.to(roomForJob(job)).emit('aida:job', job);
 }
 
+// For background code that needs to emit something OTHER than an aida:job
+// event (e.g. notifyCompanyMessage.js emitting a real-time `message:new:*`
+// event into a tenant's own socket room) — this is the one place the live
+// Socket.io instance is held outside of an Express request's req.io.
+function getIo() {
+  return io;
+}
+
 const helpers = {
   appendEvent: (jobId, event, detail) => jobStore.appendEvent(jobId, event, detail),
   updateStatus: async (jobId, status, extra) => {
@@ -158,4 +166,4 @@ function start(ioInstance) {
   previewPollTimer.unref?.();
 }
 
-module.exports = { start, resumeApproved, runOnReject, emitJobUpdate, roomForJob };
+module.exports = { start, resumeApproved, runOnReject, emitJobUpdate, roomForJob, getIo };

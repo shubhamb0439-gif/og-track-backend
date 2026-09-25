@@ -1662,3 +1662,102 @@ next to) each AIDA reply bubble, using the matching `label` from `GET /models`, 
 always confirm afterward which model actually generated a given reply — the dropdown selection
 alone isn't proof of that, since a request can silently fail validation, fall back, or be sent
 before a selection change is applied.
+
+---
+
+## 31. Tenant — "Report a bug/feature" button
+
+**Status: backend built (2026-09-25, revised same day into a two-stage flow — see below), not
+yet wired into any frontend. The report-submission endpoint needs no frontend beyond the form
+itself; the NEW plan-approval endpoint (added in the revision) needs a small UI for a company's
+manager/developer/tester to actually act on — see "New: plan-approval UI" below.**
+
+**Why this exists:** any tenant user can now report something wrong (or a feature they want)
+directly from inside the app, and it feeds into AIDA's existing coding-agent pipeline — the same
+one that already opens real PRs for masteradmin-triggered fixes. The system figures out on its
+own whether the report is likely a frontend (something visual/interactive) or backend (data/
+calculation/logic) issue — the user never has to know or guess which repo anything lives in.
+
+**This is now a TWO-stage pipeline, each with its own separate human-approval gate** (revised
+after the original single-stage design, per explicit follow-up): AIDA first writes a short
+plan of action and gets that approved BEFORE touching any code, then only after that separately
+opens a real PR which itself still needs a second, separate approval before merging. Nothing is
+ever pushed to production without a masteradmin explicitly approving the final PR — the report
+button does not grant any tenant user new ability to change code themselves, at either stage.
+
+```
+POST /api/:slug/aida/report-issue
+  body: { type: "bug" | "feature", description: string, screenshotUrl?: string }
+  → 200 { jobId: string, status: "queued" }
+  400 errors:
+    - { error: 'type must be "bug" or "feature"' }
+    - { error: "description is required" }
+```
+
+**What happens after the 200 response, stage 1 ("plan")** — none of this needs frontend
+handling for the reporting user, it all runs server-side: the job classifies which repo the
+report likely belongs to, has the LLM write a short plan (a one/two-sentence summary + a
+handful of action-item bullets — NOT code, nothing has been touched yet), then notifies people
+and lands at `awaiting_approval`:
+- The master admin gets a WhatsApp message with the plan (once WhatsApp is actually configured
+  server-side — it isn't yet on this server).
+- This company's `manager`/`developer`/`tester`-role users get a real, durable message posted
+  into the existing Messages module, in a conversation named **"AIDA Reports"** (auto-created the
+  first time it's needed, with those role-holders as members) — sent from an account literally
+  named "AIDA". Requires this company to have the `messages` module enabled; if it doesn't, this
+  notification is silently skipped (the master-admin WhatsApp one still happens).
+
+**New: plan-approval endpoints** (this is the part needing new UI):
+```
+POST /api/:slug/aida/report-issue-jobs/:id/approve
+POST /api/:slug/aida/report-issue-jobs/:id/reject
+  Auth: Bearer token — accepts EITHER a master-admin token OR a tenant token whose role is
+  manager/developer/tester AND whose company slug matches the URL's :slug. Any other tenant
+  role gets 403.
+  → 200 { job: {...} }   (approve resumes the job — see stage 2 below; reject just marks it rejected)
+  400/403/404 errors:
+    - { error: "This endpoint only approves/rejects the plan stage of a user_reported_issue job." }
+    - { error: "This job does not belong to this company." }
+    - { error: "Job is not awaiting approval (status: ...)" }
+    - { error: "Only this company's manager/developer/tester, or a master admin, can approve or reject this." }
+```
+This is a NEW capability: for the first time, a non-masteradmin tenant user (with one of those
+3 roles) can approve/reject something in AIDA's job pipeline — but ONLY the plan stage of their
+own company's reports, never anything else.
+
+**Stage 2 ("build")** only starts after a plan is approved — a brand new job (kind
+`user_reported_issue_build`) opens a real sandbox, runs the coding agent, and (if it produces a
+real change) opens a PR, landing at its OWN `awaiting_approval`. That second gate is
+UNCHANGED from before this revision — still master-admin-only, via the existing
+`POST /api/masteradmin/aida/jobs/:id/approve`/`reject` (no new UI needed for that part, same as
+`dev_repo_fix` jobs already work).
+
+**What's explicitly NOT built in this phase:** no way for the ORIGINAL reporting user to see
+their report's status (no `GET` endpoint for it) — the 200 from `/report-issue` is just
+"submitted", nothing more. No screenshot upload/storage — `screenshotUrl` expects an
+already-hosted URL; skip the screenshot field if there's no existing upload mechanism to point
+at. No persistence/read tracking beyond what the Messages module already does natively.
+
+**Frontend prompt — two separate pieces:**
+
+1. **The report button** (submission side, tenant-facing, every page): a floating "Report a
+   bug/feature" button, same always-visible placement convention as the AIDA launcher (opposite
+   corner or stacked near it). Opens a small form: type toggle (Bug / Feature idea), required
+   multi-line description, optional screenshot only if there's an existing upload mechanism to
+   reuse. POSTs to `/report-issue`; on success show a brief honest confirmation ("Thanks — this
+   has been sent to the team.") and close the form — don't imply trackable progress. Show 400s
+   inline in the form, not as a toast.
+
+2. **The plan-approval UI** (manager/developer/tester-facing, this is new): when a message from
+   "AIDA" appears in the "AIDA Reports" conversation in the Messages module, render it with two
+   extra inline actions — "Approve" and "Reject" — instead of (or alongside) the normal reply
+   box, so a manager/developer/tester can act right from that conversation without needing to
+   know a job id. You'll need the job id to call the approve/reject endpoints above; the
+   simplest option is having AIDA's message text end with a bare `job_...` id you parse out
+   client-side (ask backend if you'd rather it be passed some other way — this wasn't
+   pre-agreed, use your judgment on the cleanest wire format). After a click, replace those two
+   buttons with a plain status line ("Approved by You" / "Rejected by You") using the response's
+   `job.status`. Master admins can also approve/reject the same job from the existing AIDA Job
+   panel — no new masteradmin UI needed, just make sure whichever action happens first (from
+   either surface) is reflected if the other surface is later viewed (a stale "Approve/Reject"
+   button on an already-resolved job should show the resolved state instead, not error out).

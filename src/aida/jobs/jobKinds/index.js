@@ -50,6 +50,18 @@ const kinds = {
   // at once (see docs/AIDA_PHASE2_MODULE_BUILDER_PLAN.md) — resume merges
   // BOTH PRs, onReject closes BOTH and tears down the live preview it booted.
   create_module: require('./createModule'),
+  // AIDA roadmap item 4b: tenant-facing "report a bug/feature" button.
+  // Two stages, two separate human-approval gates:
+  //   user_reported_issue (stage 1, "plan") — classifies frontend/backend,
+  //     writes a short plan of action, notifies the master admin (WhatsApp)
+  //     and this company's manager/developer/tester (in-app Messages
+  //     module), then waits for approval. Nothing is cloned/built yet.
+  //   user_reported_issue_build (stage 2, "build") — only ever created by
+  //     stage 1's resume() once the plan is approved. Same sandbox/coding-
+  //     agent/PR/approval pipeline as dev_repo_fix, targeting the repo
+  //     stage 1 already resolved.
+  user_reported_issue: require('./userReportedIssue'),
+  user_reported_issue_build: require('./userReportedIssueBuild'),
 };
 
 function getJobKind(kind) {

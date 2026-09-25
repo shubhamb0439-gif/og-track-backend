@@ -390,6 +390,11 @@ module.exports = {
       allowedNumbers: (process.env.WHATSAPP_ALLOWED_NUMBERS || '')
         .split(',').map((s) => s.trim()).filter(Boolean),
       adminMap,
+      // Where AIDA sends a bug/feature report's plan-of-action summary for
+      // human review (jobKinds/userReportedIssue.js) — the developer/master
+      // admin's own number, separate from allowedNumbers (which is about who
+      // is allowed to MESSAGE AIDA, not who AIDA proactively notifies).
+      masterAdminNumber: process.env.WHATSAPP_MASTERADMIN_NUMBER || null,
     };
   })(),
   // Azure Communication Services Email (src/utils/email.js) — currently just
