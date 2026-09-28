@@ -633,10 +633,23 @@ reportIssueApprovalRouter.use((req, res, next) => {
 });
 reportIssueApprovalRouter.use(requireReportIssueApprover);
 
-function validateReportIssuePlanJob(req, res, job) {
+// Accepts either the PLAN stage (user_reported_issue, any type — the broad
+// manager/developer/tester set requireReportIssueApprover already checked
+// applies as-is) or the BUILD/merge stage of a BUG report specifically
+// (user_reported_issue_build, type: 'bug' only — feature-request merges stay
+// master-admin-only via the existing masterAdminAidaRouter routes below,
+// unchanged). The merge stage is deliberately narrower than the plan stage:
+// only this company's developer/tester can approve a real merge, not manager.
+function validateReportIssueApprovableJob(req, res, job) {
   if (!job) { res.status(404).json({ error: 'Job not found' }); return false; }
-  if (job.kind !== 'user_reported_issue') {
-    res.status(400).json({ error: 'This endpoint only approves/rejects the plan stage of a user_reported_issue job.' });
+  const isPlanStage = job.kind === 'user_reported_issue';
+  const isBugBuildStage = job.kind === 'user_reported_issue_build' && job.payload?.type === 'bug';
+  if (!isPlanStage && !isBugBuildStage) {
+    res.status(400).json({ error: 'This endpoint only approves/rejects a user-reported plan, or the final fix for a BUG report (not a feature request).' });
+    return false;
+  }
+  if (isBugBuildStage && req.approver.type !== 'masteradmin' && !['developer', 'tester'].includes(req.approver.role)) {
+    res.status(403).json({ error: "Only this company's developer or tester, or a master admin, can approve or reject the final fix for a bug." });
     return false;
   }
   if (job.companySlug !== req.params.slug) {
@@ -653,7 +666,7 @@ function validateReportIssuePlanJob(req, res, job) {
 reportIssueApprovalRouter.post('/:id/approve', async (req, res) => {
   try {
     const job = await jobStore.getJob(req.params.id);
-    if (!validateReportIssuePlanJob(req, res, job)) return;
+    if (!validateReportIssueApprovableJob(req, res, job)) return;
     const approved = await jobStore.updateJobStatus(job.id, 'approved');
     await jobStore.appendEvent(job.id, 'approved', { approvedBy: req.approver });
     jobRunner.emitJobUpdate(approved);
@@ -665,7 +678,7 @@ reportIssueApprovalRouter.post('/:id/approve', async (req, res) => {
 reportIssueApprovalRouter.post('/:id/reject', async (req, res) => {
   try {
     const job = await jobStore.getJob(req.params.id);
-    if (!validateReportIssuePlanJob(req, res, job)) return;
+    if (!validateReportIssueApprovableJob(req, res, job)) return;
     // Event logged BEFORE onReject runs (unlike the masteradmin-only reject
     // route below) — userReportedIssue.js's onReject reads this same event
     // back to know who rejected it, since the generic job-kind contract has

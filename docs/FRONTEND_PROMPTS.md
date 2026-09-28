@@ -1764,3 +1764,177 @@ at. No persistence/read tracking beyond what the Messages module already does na
    panel — no new masteradmin UI needed, just make sure whichever action happens first (from
    either surface) is reflected if the other surface is later viewed (a stale "Approve/Reject"
    button on an already-resolved job should show the resolved state instead, not error out).
+
+---
+
+## 32. BUG FIX — "Approve"/"Reject" on AIDA's message do nothing (Prompt 31 not actually wired up)
+
+**Status: confirmed real bug, live-verified against production data (2026-09-28), not yet fixed.**
+
+**What's actually happening right now:** in the "AIDA Reports" conversation, whatever was built
+for Prompt 31's "plan-approval UI" renders "Approve"/"Reject" as what LOOKS like inline actions,
+but they're actually just being sent as plain typed chat messages — same visual bubble style,
+same read-receipt checkmarks, as any normal message a person types and sends. Clicking them does
+NOT call `POST /api/:slug/aida/report-issue-jobs/:id/approve` (or `/reject`) at all.
+
+**Proof, not a guess:** a real report was submitted ("Birthday notifications fail to pop up"),
+its plan was posted to the conversation, and Shubham (role: manager) sent something that reads
+as "Approve" in the chat. Checking the actual job row in the database immediately after:
+```
+{ id: 'job_1790572930829_1s2b26', status: 'awaiting_approval', ... }
+```
+Still `awaiting_approval` — if the real endpoint had been called, this would be `'approved'`
+then `'completed'` (with a new stage-2 build job spawned). It never moved. The backend side of
+this entire pipeline is confirmed working correctly (job creation, classification, plan
+generation, notification delivery all verified) — this is purely a frontend gap.
+
+**Also fixed server-side as part of diagnosing this**: AIDA's plan message previously had NO
+job id anywhere in its text at all — meaning even a correctly-built Approve button would have
+had nothing reliable to call the endpoint with. This is now fixed: every plan message posted
+into the Messages module ends with a line in this EXACT format:
+```
+Job ID: job_1790572930829_1s2b26
+```
+Job ids always match `job_<digits>_<alphanumeric>` (see `jobStore.js`'s `newId()`) — extract
+with a regex like `/Job ID:\s*(job_\w+)/` (or just `/job_\d+_[a-z0-9]+/i` against the whole
+message text) rather than assuming it's always the literal last line, in case message formatting
+changes later.
+
+**What needs to actually be built:**
+1. When rendering a message whose `senderName`/`senderId` is AIDA's system user AND its text
+   contains a `job_...` id, render two REAL buttons — "Approve" and "Reject" — as actual UI
+   elements (not a text input, not something that sends a chat message), each calling:
+   ```
+   POST /api/:slug/aida/report-issue-jobs/{jobId}/approve
+   POST /api/:slug/aida/report-issue-jobs/{jobId}/reject
+   Auth: Bearer <the normal tenant session token>
+   → 200 { job: {...} }
+   400/403/404 errors (show inline near the buttons, not as a generic toast):
+     - { error: "This endpoint only approves/rejects the plan stage of a user_reported_issue job." }
+     - { error: "This job does not belong to this company." }
+     - { error: "Job is not awaiting approval (status: ...)" }
+     - { error: "Only this company's manager/developer/tester, or a master admin, can approve or reject this." }
+   ```
+2. On success, replace the two buttons with a plain status line ("Approved" / "Rejected") —
+   don't leave them clickable again, and don't let a second click re-fire the request.
+3. If the conversation is reopened later and the job is already resolved (approved/rejected/
+   completed/failed — anything other than `awaiting_approval`), show the resolved status
+   instead of live buttons — don't show clickable Approve/Reject on a job that's already been
+   acted on, and don't error out if someone clicks a stale one anyway (just treat the 400 from
+   "Job is not awaiting approval" as "someone else already acted, refresh the status").
+4. Once approved, AIDA posts follow-up messages into this SAME conversation as things happen
+   (an immediate "✅ Plan approved by..." acknowledgment, then later "🔧 fix ready" / "⚠️ wasn't
+   able to produce a fix" / etc.) — these need no special rendering, they're just normal
+   messages from AIDA like the plan itself, but don't assume the conversation is "done" after
+   the plan message; more will arrive. **See Prompt 33 below — the "fix ready" message is its
+   own separate approval step, with its own job id, its own endpoint contract nuances, and (for
+   bug reports only) a wider set of people who can act on it.**
+
+---
+
+## 33. AIDA bug/feature pipeline — the FULL current message/approval contract (supersedes parts of #31/#32)
+
+**Status: backend built and tested (2026-09-28) — this is the authoritative spec for everything
+the "AIDA Reports" conversation can show you. Written in response to an explicit request for
+the exact contract before implementing further, since #31/#32 described behavior without always
+giving the literal wire format.**
+
+There are now TWO separate messages from AIDA per report, each with its OWN job id and its OWN
+approval step — do not assume one "Approve" button handles the whole lifecycle.
+
+### Message 1 — the PLAN (unchanged from #31/#32)
+
+Posted as soon as a report comes in, before anything is built. Ends with:
+```
+Job ID: job_xxxxxxxxxxxxx_xxxxxx
+```
+Approve/reject it via:
+```
+POST /api/:slug/aida/report-issue-jobs/{jobId}/approve
+POST /api/:slug/aida/report-issue-jobs/{jobId}/reject
+Auth: Bearer <normal tenant session token> (this company's manager/developer/tester — ANY of
+      the three — or a master admin token)
+→ 200 { job: {...} }
+```
+Approving this does NOT merge anything — it only tells AIDA to start building. The response's
+`job.status` becomes `'completed'` (stage 1 is done, a new stage-2 job now exists behind the
+scenes) — there is nothing further to show for THIS message once it resolves besides the plain
+"Approved"/"Rejected" status line from #32.
+
+### Message 2 — the FIX (new — this is the one #32 was missing detail on)
+
+Posted once AIDA finishes building, into the SAME "AIDA Reports" conversation, as a DIFFERENT
+message with a DIFFERENT job id (the stage-2 build job, not the plan job). Real example text:
+```
+🔧 A fix is ready — a pull request has been opened and is now pending final review — you
+(developer/tester) or the master admin can approve this.
+
+<AIDA's own summary of what it changed, free text, length varies>
+
+Preview: https://example-preview-url.azurestaticapps.net
+PR: https://github.com/owner/repo/pull/123
+Type: bug
+Job ID: job_yyyyyyyyyyyyy_yyyyyy
+```
+Exact parseable fields, each on its own line, each optional except `Type`/`Job ID` which are
+always present:
+- `Preview: <url>` — a REAL, live, clickable staging URL for the tester to actually try the fix
+  on — only present when a preview environment resolved (backend-repo fixes get this
+  immediately; frontend-repo fixes may get it in a LATER separate message once Azure Static Web
+  Apps finishes building the PR preview, 1-3 minutes later — same conversation, watch for a
+  message starting `🔗 The staging link for this fix is ready`). Extract with
+  `/Preview:\s*(\S+)/`.
+- `PR: <url>` — the GitHub PR page (for reviewing the actual diff/code), always present once a
+  fix reaches this stage. Extract with `/PR:\s*(\S+)/`.
+- `Type: bug` or `Type: feature` — **this is how you know whether to show the Approve/Reject
+  buttons on THIS message at all.** Extract with `/Type:\s*(bug|feature)/`.
+- `Job ID: job_...` — same format/regex as message 1, but note this is a DIFFERENT job id than
+  the plan message's — don't reuse the plan's job id here.
+
+Not every report reaches this message — AIDA may instead post one of these terminal messages
+with NO approve/reject action needed (just display them, same `Type`/`Job ID` suffix on each
+for consistency, but no buttons):
+- `ℹ️ AIDA investigated but found nothing to change: ...` — nothing to review, nothing to do.
+- `⚠️ AIDA wasn't able to produce a fix: ...` — same, nothing to review.
+- `⚠️ ...had to stop: ...` / `⚠️ The plan was approved, but ...isn't configured...` — a real
+  server-side problem occurred; nothing actionable for a normal user either way.
+
+### Approve/reject on Message 2 — narrower rules than Message 1, read carefully
+
+```
+POST /api/:slug/aida/report-issue-jobs/{jobId}/approve   (same endpoint path as message 1 —
+POST /api/:slug/aida/report-issue-jobs/{jobId}/reject     it now handles BOTH stages)
+Auth: Bearer <token>
+→ 200 { job: {...} }
+400/403/404 errors:
+  - { error: "This endpoint only approves/rejects a user-reported plan, or the final fix for a BUG report (not a feature request)." }
+  - { error: "Only this company's developer or tester, or a master admin, can approve or reject the final fix for a bug." }
+  - { error: "This job does not belong to this company." }
+  - { error: "Job is not awaiting approval (status: ...)" }
+```
+**Only show Approve/Reject on Message 2 when `Type: bug`.** For `Type: feature`, there is
+nothing this company's users can do on this message — a master admin has to act from the
+existing AIDA Job panel instead (not this Messages conversation). Don't render buttons at all
+for a feature-type Message 2; a plain "pending master admin review" status line is enough.
+
+For `Type: bug` Message 2s specifically, note the role set is NARROWER than Message 1's:
+**`manager` cannot approve/reject Message 2**, even though they could act on Message 1 — only
+`developer`/`tester` (or master admin). If a manager's session token calls this endpoint on a
+bug-type Message 2, they'll get the 403 above — treat it the same as any other 403 (show the
+error inline, don't retry).
+
+On success, `job.status` becomes `'approved'`→(merge happens automatically server-side)→
+`'completed'`, or `'rejected'`. AIDA then posts a THIRD message into the same conversation
+confirming the outcome ("✅ Merged by ... — this fix is now live." / "❌ Fix rejected by ... —
+the pull request has been closed without merging.") — again, plain text, no action needed,
+just display it.
+
+### Summary of what to actually build (if not already covered by #32's work)
+
+1. Parse every AIDA message for a trailing `Job ID: job_...` line — that's the id for THAT
+   specific message's approve/reject calls, never reuse another message's id.
+2. For a message containing `Preview:`/`PR:`/`Type:` lines (i.e., Message 2's shape): render the
+   Preview link and PR link as real clickable links; only render Approve/Reject buttons when
+   `Type: bug` — never for `Type: feature`.
+3. Same button-replacement/stale-state handling as #32 already asked for, applies equally to
+   Message 2's buttons.

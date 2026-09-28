@@ -2,6 +2,7 @@ const config = require('../../config');
 const jobStore = require('./jobStore');
 const { getSwaPreviewUrl } = require('../codingAgent/github');
 const { sendWhatsAppMessage } = require('../whatsapp');
+const { notifyCompanyMessage } = require('./notifyCompanyMessage');
 
 /**
  * The frontend repo's Azure Static Web Apps preview URL isn't known at
@@ -52,7 +53,7 @@ async function notifyPreviewReady(job) {
 async function tryResolvePreviewUrl(job) {
   let updated = null;
 
-  if (job.kind === 'dev_repo_fix' && job.result?.prNumber && job.result?.previewUrl == null &&
+  if ((job.kind === 'dev_repo_fix' || job.kind === 'user_reported_issue_build') && job.result?.prNumber && job.result?.previewUrl == null &&
       job.result?.repo === config.aida.moduleBuilder.frontendRepo) {
     const previewUrl = await fetchUrl(job.result.repo, job.result.prNumber, job.id);
     if (previewUrl) {
@@ -78,6 +79,13 @@ async function tryResolvePreviewUrl(job) {
   // needs this module itself, only the route/tool/poller callers do).
   require('./jobRunner').emitJobUpdate(updated);
   notifyPreviewReady(updated).catch((e) => console.error(`[aida] preview-ready WhatsApp notify failed for job ${updated.id}:`, e.message));
+  // The masteradmin-only kinds above have no companySlug (cross-tenant jobs);
+  // user_reported_issue_build always does — this is what actually gets the
+  // staging link into the tester's chat, not just a WhatsApp ping.
+  if (updated.companySlug && updated.result?.previewUrl) {
+    notifyCompanyMessage(updated.companySlug, `🔗 The staging link for this fix is ready — you can test it here: ${updated.result.previewUrl}`)
+      .catch((e) => console.error(`[aida] preview-ready in-app message failed for job ${updated.id}:`, e.message));
+  }
   return updated;
 }
 

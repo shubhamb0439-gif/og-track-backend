@@ -3,34 +3,7 @@ const jobStore = require('../jobStore');
 const { classifyIssueRepo, generatePlanOfAction } = require('../reportLLM');
 const { notifyCompanyMessage } = require('../notifyCompanyMessage');
 const { sendWhatsAppMessage } = require('../../whatsapp');
-const { resolveTenant } = require('../../../db/tenantConnections');
-
-/**
- * Turns the `approvedBy`/`rejectedBy` value routes/aida.js's
- * requireReportIssueApprover middleware attaches (as an 'approved'/
- * 'rejected' job event's detail — resume()/onReject() below have no other
- * way to see who acted, since jobRunner's generic contract doesn't pass
- * approver identity into a job kind directly) into a human-readable string
- * for the acknowledgment message. Best-effort: a lookup failure never blocks
- * the acknowledgment itself, it just falls back to something generic.
- */
-async function describeApprover(companySlug, approver) {
-  if (!approver) return 'someone';
-  if (approver.type === 'masteradmin') return `${approver.name || 'the master admin'} (master admin)`;
-  try {
-    const { db } = await resolveTenant(companySlug);
-    const user = await db('users').where({ id: approver.id }).first();
-    return `${user?.name || 'someone'} (${approver.role})`;
-  } catch {
-    return `someone (${approver.role})`;
-  }
-}
-
-async function latestEventDetail(jobId, eventName) {
-  const events = await jobStore.listEventsForJob(jobId);
-  const match = [...events].reverse().find((e) => e.event === eventName);
-  return match?.detail || null;
-}
+const { describeApprover, latestEventDetail } = require('../approverInfo');
 
 /**
  * Stage 1 ("plan") of the tenant-facing bug/feature report pipeline —
@@ -54,7 +27,7 @@ async function latestEventDetail(jobId, eventName) {
  * happens, it never touches a sandbox or GitHub directly.
  */
 
-function buildPlanMessage({ type, description, classifiedRepo, classifiedReasoning, plan, companySlug }) {
+function buildPlanMessage({ jobId, type, description, classifiedRepo, classifiedReasoning, plan, companySlug }) {
   const kindLabel = type === 'feature' ? 'Feature request' : 'Bug report';
   const lines = [
     `🤖 AIDA — new ${kindLabel.toLowerCase()}${companySlug ? ` from "${companySlug}"` : ''}`,
@@ -68,6 +41,11 @@ function buildPlanMessage({ type, description, classifiedRepo, classifiedReasoni
     ...plan.actionItems.map((item) => `• ${item}`),
     '',
     'Reply/approve in the AIDA Job panel (master admin) or this company\'s Messages panel to let AIDA start building.',
+    // Machine-parseable on purpose — see docs/FRONTEND_PROMPTS.md #32. Job
+    // ids are always "job_<digits>_<alnum>" (jobStore.js's newId), which
+    // can't collide with anything else in this message, so a frontend can
+    // reliably extract this without needing a separate wire-format field.
+    `Job ID: ${jobId}`,
   ];
   return lines.join('\n');
 }
@@ -100,6 +78,7 @@ module.exports = {
     await appendEvent(job.id, 'plan_generated', { plan });
 
     const messageText = buildPlanMessage({
+      jobId: job.id,
       type, description, classifiedRepo: classification.repo, classifiedReasoning: classification.reasoning,
       plan, companySlug: job.companySlug,
     });

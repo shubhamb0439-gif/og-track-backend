@@ -10,6 +10,8 @@ const { createBranch, commitAll, pushBranch, openPullRequest } = require('../../
 const { notifyPreviewReady } = require('../previewResolver');
 const { notifyCompanyMessage } = require('../notifyCompanyMessage');
 const { sendWhatsAppMessage } = require('../../whatsapp');
+const jobStore = require('../jobStore');
+const { describeApprover, latestEventDetail } = require('../approverInfo');
 const devFix = require('./devFix');
 
 // Closes the loop that stage 1 (userReportedIssue.js) opens — whoever
@@ -18,11 +20,18 @@ const devFix = require('./devFix');
 // masteradmin Job panel. Best-effort, same as every other notification in
 // this pipeline: a failure here never affects the job's own real outcome.
 function notifyBuildResult(job, text) {
+  // Every message this job kind sends ends with these two machine-parseable
+  // lines — same "Label: value" convention as userReportedIssue.js's plan
+  // message ("Job ID: job_..."), centralized here so no individual call site
+  // can forget them (a prior version of the "fix ready" message omitted the
+  // job id entirely, which meant a frontend Approve/Reject button had
+  // nothing to call the endpoint with — see docs/FRONTEND_PROMPTS.md #33).
+  const fullText = [text, `Type: ${job.payload?.type || 'unknown'}`, `Job ID: ${job.id}`].join('\n');
   if (config.whatsapp.enabled && config.whatsapp.masterAdminNumber) {
-    sendWhatsAppMessage(config.whatsapp.masterAdminNumber, text).catch((e) => console.error(`[aida] job ${job.id}: build-result WhatsApp failed:`, e.message));
+    sendWhatsAppMessage(config.whatsapp.masterAdminNumber, fullText).catch((e) => console.error(`[aida] job ${job.id}: build-result WhatsApp failed:`, e.message));
   }
   if (job.companySlug) {
-    notifyCompanyMessage(job.companySlug, text).catch((e) => console.error(`[aida] job ${job.id}: build-result in-app message failed:`, e.message));
+    notifyCompanyMessage(job.companySlug, fullText).catch((e) => console.error(`[aida] job ${job.id}: build-result in-app message failed:`, e.message));
   }
 }
 
@@ -174,7 +183,17 @@ module.exports = {
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { prUrl: pr.html_url });
-      notifyBuildResult(job, `🔧 A fix is ready — a pull request has been opened and is now pending final review by the master admin.\n\n${agentResult.summary}\n\n${pr.html_url}`);
+      const reviewerLine = type === 'bug'
+        ? 'pending final review — you (developer/tester) or the master admin can approve this'
+        : 'pending final review by the master admin';
+      notifyBuildResult(job, [
+        `🔧 A fix is ready — a pull request has been opened and is now ${reviewerLine}.`,
+        '',
+        agentResult.summary,
+        '',
+        previewUrl ? `Preview: ${previewUrl}` : null,
+        `PR: ${pr.html_url}`,
+      ].filter((l) => l !== null).join('\n'));
       if (previewUrl) {
         notifyPreviewReady(finalJob).catch((e) => console.error(`[aida] preview-ready WhatsApp notify failed for job ${job.id}:`, e.message));
       }
@@ -188,8 +207,28 @@ module.exports = {
     }
   },
 
-  // Merging/closing the PR once it exists is identical to dev_repo_fix's own
-  // behavior — both only ever read job.result.repo/prNumber.
-  resume: devFix.resume,
-  onReject: devFix.onReject,
+  /**
+   * Merging the PR once it exists is identical to dev_repo_fix's own
+   * behavior (both only ever read job.result.repo/prNumber) — devFix.resume
+   * does the actual merge. What's new here: for a BUG report specifically,
+   * this can now be approved by this company's own developer/tester, not
+   * just a master admin (see routes/aida.js's validateReportIssueApprovableJob)
+   * — either way, the master admin gets told what happened, since they're
+   * no longer necessarily the one who acted.
+   */
+  async resume(job, helpers) {
+    await devFix.resume(job, helpers);
+    const finalJob = await jobStore.getJob(job.id);
+    const approvedBy = await describeApprover(job.companySlug, (await latestEventDetail(job.id, 'approved'))?.approvedBy);
+    const text = finalJob.status === 'completed'
+      ? `✅ Merged by ${approvedBy} — this fix is now live.`
+      : `⚠️ Approved by ${approvedBy}, but merging failed: ${finalJob.errorMessage || 'unknown error'}`;
+    notifyBuildResult(finalJob, text);
+  },
+
+  async onReject(job, helpers) {
+    await devFix.onReject(job, helpers);
+    const rejectedBy = await describeApprover(job.companySlug, (await latestEventDetail(job.id, 'rejected'))?.rejectedBy);
+    notifyBuildResult(job, `❌ Fix rejected by ${rejectedBy} — the pull request has been closed without merging.`);
+  },
 };
