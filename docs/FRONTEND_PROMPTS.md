@@ -1740,13 +1740,16 @@ at. No persistence/read tracking beyond what the Messages module already does na
 
 **Frontend prompt — two separate pieces:**
 
-1. **The report button** (submission side, tenant-facing, every page): a floating "Report a
-   bug/feature" button, same always-visible placement convention as the AIDA launcher (opposite
-   corner or stacked near it). Opens a small form: type toggle (Bug / Feature idea), required
+1. **The report button** (submission side, tenant-facing, every page): add it to the TOP HEADER
+   BAR, alongside the existing icon buttons there (the theme toggle "Aa" and the notification
+   bell, top-right) — same rounded-square icon-button style, same row, placed next to them (e.g.
+   immediately to their left). Use a bug/flag-style icon consistent with those two in weight and
+   size. Clicking it opens a small form/modal: type toggle (Bug / Feature idea), required
    multi-line description, optional screenshot only if there's an existing upload mechanism to
    reuse. POSTs to `/report-issue`; on success show a brief honest confirmation ("Thanks — this
    has been sent to the team.") and close the form — don't imply trackable progress. Show 400s
-   inline in the form, not as a toast.
+   inline in the form, not as a toast. (This replaces the earlier "floating button" placement
+   suggestion — header icon row is the confirmed placement.)
 
 2. **The plan-approval UI** (manager/developer/tester-facing, this is new): when a message from
    "AIDA" appears in the "AIDA Reports" conversation in the Messages module, render it with two

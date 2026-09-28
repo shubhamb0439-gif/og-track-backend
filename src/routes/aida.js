@@ -666,9 +666,13 @@ reportIssueApprovalRouter.post('/:id/reject', async (req, res) => {
   try {
     const job = await jobStore.getJob(req.params.id);
     if (!validateReportIssuePlanJob(req, res, job)) return;
+    // Event logged BEFORE onReject runs (unlike the masteradmin-only reject
+    // route below) — userReportedIssue.js's onReject reads this same event
+    // back to know who rejected it, since the generic job-kind contract has
+    // no other way to pass approver identity into onReject(job, helpers).
+    await jobStore.appendEvent(job.id, 'rejected', { rejectedBy: req.approver });
     await jobRunner.runOnReject(job);
     const rejected = await jobStore.updateJobStatus(job.id, 'rejected');
-    await jobStore.appendEvent(job.id, 'rejected', { rejectedBy: req.approver });
     jobRunner.emitJobUpdate(rejected);
     res.json({ job: rejected });
   } catch (e) { res.status(500).json({ error: e.message }); }

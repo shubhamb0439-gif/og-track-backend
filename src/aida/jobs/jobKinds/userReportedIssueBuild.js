@@ -8,7 +8,23 @@ const { runCodingAgent } = config.aida.codingAgent.provider === 'anthropic'
   : require('../../codingAgent/providers/openai');
 const { createBranch, commitAll, pushBranch, openPullRequest } = require('../../codingAgent/github');
 const { notifyPreviewReady } = require('../previewResolver');
+const { notifyCompanyMessage } = require('../notifyCompanyMessage');
+const { sendWhatsAppMessage } = require('../../whatsapp');
 const devFix = require('./devFix');
+
+// Closes the loop that stage 1 (userReportedIssue.js) opens — whoever
+// approved the plan sees it land in Messages/WhatsApp, but without this
+// they'd otherwise hear nothing further until someone happens to check the
+// masteradmin Job panel. Best-effort, same as every other notification in
+// this pipeline: a failure here never affects the job's own real outcome.
+function notifyBuildResult(job, text) {
+  if (config.whatsapp.enabled && config.whatsapp.masterAdminNumber) {
+    sendWhatsAppMessage(config.whatsapp.masterAdminNumber, text).catch((e) => console.error(`[aida] job ${job.id}: build-result WhatsApp failed:`, e.message));
+  }
+  if (job.companySlug) {
+    notifyCompanyMessage(job.companySlug, text).catch((e) => console.error(`[aida] job ${job.id}: build-result in-app message failed:`, e.message));
+  }
+}
 
 /**
  * Stage 2 ("build") of the tenant-facing bug/feature report pipeline —
@@ -57,21 +73,25 @@ module.exports = {
     const { type, description, screenshotUrl, repo, classifiedRepo, classifiedReasoning } = job.payload || {};
     if (!description || !repo) {
       await updateStatus(job.id, 'failed', { errorMessage: 'Missing description/repo in job payload.' });
+      notifyBuildResult(job, `⚠️ AIDA couldn't start work on this — its job payload was incomplete. A master admin will need to look into this directly.`);
       return;
     }
     const ca = config.aida.codingAgent;
     if (!ca.enabled) {
       await updateStatus(job.id, 'failed', { errorMessage: 'Coding agent is not configured (missing an API key for its provider).' });
+      notifyBuildResult(job, `⚠️ The plan was approved, but AIDA's coding agent isn't configured on this server yet, so it can't actually start building. A master admin will need to set that up.`);
       return;
     }
     if (!ca.githubToken) {
       await updateStatus(job.id, 'failed', { errorMessage: 'Coding agent has no write-scoped GitHub token configured (AIDA_CODING_AGENT_GITHUB_TOKEN).' });
+      notifyBuildResult(job, `⚠️ The plan was approved, but AIDA's coding agent has no repo access configured on this server yet, so it can't actually start building. A master admin will need to set that up.`);
       return;
     }
     // Defense in depth — stage 1 already checked this, but this job re-checks
     // so nothing can reach a clone step regardless of how it was created.
     if (!isAuthorized(repo)) {
       await updateStatus(job.id, 'failed', { errorMessage: `Repo "${repo}" is not authorized for AIDA repo access.` });
+      notifyBuildResult(job, `⚠️ The plan was approved, but AIDA isn't authorized to access the repo this needs (${repo}). A master admin will need to look into this.`);
       return;
     }
 
@@ -117,6 +137,7 @@ module.exports = {
       if (!agentResult.success) {
         await updateStatus(job.id, 'failed', { errorMessage: agentResult.summary, result: baseResult });
         await appendEvent(job.id, 'failed', { stage: 'agent' });
+        notifyBuildResult(job, `⚠️ AIDA wasn't able to produce a fix: ${agentResult.summary}`);
         return;
       }
 
@@ -124,6 +145,7 @@ module.exports = {
       if (!commitResult.committed) {
         await updateStatus(job.id, 'completed', { result: { ...baseResult, changed: false } });
         await appendEvent(job.id, 'completed', { changed: false });
+        notifyBuildResult(job, `ℹ️ AIDA investigated but found nothing to change: ${agentResult.summary}`);
         return;
       }
 
@@ -152,6 +174,7 @@ module.exports = {
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { prUrl: pr.html_url });
+      notifyBuildResult(job, `🔧 A fix is ready — a pull request has been opened and is now pending final review by the master admin.\n\n${agentResult.summary}\n\n${pr.html_url}`);
       if (previewUrl) {
         notifyPreviewReady(finalJob).catch((e) => console.error(`[aida] preview-ready WhatsApp notify failed for job ${job.id}:`, e.message));
       }
@@ -159,6 +182,7 @@ module.exports = {
       const safeMessage = ca.githubToken ? e.message.split(ca.githubToken).join('***') : e.message;
       await updateStatus(job.id, 'failed', { errorMessage: safeMessage });
       await appendEvent(job.id, 'failed', { error: safeMessage });
+      notifyBuildResult(job, `⚠️ AIDA hit an unexpected error while working on this and had to stop: ${safeMessage}`);
     } finally {
       sandbox?.cleanup();
     }

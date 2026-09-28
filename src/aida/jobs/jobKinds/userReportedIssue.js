@@ -3,6 +3,34 @@ const jobStore = require('../jobStore');
 const { classifyIssueRepo, generatePlanOfAction } = require('../reportLLM');
 const { notifyCompanyMessage } = require('../notifyCompanyMessage');
 const { sendWhatsAppMessage } = require('../../whatsapp');
+const { resolveTenant } = require('../../../db/tenantConnections');
+
+/**
+ * Turns the `approvedBy`/`rejectedBy` value routes/aida.js's
+ * requireReportIssueApprover middleware attaches (as an 'approved'/
+ * 'rejected' job event's detail — resume()/onReject() below have no other
+ * way to see who acted, since jobRunner's generic contract doesn't pass
+ * approver identity into a job kind directly) into a human-readable string
+ * for the acknowledgment message. Best-effort: a lookup failure never blocks
+ * the acknowledgment itself, it just falls back to something generic.
+ */
+async function describeApprover(companySlug, approver) {
+  if (!approver) return 'someone';
+  if (approver.type === 'masteradmin') return `${approver.name || 'the master admin'} (master admin)`;
+  try {
+    const { db } = await resolveTenant(companySlug);
+    const user = await db('users').where({ id: approver.id }).first();
+    return `${user?.name || 'someone'} (${approver.role})`;
+  } catch {
+    return `someone (${approver.role})`;
+  }
+}
+
+async function latestEventDetail(jobId, eventName) {
+  const events = await jobStore.listEventsForJob(jobId);
+  const match = [...events].reverse().find((e) => e.event === eventName);
+  return match?.detail || null;
+}
 
 /**
  * Stage 1 ("plan") of the tenant-facing bug/feature report pipeline —
@@ -123,8 +151,30 @@ module.exports = {
     });
     await appendEvent(job.id, 'handed_off', { buildJobId: buildJob.id });
     await updateStatus(job.id, 'completed', { result: { ...job.result, buildJobId: buildJob.id } });
+
+    // Close the loop — this is what was missing before: approving used to be
+    // a silent action with no acknowledgment anywhere. Best-effort, same
+    // pattern as run()'s own notifications — a failure here never affects
+    // the approval/handoff itself, which has already succeeded above.
+    const approvedBy = await describeApprover(job.companySlug, (await latestEventDetail(job.id, 'approved'))?.approvedBy);
+    const ackText = `✅ Plan approved by ${approvedBy} — starting work now. I'll post back here once a fix is ready for review.`;
+    if (config.whatsapp.enabled && config.whatsapp.masterAdminNumber) {
+      sendWhatsAppMessage(config.whatsapp.masterAdminNumber, ackText).catch((e) => console.error(`[aida] job ${job.id}: approval-ack WhatsApp failed:`, e.message));
+    }
+    if (job.companySlug) {
+      notifyCompanyMessage(job.companySlug, ackText).catch((e) => console.error(`[aida] job ${job.id}: approval-ack in-app message failed:`, e.message));
+    }
   },
 
-  // No onReject: rejecting the PLAN stops here — nothing was ever cloned or
-  // pushed yet, so there's nothing external to clean up.
+  /** Fires once a human rejects the PLAN — nothing was ever cloned/pushed, so there's nothing to clean up, only to acknowledge. */
+  async onReject(job) {
+    const rejectedBy = await describeApprover(job.companySlug, (await latestEventDetail(job.id, 'rejected'))?.rejectedBy);
+    const ackText = `❌ Plan rejected by ${rejectedBy} — AIDA won't proceed with this report.`;
+    if (config.whatsapp.enabled && config.whatsapp.masterAdminNumber) {
+      sendWhatsAppMessage(config.whatsapp.masterAdminNumber, ackText).catch((e) => console.error(`[aida] job ${job.id}: rejection-ack WhatsApp failed:`, e.message));
+    }
+    if (job.companySlug) {
+      notifyCompanyMessage(job.companySlug, ackText).catch((e) => console.error(`[aida] job ${job.id}: rejection-ack in-app message failed:`, e.message));
+    }
+  },
 };
