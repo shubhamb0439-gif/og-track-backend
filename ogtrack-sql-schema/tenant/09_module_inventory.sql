@@ -124,6 +124,9 @@ CREATE TABLE dbo.inv_stock_lots (
     received_date       DATE           NOT NULL DEFAULT CAST(SYSUTCDATETIME() AS DATE),
     source              NVARCHAR(20)   NOT NULL DEFAULT 'purchase',
     notes               NVARCHAR(500)  NULL,
+    -- Vendor invoice for THIS receipt (a PO can be received in several
+    -- partial deliveries, each with its own invoice) — see patch_16.
+    invoice_number      NVARCHAR(100)  NULL,
     created_at          DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
 
     CONSTRAINT CK_inv_stock_lots_source CHECK (source IN ('purchase','opening_stock','manual','import','assembly'))

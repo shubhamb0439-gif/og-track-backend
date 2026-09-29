@@ -1938,3 +1938,138 @@ just display it.
    `Type: bug` — never for `Type: feature`.
 3. Same button-replacement/stale-state handling as #32 already asked for, applies equally to
    Message 2's buttons.
+
+---
+
+## 34. CAJO Inventory — Invoice Number popup when Received Quantity is increased (per partial receipt)
+
+**Status: backend built. Additive to the existing Edit Purchase → Received Quantity save flow
+(Not Received / Partially Received / Fully Received controls + % slider, which already calls
+`POST /purchases/:id/receive-lines`). Do not change anything else in that flow. Apply
+`patch_16_inv_stock_lots_invoice_number.sql` to each live tenant DB before or with this release.**
+
+A purchase can be received in several partial deliveries, and each delivery has its own
+vendor invoice. The backend now stores an invoice number for each receipt, not just once per
+PO. The PO header's existing `invoiceNumber` field (Prompt 21 #2) is unchanged and separate.
+Leave it as it is.
+
+```
+POST /api/:slug/inventory/purchases/:id/receive-lines
+  body: { lines: [{ purchaseItemId, quantityReceived }], invoiceNumber? }   <- invoiceNumber is NEW
+  - invoiceNumber is REQUIRED if at least one line's new quantityReceived is greater than that
+    line's currently saved quantityReceived. Otherwise it's ignored/optional (reductions and
+    no-change saves work exactly as before).
+  - Missing/blank on an increase -> 400
+      { error: "Invoice number is required when received quantity is increased.",
+        code: "INVOICE_NUMBER_REQUIRED" }
+    Nothing is saved in that case (no quantities, no lots, no status change).
+  - Max 100 characters (400 otherwise). The server trims whitespace.
+  - The invoice is stored against the quantity newly received in THIS call only (every line
+    that increased in this save gets the same invoice).
+  - Response is unchanged: { ...purchase, items: [...] }
+
+POST /api/:slug/inventory/purchases/:id/receive   (receive-all, unchanged contract)
+  - Its existing optional invoiceNumber is now also stored against that receipt.
+
+GET /api/:slug/inventory/purchases/:id/receipts   (NEW, read-only)
+  -> [ { lotId, lotRef, purchaseItemId, itemId, quantityReceived, invoiceNumber,
+         receivedDate, createdAt }, ... ]   oldest first
+  One row per line per delivery. invoiceNumber is null for receipts made before this feature.
+
+GET /api/:slug/inventory/items/:id/lots   -> each lot now also includes invoiceNumber (nullable)
+```
+
+### What to build
+
+1. In the Edit Purchase modal's Save handler for received quantities, **before** the existing
+   `receive-lines` call, compare each line's new Received Quantity with the **last saved**
+   value (the `quantityReceived` from the purchase/items you loaded, not the value from the
+   previous keystroke or slider position).
+2. **If any line increased:** open an "Invoice Number" modal:
+   - Title: "Invoice Number for this receipt". Optionally show a short summary of what's being
+     received, e.g. "Item A: +3, Item B: +1".
+   - A single required text input (maxLength 100) with **Confirm** and **Cancel** buttons.
+   - Disable Confirm until the trimmed value is non-empty. Show an inline error if the user
+     tries to submit a blank value.
+   - **Confirm** → call the existing `receive-lines` request unchanged, just add
+     `invoiceNumber` to the body. Keep the existing success handling as it is: refresh,
+     toast, status badge and socket updates.
+   - **Cancel** or closing the modal → do **not** call the API. Keep the user's unsaved edits
+     in the form so they can try again or revert.
+   - Start the input empty each time. Every receipt has its own invoice, so don't pre-fill it
+     from the PO header's invoiceNumber or from a previous receipt.
+3. **If nothing increased** (no change, or only reductions): don't show the modal. Save
+   exactly as today, without `invoiceNumber`.
+4. If the API still returns `code: "INVOICE_NUMBER_REQUIRED"`, for example because another
+   user saved in the meantime, reopen the modal instead of showing a generic error.
+5. Optional but recommended: add a small "Receipts" list in Edit Purchase from
+   `GET /purchases/:id/receipts`, showing Date / Item / Qty / Invoice No. Show "—" when the
+   invoice is null. This is where the separate invoices for each partial receipt become
+   visible.
+
+Don't change the Not Received / Partially Received / Fully Received controls, the % slider,
+the PO header Invoice Number field, or any other Purchases screen.
+
+---
+
+## 35. BUG — Edit Purchase shows stale Quantity Received / Remaining (and Save can silently undo a receipt)
+
+**Status: frontend bug + small backend guard (built). Follow-up to #34.**
+
+**Symptom:** a line ordered 10 had two receipts of 2 (the Receipts table shows both, with
+invoices PO1001 and 2001). But Edit Purchase showed Quantity Received **0** and Remaining
+**10**, when it should show 4 and 6.
+
+**Cause (frontend):** `openInvPurchaseEditModal` fills the line fields from the in-memory
+`invPurchaseLinesCache[id]` when it has an entry, and only fetches when it doesn't. That cache
+goes stale:
+- no socket event updates it (`inv:purchase_updated` only carries the purchase header, not the
+  lines), so another tab or user receiving stock is never reflected;
+- `loadInvPurchaseLinesBulk()` can be in flight when Save clears the cache. When it finishes,
+  it writes the old lines back with `Object.assign`.
+
+Because Save sends Quantity Received for **every** line, clicking Save Changes on a stale
+form (even just to edit the header) sends the old value, e.g. 0. The backend treats that as a
+**reduction**: it takes the received stock back out and no invoice popup appears. The receipt
+rows stay, which is why Receipts and Remaining disagree.
+
+### Fix
+
+1. **Always load fresh lines when opening Edit Purchase.** In `openInvPurchaseEditModal`,
+   replace
+   `const lines=invPurchaseLinesCache[id] || await loadInvPurchaseLines(id);`
+   with
+   `const lines=await loadInvPurchaseLines(id); if(invEditPurchaseId!==id) return;`
+   (`loadInvPurchaseLines` already refreshes the cache entry). Remaining, the status pill and
+   `data-saved-received` then all come from the server's current `quantityReceived`.
+
+2. **Send the value the form was loaded with.** In `saveInvPurchaseEdit`, add
+   `previousQuantityReceived` to each `receive-lines` line, taken from the row's
+   `data-saved-received`:
+   ```js
+   receiveUpdates.push({ purchaseItemId: lineId, quantityReceived,
+                         previousQuantityReceived: Number(row.dataset.savedReceived || 0) });
+   ```
+   Backend contract (new, optional field; omitting it behaves exactly as before):
+   ```
+   POST /api/:slug/inventory/purchases/:id/receive-lines
+     lines[].previousQuantityReceived?  — the quantityReceived the form was loaded with
+     If it no longer matches the saved value -> 409, and nothing is saved:
+       { error: "Received quantities were changed since this form was opened. Reload the purchase and try again.",
+         code: "RECEIVED_QUANTITY_CHANGED" }
+   ```
+3. **Handle the 409.** In the `receive-lines` loop, on `code === 'RECEIVED_QUANTITY_CHANGED'`,
+   show a warning toast with the error text and reopen the modal with fresh data
+   (`openInvPurchaseEditModal(invEditPurchaseId)`). Don't retry automatically, and keep the
+   generic error handling for everything else.
+4. **Keep the bulk loader from overwriting fresh data.** In `loadInvPurchaseLinesBulk`, record
+   a counter or timestamp when the request starts, and skip the `Object.assign` if the cache
+   was cleared after that point (e.g. bump a `invPurchaseLinesCacheGen` counter wherever the
+   code does `invPurchaseLinesCache={}`).
+
+Don't change the #34 invoice popup, the Receipts list, or any other part of the form.
+
+**Existing test data:** after fix #1, reopen the purchase. If it now shows 4 / 6, only the
+display was stale and nothing needs doing. If it still shows 0 / 10, a stale save already
+reversed the receipts. Re-enter the real received quantity: it will ask for an invoice and
+record a new receipt, and the two old receipt rows stay in the Receipts list as history.

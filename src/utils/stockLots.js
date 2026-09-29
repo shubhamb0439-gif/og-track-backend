@@ -116,7 +116,7 @@ function distributeConsumptionAcrossUnits(consumed, quantityPerUnit, unitCount) 
  * Creates a new lot for an item (received stock, opening balance, or a
  * manual positive correction) and returns the created row's id.
  */
-async function createLot(db, { itemId, lotRef, vendorId, purchaseItemId, quantity, unitCost, receivedDate, source, notes }) {
+async function createLot(db, { itemId, lotRef, vendorId, purchaseItemId, quantity, unitCost, receivedDate, source, notes, invoiceNumber }) {
   const id = 'lot' + Date.now() + Math.random().toString(36).slice(2, 6);
   await db('inv_stock_lots').insert({
     id,
@@ -130,6 +130,9 @@ async function createLot(db, { itemId, lotRef, vendorId, purchaseItemId, quantit
     received_date: receivedDate || new Date(),
     source: source || 'manual',
     notes: notes || null,
+    // Only written when given (purchase receipts) — every other caller
+    // (manufacturing, manual adjustments) inserts exactly what it did before.
+    ...(invoiceNumber ? { invoice_number: invoiceNumber } : {}),
   });
   return id;
 }

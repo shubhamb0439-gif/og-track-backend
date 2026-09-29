@@ -336,6 +336,7 @@ router.get('/items/:id/lots', async (req, res) => {
       quantityRemaining: Number(l.quantity_remaining),
       unitCost: Number(l.unit_cost),
       receivedDate: l.received_date, source: l.source, notes: l.notes,
+      invoiceNumber: l.invoice_number || null,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -435,6 +436,28 @@ router.get('/purchases/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /purchases/:id/receipts — receipt history for a purchase: one row per
+// stock lot created by /receive or /receive-lines (i.e. per line per
+// delivery), each with the invoice number captured for that delivery.
+router.get('/purchases/:id/receipts', async (req, res) => {
+  try {
+    const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
+    if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
+    const lines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
+    const lineIds = lines.map(l => l.id);
+    const lots = lineIds.length
+      ? await req.db('inv_stock_lots').whereIn('purchase_item_id', lineIds)
+          .orderBy('received_date', 'asc').orderBy('created_at', 'asc')
+      : [];
+    res.json(lots.map(l => ({
+      lotId: l.id, lotRef: l.lot_ref, purchaseItemId: l.purchase_item_id, itemId: l.item_id,
+      quantityReceived: Number(l.quantity_received),
+      invoiceNumber: l.invoice_number || null,
+      receivedDate: l.received_date, createdAt: l.created_at,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.post('/purchases', async (req, res) => {
   try {
     const { poNumber, vendorId, orderDate, expectedDate, invoiceNumber, currency, notes, lines } = req.body;
@@ -528,6 +551,7 @@ router.post('/purchases/:id/receive', async (req, res) => {
             vendorId: purchase.vendor_id, purchaseItemId: line.id,
             quantity: outstanding, unitCost: landedUnitCost,
             receivedDate: new Date(), source: 'purchase',
+            invoiceNumber: typeof invoiceNumber === 'string' ? invoiceNumber.trim() : null,
           });
           await createSerialUnitsForLot(trx, { itemId: line.item_id, lotId, purchaseItemId: line.id, quantity: outstanding });
           touchedItemIds.add(line.item_id);
@@ -558,10 +582,15 @@ router.post('/purchases/:id/receive', async (req, res) => {
 // /receive endpoint (which always force-completes every outstanding line),
 // this only advances each line to the quantityReceived the caller specifies,
 // and only creates a lot for the newly-received delta on that line.
-// Body: { lines: [{ purchaseItemId, quantityReceived }] }
+// Body: { lines: [{ purchaseItemId, quantityReceived, previousQuantityReceived? }], invoiceNumber? }
+// invoiceNumber is required whenever at least one line's received quantity
+// goes UP (a new delivery) and is stamped on every lot this call creates —
+// so each partial receipt keeps its own invoice. Pure reductions/no-ops
+// don't need one.
 router.post('/purchases/:id/receive-lines', async (req, res) => {
   try {
     const { lines } = req.body;
+    const invoiceNumber = typeof req.body.invoiceNumber === 'string' ? req.body.invoiceNumber.trim() : '';
     if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'lines is required' });
     const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
@@ -569,6 +598,31 @@ router.post('/purchases/:id/receive-lines', async (req, res) => {
 
     const existingLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
     const touchedItemIds = new Set();
+
+    const hasIncrease = lines.some(update => {
+      const line = existingLines.find(l => l.id === update.purchaseItemId);
+      if (!line) return false;
+      const newReceived = Math.max(0, Math.min(Number(line.quantity_ordered), Number(update.quantityReceived || 0)));
+      return newReceived > Number(line.quantity_received || 0);
+    });
+    if (hasIncrease && !invoiceNumber) {
+      return res.status(400).json({ error: 'Invoice number is required when received quantity is increased.', code: 'INVOICE_NUMBER_REQUIRED' });
+    }
+    if (invoiceNumber.length > 100) return res.status(400).json({ error: 'Invoice number must be 100 characters or fewer.' });
+
+    // Optional optimistic-concurrency guard: the caller can send the
+    // quantityReceived its form was loaded with. If the line has moved since
+    // (another save, another tab, a stale client cache), reject instead of
+    // silently treating the stale form value as a reduction and reversing
+    // stock that really was received.
+    const stale = lines.find(update => {
+      if (update.previousQuantityReceived === undefined || update.previousQuantityReceived === null) return false;
+      const line = existingLines.find(l => l.id === update.purchaseItemId);
+      return line && Number(update.previousQuantityReceived) !== Number(line.quantity_received || 0);
+    });
+    if (stale) {
+      return res.status(409).json({ error: 'Received quantities were changed since this form was opened. Reload the purchase and try again.', code: 'RECEIVED_QUANTITY_CHANGED' });
+    }
 
     // Same atomicity guarantee as /receive above: line update, lot
     // creation/consumption, and the purchase's resulting status all commit
@@ -591,6 +645,7 @@ router.post('/purchases/:id/receive-lines', async (req, res) => {
             vendorId: purchase.vendor_id, purchaseItemId: line.id,
             quantity: delta, unitCost: landedUnitCost,
             receivedDate: new Date(), source: 'purchase',
+            invoiceNumber,
           });
           await createSerialUnitsForLot(trx, { itemId: line.item_id, lotId, purchaseItemId: line.id, quantity: delta });
         } else {
