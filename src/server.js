@@ -56,6 +56,12 @@ app.use((req, _res, next) => { req.io = io; next(); });
 // its originating POST /aida/chat request has already returned).
 aidaJobRunner.start(io);
 
+// AIDA roadmap item 3 — watches the shared mailbox for mail addressed to a
+// watched recipient, summarizes it to WhatsApp, and escalates genuinely
+// urgent ones with a Twilio call. No-op (logs once and returns) if
+// Microsoft Graph credentials aren't configured on this server yet.
+require('./aida/emailMonitor').start();
+
 // ── Socket.io: per-tenant rooms ──────────────────────────────────────────────
 // Every client joins a room named after its company slug. All real-time
 // emits in the routes target io.to(slug), so OGTrack events never reach Cajo

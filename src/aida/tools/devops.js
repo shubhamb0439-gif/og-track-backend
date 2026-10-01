@@ -103,12 +103,17 @@ module.exports = [
       'feature with its own backend routes/database table, e.g. "create me a module called Attendance with ' +
       'these features: ...". (2) "page" — a standalone, self-contained HTML page with NO backend/database ' +
       'involved, e.g. "build me a landing page for a coffee shop" or "make me a Coming Soon page". Always use ' +
-      'this tool (not dev_repo_fix) for either kind of "build me something new" request. Clones the repo(s) ' +
-      'into disposable sandboxes, writes the code, and if successful, pushes a branch and opens a PR (both ' +
-      'repos\' PRs for a module, frontend-only for a page), and boots a LIVE local preview for a human to ' +
-      'click through before approving. Never merges or goes to production automatically. Runs as a background ' +
-      'job — returns a job id immediately; check the AIDA Job panel once it reaches awaiting_approval for the ' +
-      'preview link.',
+      'this tool (not dev_repo_fix) for either kind of "build me something new" request. If the human gives you ' +
+      'an actual URL and asks for a "1:1 replica" or a "redesigned/better version" of a real existing website, ' +
+      'ALWAYS pass that URL in `sourceUrl` — do not paraphrase or summarize the site into `features` yourself ' +
+      'from memory/guessing; the coding agent will actually crawl the real URL (via inspect_website) and use ' +
+      'what it finds, including downloading the site\'s real images, which is the only way a "replica" claim is ' +
+      'actually true. Clones the repo(s) into disposable sandboxes, writes the code, and if successful, pushes ' +
+      'a branch and opens a PR (both repos\' PRs for a module, frontend-only for a page). A real preview link ' +
+      'becomes available once GitHub/Azure finish building it (immediate for a module\'s backend half, up to a ' +
+      'few minutes for a page/frontend half) — check the AIDA Job panel once the job reaches awaiting_approval. ' +
+      'Never merges or goes to production automatically. Runs as a background job — returns a job id ' +
+      'immediately; ask me to check on it later.',
     requiredModules: [MASTERADMIN_SENTINEL_MODULE],
     inputSchema: {
       type: 'object',
@@ -122,12 +127,16 @@ module.exports = [
         features: {
           type: 'array',
           items: { type: 'string' },
-          description: 'For a module: the feature list, one item per feature (e.g. ["Clock in/out with GPS", "Weekly timesheet export"]). For a page: what it should contain/say, one item per section or requirement (e.g. ["Title and short description", "Email signup form"]).',
+          description: 'For a module: the feature list, one item per feature (e.g. ["Clock in/out with GPS", "Weekly timesheet export"]). For a page: what it should contain/say, one item per section or requirement (e.g. ["Title and short description", "Email signup form"]). If `sourceUrl` is set, this can just be brief extra notes/constraints (e.g. ["No checkout logic, just a showcase"]) since the agent will get the real content from the site itself — it does not need to be re-described here.',
+        },
+        sourceUrl: {
+          type: 'string',
+          description: 'Only when the human wants a replica/redesign of a REAL existing website — the exact URL to crawl and base the build on. Omit entirely for anything built from a plain description with no real site to reference.',
         },
       },
       required: ['moduleName', 'features'],
     },
-    async handler(context, { moduleName, features, kind }) {
+    async handler(context, { moduleName, features, kind, sourceUrl }) {
       if (!config.aida.moduleBuilder.enabled) {
         return { error: 'The module builder is not fully configured on this server yet (missing repo names or the staging database connection).' };
       }
@@ -135,11 +144,11 @@ module.exports = [
         return { error: 'The coding agent is not configured on this server yet (missing its provider API key).' };
       }
       const effectiveKind = kind === 'page' ? 'page' : 'module';
-      const job = await jobStore.createJob({ kind: 'create_module', createdByUserId: context.userId, payload: { moduleName, features, kind: effectiveKind } });
+      const job = await jobStore.createJob({ kind: 'create_module', createdByUserId: context.userId, payload: { moduleName, features, kind: effectiveKind, sourceUrl: sourceUrl || null } });
       return {
         jobId: job.id,
         status: job.status,
-        message: `Started building the "${moduleName}" ${effectiveKind} (job ${job.id}). This runs in the background and can take a while — ask me to check on it, or watch the AIDA Job panel for the live preview link once it's ready for review.`,
+        message: `Started building the "${moduleName}" ${effectiveKind} (job ${job.id}). This runs in the background and can take a while — ask me to check on it later.`,
       };
     },
   },

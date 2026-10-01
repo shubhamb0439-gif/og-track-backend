@@ -36,4 +36,24 @@ async function uploadBuffer(buffer, blobName, contentType, containerName = logoC
   return blockBlobClient.url;
 }
 
-module.exports = { uploadBuffer, logoContainerName };
+/**
+ * Creates `containerName` if it doesn't exist yet, with NO public access
+ * (unlike the logo container's anonymous-read setup) — for private,
+ * server-only blobs like the coding-agent's node_modules cache, where reads
+ * always go through this same authenticated client, never a public URL.
+ */
+async function ensurePrivateContainer(containerName) {
+  const containerClient = getBlobServiceClient().getContainerClient(containerName);
+  await containerClient.createIfNotExists();
+  return containerClient;
+}
+
+/** Downloads a blob as a Buffer, or null if it doesn't exist — for private containers via ensurePrivateContainer. */
+async function downloadBuffer(blobName, containerName) {
+  const containerClient = getBlobServiceClient().getContainerClient(containerName);
+  const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+  if (!(await blockBlobClient.exists())) return null;
+  return blockBlobClient.downloadToBuffer();
+}
+
+module.exports = { uploadBuffer, downloadBuffer, ensurePrivateContainer, logoContainerName };

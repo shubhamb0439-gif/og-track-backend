@@ -3,7 +3,9 @@ const path = require('path');
 const sql = require('mssql');
 const config = require('../../../config');
 const { createSandbox } = require('../../codingAgent/sandbox');
-const { runCommand, listFiles, readFile } = require('../../codingAgent/tools');
+const { runCommand, listFiles, readFile, downloadFile } = require('../../codingAgent/tools');
+const browserless = require('../../codingAgent/browserless');
+const depsCache = require('../../codingAgent/depsCache');
 const { snapshotExistingFiles } = require('../../codingAgent/moduleGuardrails');
 // Same provider switch as devFix.js — AIDA_CODING_AGENT_PROVIDER=anthropic
 // picks this up automatically, no code change needed beyond this file
@@ -71,8 +73,100 @@ function nextSchemaScriptNumber(backendSandboxDir) {
   return String(next).padStart(2, '0');
 }
 
-function buildTask({ moduleName, slug, features, nextNumber }) {
-  return `Build a brand-new OG Track module called "${moduleName}" (module key: "${slug}").
+// Live-verified as a real, repeatable failure mode: even with
+// inspect_website/download_file registered and the model explicitly told
+// (in both the system prompt and here) to call them first, it sometimes
+// just doesn't — and then fabricates plausible-sounding content while
+// falsely claiming it "has no internet access" (an LLM instruction-
+// following failure, not a wiring bug — confirmed live on a fresh restart
+// with all the wiring genuinely in place). So the actual crawl/download no
+// longer depends on the agent choosing to do it — see autoInspectSource()
+// below, called from run() BEFORE the agent even starts. This preamble is
+// now just the fallback for when that automatic step wasn't possible at all
+// (Browserless not configured, or the crawl itself failed) — the agent
+// still has inspect_website/download_file available to try itself there,
+// on the chance it does better than nothing.
+function buildSourceUrlPreamble(sourceUrl, researchSummary) {
+  if (!sourceUrl) return '';
+  if (researchSummary) return `${researchSummary}\n\n`;
+  return `Reference/source site to replicate or redesign: ${sourceUrl}
+
+Automatic inspection of this URL was not possible this time (see the job's event log for why) — try
+calling inspect_website on it yourself before writing any HTML. If that also fails, say so PLAINLY in
+your finish summary rather than fabricating placeholder content and presenting it as if it were the
+real site.
+
+`;
+}
+
+/**
+ * Deterministically crawls sourceUrl (when given) and downloads a bounded
+ * number of its real images, BEFORE the agent loop starts — see the big
+ * comment on buildSourceUrlPreamble above for why this can no longer be left
+ * to the agent's own discretion. Runs against the frontend sandbox, since
+ * both a "page" and a "module" task's user-facing replica content lands
+ * there. Best-effort: any failure here just means the agent falls back to
+ * trying the tools itself (via buildSourceUrlPreamble's fallback text), it
+ * never fails the whole job.
+ */
+async function autoInspectSource({ job, appendEvent, sandboxDir, sourceUrl, maxPages }) {
+  if (!sourceUrl) return null;
+  if (!config.aida.browserless.enabled) {
+    await appendEvent(job.id, 'source_inspection_skipped', { reason: 'Browserless not configured (missing BROWSERLESS_API_KEY)' });
+    return null;
+  }
+
+  await appendEvent(job.id, 'inspecting_source', { sourceUrl, maxPages });
+  let inspection;
+  try {
+    inspection = await browserless.inspectWebsite(sandboxDir, sourceUrl, { maxPages });
+  } catch (e) {
+    await appendEvent(job.id, 'source_inspection_failed', { error: e.message });
+    return null;
+  }
+
+  const downloadedImages = [];
+  for (const page of inspection.pages) {
+    if (page.error) continue;
+    for (const img of (page.images || []).slice(0, 12)) {
+      const ext = (img.src.split('.').pop() || 'jpg').split(/[?#]/)[0].slice(0, 5).replace(/[^a-z0-9]/gi, '') || 'jpg';
+      const localPath = `images/src_${downloadedImages.length}.${ext}`;
+      try {
+        await downloadFile(sandboxDir, localPath, img.src);
+        downloadedImages.push({ originalSrc: img.src, alt: img.alt, localPath });
+      } catch {
+        // best-effort — one failed image shouldn't block the rest or the job
+      }
+    }
+  }
+
+  await appendEvent(job.id, 'source_inspected', { pageCount: inspection.pages.length, imagesDownloaded: downloadedImages.length });
+  return { inspection, downloadedImages };
+}
+
+function buildResearchSummary({ inspection, downloadedImages }) {
+  const pageLines = inspection.pages.map((p, i) => (
+    p.error
+      ? `Page ${i}: ${p.url} — failed to load (${p.error})`
+      : `Page ${i}: ${p.url}\n  Title: ${p.title || '(none)'}\n  Full cleaned HTML already saved at: ${p.htmlFile} — you MUST read_file this before writing anything, the preview below is NOT enough on its own.\n  Preview: ${p.textPreview}`
+  )).join('\n\n');
+
+  const imageLines = downloadedImages.length
+    ? downloadedImages.map((img) => `  ${img.localPath}  (captured from: ${img.originalSrc}${img.alt ? `, alt: "${img.alt}"` : ''})`).join('\n')
+    : '  (none found/downloaded)';
+
+  return `RESEARCH ALREADY DONE FOR YOU — the real source site has ALREADY been crawled and its real images ALREADY downloaded into this sandbox. Do NOT call inspect_website or download_file again for anything listed below (only use them for something genuinely missing, e.g. one extra page/image you notice isn't covered here).
+
+${pageLines}
+
+Images already downloaded into this sandbox's images/ folder — reference these EXACT LOCAL paths in your HTML (e.g. <img src="images/src_0.jpg">). Do NOT reference the original external URL — that is not a real replica of the image, only a link back to someone else's server:
+${imageLines}
+
+Base your actual replica on what read_file shows you for the page(s) above — not on any assumption or general-knowledge guess about what a site with this name/URL might contain. If what you read doesn't match what you expected, trust what you read.`;
+}
+
+function buildTask({ moduleName, slug, features, nextNumber, sourceUrl, researchSummary }) {
+  return `${buildSourceUrlPreamble(sourceUrl, researchSummary)}Build a brand-new OG Track module called "${moduleName}" (module key: "${slug}").
 
 Requested features:
 ${formatFeatures(features)}
@@ -94,8 +188,8 @@ file, do NOT edit it — describe the exact line(s) needed in your finish summar
 }
 
 /** A "page" request is frontend-only — no backend route, no schema, no server.js/provisioning.js edits, no sidebar entry. Just one new self-contained HTML file. */
-function buildPageTask({ moduleName, slug, features }) {
-  return `Build a standalone, self-contained HTML page called "${moduleName}" at ${slug}.html.
+function buildPageTask({ moduleName, slug, features, sourceUrl, researchSummary }) {
+  return `${buildSourceUrlPreamble(sourceUrl, researchSummary)}Build a standalone, self-contained HTML page called "${moduleName}" at ${slug}.html.
 
 What it should contain:
 ${formatFeatures(features)}
@@ -111,7 +205,7 @@ requested features say otherwise.`;
 
 module.exports = {
   async run(job, { appendEvent, updateStatus }) {
-    const { moduleName, features, kind } = job.payload || {};
+    const { moduleName, features, kind, sourceUrl } = job.payload || {};
     const isPage = kind === 'page';
     if (!moduleName || !String(moduleName).trim()) {
       await updateStatus(job.id, 'failed', { errorMessage: 'Missing moduleName in job payload.' });
@@ -134,13 +228,28 @@ module.exports = {
     const slug = slugify(moduleName);
     const [backendOwner, backendRepoName] = mb.backendRepo.split('/');
     const [frontendOwner, frontendRepoName] = mb.frontendRepo.split('/');
-    await appendEvent(job.id, 'started', { moduleName, slug, features });
+    await appendEvent(job.id, 'started', { moduleName, slug, features, sourceUrl });
+
+    // A "page" task's own instructions forbid touching the backend repo at
+    // all (see buildPageTask) — so for that kind, skip materializing/
+    // installing the backend sandbox entirely instead of paying for it and
+    // never using it. This repo's own npm install (mssql, knex, socket.io,
+    // several AI SDKs) is genuinely heavy on a cold sandbox — confirmed the
+    // single biggest cost in a real ~15-minute "one simple HTML page" run.
+    // The module-builder agent's tool dispatch already treats a missing
+    // sandboxDirs.backend as a clean per-call error (see
+    // providers/moduleBuilder.js / anthropicModuleBuilder.js's
+    // `if (!sandboxDir) return { error: ... }`), so this is safe even if the
+    // agent ever mistakenly tries a backend-repo tool call on a page task.
+    const needsBackend = !isPage;
 
     let backendSandbox, frontendSandbox;
     try {
-      backendSandbox = await createSandbox(backendOwner, backendRepoName, ca.githubToken);
-      frontendSandbox = await createSandbox(frontendOwner, frontendRepoName, ca.githubToken);
-      await appendEvent(job.id, 'cloned', { backendRepo: mb.backendRepo, frontendRepo: mb.frontendRepo });
+      [backendSandbox, frontendSandbox] = await Promise.all([
+        needsBackend ? createSandbox(backendOwner, backendRepoName, ca.githubToken) : Promise.resolve(null),
+        createSandbox(frontendOwner, frontendRepoName, ca.githubToken),
+      ]);
+      await appendEvent(job.id, 'cloned', { backendRepo: needsBackend ? mb.backendRepo : null, frontendRepo: mb.frontendRepo, backendSkipped: !needsBackend });
 
       await appendEvent(job.id, 'installing');
       // Not every repo here is guaranteed to be an npm project — the
@@ -149,17 +258,24 @@ module.exports = {
       // by serve.js, no build step). Running `npm install` against a
       // directory with no package.json fails hard (ENOENT), so check first
       // and skip per-sandbox rather than assuming every repo needs it.
-      const [backendHasPkg, frontendHasPkg] = [
-        fs.existsSync(path.join(fs.realpathSync(backendSandbox.dir), 'package.json')),
-        fs.existsSync(path.join(fs.realpathSync(frontendSandbox.dir), 'package.json')),
-      ];
+      const backendHasPkg = needsBackend && fs.existsSync(path.join(fs.realpathSync(backendSandbox.dir), 'package.json'));
+      const frontendHasPkg = fs.existsSync(path.join(fs.realpathSync(frontendSandbox.dir), 'package.json'));
+
+      const installOne = async (sandbox, hasPkg, label) => {
+        if (!hasPkg) return { exitCode: 0, skipped: true };
+        const restored = await depsCache.tryRestore(sandbox.dir);
+        if (restored) {
+          await appendEvent(job.id, 'deps_cache_hit', { repo: label });
+          return { exitCode: 0, cached: true };
+        }
+        const result = await runCommand(sandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 });
+        if (result.exitCode === 0) await depsCache.saveCacheSafely(sandbox.dir, label);
+        return result;
+      };
+
       const [backendInstall, frontendInstall] = await Promise.all([
-        backendHasPkg
-          ? runCommand(backendSandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 })
-          : Promise.resolve({ exitCode: 0, skipped: true }),
-        frontendHasPkg
-          ? runCommand(frontendSandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 })
-          : Promise.resolve({ exitCode: 0, skipped: true }),
+        needsBackend ? installOne(backendSandbox, backendHasPkg, 'backend') : Promise.resolve({ exitCode: 0, skipped: true }),
+        installOne(frontendSandbox, frontendHasPkg, 'frontend'),
       ]);
       if (backendInstall.exitCode !== 0 || frontendInstall.exitCode !== 0) {
         await updateStatus(job.id, 'failed', {
@@ -169,30 +285,45 @@ module.exports = {
         await appendEvent(job.id, 'failed', { stage: 'install' });
         return;
       }
-      await appendEvent(job.id, 'installed', { backendSkipped: !backendHasPkg, frontendSkipped: !frontendHasPkg });
+      await appendEvent(job.id, 'installed', {
+        backendSkipped: !backendHasPkg, frontendSkipped: !frontendHasPkg,
+        backendCached: !!backendInstall.cached, frontendCached: !!frontendInstall.cached,
+      });
 
       const branchName = `aida/module-${slug}-${job.id}`;
-      await createBranch(backendSandbox, branchName);
+      if (needsBackend) await createBranch(backendSandbox, branchName);
       await createBranch(frontendSandbox, branchName);
 
-      const existingFiles = { backend: snapshotExistingFiles(backendSandbox.dir), frontend: snapshotExistingFiles(frontendSandbox.dir) };
+      const existingFiles = { backend: needsBackend ? snapshotExistingFiles(backendSandbox.dir) : new Set(), frontend: snapshotExistingFiles(frontendSandbox.dir) };
       const originalContents = { backend: new Map(), frontend: new Map() };
-      for (const f of mb.insertOnlyFiles.backend) {
-        try { originalContents.backend.set(f, readFile(backendSandbox.dir, f)); } catch { /* file may not exist in this checkout — write will fail its own way */ }
+      if (needsBackend) {
+        for (const f of mb.insertOnlyFiles.backend) {
+          try { originalContents.backend.set(f, readFile(backendSandbox.dir, f)); } catch { /* file may not exist in this checkout — write will fail its own way */ }
+        }
       }
       for (const f of mb.insertOnlyFiles.frontend) {
         try { originalContents.frontend.set(f, readFile(frontendSandbox.dir, f)); } catch { /* same as above */ }
       }
 
-      const nextNumber = nextSchemaScriptNumber(backendSandbox.dir);
+      const nextNumber = needsBackend ? nextSchemaScriptNumber(backendSandbox.dir) : null;
+
+      let researchSummary = null;
+      if (sourceUrl) {
+        const auto = await autoInspectSource({
+          job, appendEvent, sandboxDir: frontendSandbox.dir, sourceUrl,
+          maxPages: isPage ? 1 : 5, // a "page" task means ONE page by definition — no reason to crawl the whole site
+        });
+        if (auto) researchSummary = buildResearchSummary(auto);
+      }
+
       const task = isPage
-        ? buildPageTask({ moduleName, slug, features })
-        : buildTask({ moduleName, slug, features, nextNumber });
+        ? buildPageTask({ moduleName, slug, features, sourceUrl, researchSummary })
+        : buildTask({ moduleName, slug, features, nextNumber, sourceUrl, researchSummary });
 
       await appendEvent(job.id, 'agent_started');
       const toolLog = [];
       const agentResult = await runModuleBuilderAgent({
-        sandboxDirs: { backend: backendSandbox.dir, frontend: frontendSandbox.dir },
+        sandboxDirs: { backend: needsBackend ? backendSandbox.dir : null, frontend: frontendSandbox.dir },
         task,
         existingFiles,
         insertOnlyFiles: mb.insertOnlyFiles,
@@ -217,7 +348,7 @@ module.exports = {
       }
 
       const [backendCommit, frontendCommit] = await Promise.all([
-        commitAll(backendSandbox, `AIDA: add ${slug} module (backend)`),
+        needsBackend ? commitAll(backendSandbox, `AIDA: add ${slug} module (backend)`) : Promise.resolve({ committed: false }),
         commitAll(frontendSandbox, `AIDA: add ${slug} module (frontend)`),
       ]);
 
@@ -251,31 +382,36 @@ module.exports = {
         await appendEvent(job.id, 'frontend_pr_opened', { prNumber: frontendPr.number, prUrl: frontendPr.html_url });
       }
 
-      // The agent's new SQL file isn't in MODULE_TO_SCRIPT yet (that only
-      // happens once the backend PR merges), so the normal provisioning
-      // path can't pick it up — run whatever NEW .sql files the agent added
-      // directly against the staging DB here, so the preview actually has
-      // the module's own tables before it boots.
-      const newSqlFiles = listFiles(backendSandbox.dir, 'ogtrack-sql-schema/tenant', { recursive: false })
-        .filter((f) => f.endsWith('.sql') && !existingFiles.backend.has(f));
-      if (newSqlFiles.length) {
-        await appendEvent(job.id, 'seeding_preview_schema', { files: newSqlFiles });
-        try {
-          await applyNewSchemaFilesToStaging(newSqlFiles, backendSandbox.dir, mb.stagingDb);
-          await appendEvent(job.id, 'preview_schema_seeded');
-        } catch (e) {
-          await appendEvent(job.id, 'preview_schema_seed_failed', { error: e.message });
+      // A page task never touches the backend repo at all (no sandbox, no
+      // schema) — the schema-seed/module-enable steps below only apply to a
+      // real module.
+      if (needsBackend) {
+        // The agent's new SQL file isn't in MODULE_TO_SCRIPT yet (that only
+        // happens once the backend PR merges), so the normal provisioning
+        // path can't pick it up — run whatever NEW .sql files the agent added
+        // directly against the staging DB here, so the preview actually has
+        // the module's own tables before it boots.
+        const newSqlFiles = listFiles(backendSandbox.dir, 'ogtrack-sql-schema/tenant', { recursive: false })
+          .filter((f) => f.endsWith('.sql') && !existingFiles.backend.has(f));
+        if (newSqlFiles.length) {
+          await appendEvent(job.id, 'seeding_preview_schema', { files: newSqlFiles });
+          try {
+            await applyNewSchemaFilesToStaging(newSqlFiles, backendSandbox.dir, mb.stagingDb);
+            await appendEvent(job.id, 'preview_schema_seeded');
+          } catch (e) {
+            await appendEvent(job.id, 'preview_schema_seed_failed', { error: e.message });
+          }
         }
-      }
-      // Every module is gated per-company via enabled_modules (same as
-      // attendance, CRM, etc.) — a module this new was never in the preview
-      // company's list (it didn't exist when the staging DB was seeded), so
-      // without this it would silently 403/hide in the preview even with
-      // everything else working correctly.
-      try {
-        await enableModuleForPreviewCompany(slug, mb.stagingDb, mb.previewCompanySlug);
-      } catch (e) {
-        await appendEvent(job.id, 'preview_module_enable_failed', { error: e.message });
+        // Every module is gated per-company via enabled_modules (same as
+        // attendance, CRM, etc.) — a module this new was never in the preview
+        // company's list (it didn't exist when the staging DB was seeded), so
+        // without this it would silently 403/hide in the preview even with
+        // everything else working correctly.
+        try {
+          await enableModuleForPreviewCompany(slug, mb.stagingDb, mb.previewCompanySlug);
+        } catch (e) {
+          await appendEvent(job.id, 'preview_module_enable_failed', { error: e.message });
+        }
       }
 
       // Backend: the "preview" deployment slot auto-deploys any pushed

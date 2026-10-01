@@ -64,6 +64,50 @@ function writeFile(sandboxRoot, relPath, content) {
   return { bytesWritten: Buffer.byteLength(content, 'utf8') };
 }
 
+// Real, binary-safe cousin of writeFile — that one always encodes as 'utf8',
+// which silently corrupts any binary content (an image passed as a base64
+// string through it comes out as garbage bytes, not a valid file). Added
+// once a real gap surfaced live: a coding agent asked to build a "1:1
+// replica" of a real website had NO way to get any actual image bytes into
+// the sandbox at all, only text/HTML — see docs/FRONTEND_PROMPTS.md-adjacent
+// AIDA roadmap item 7 notes. Deliberately its own function rather than an
+// options flag on writeFile, since the two have almost nothing in common
+// once you account for encoding, network I/O, and size limits.
+const MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024; // 8MB — comfortably covers real web images/fonts/small PDFs, guards against something huge
+const DOWNLOAD_TIMEOUT_MS = 20_000;
+
+async function downloadFile(sandboxRoot, relPath, url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`"${url}" is not a valid absolute URL.`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error(`Only http/https URLs can be downloaded, got "${parsed.protocol}".`);
+  }
+  const abs = resolveSafe(sandboxRoot, relPath);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`"${url}" is ${buf.length} bytes — too large to download (limit ${MAX_DOWNLOAD_BYTES}).`);
+  }
+
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, buf); // no encoding argument — real binary write, unlike writeFile above
+  return { bytesWritten: buf.length };
+}
+
 function listFiles(sandboxRoot, relDir, { recursive = false } = {}) {
   // Resolve the root ONCE and use that consistently for every relative-path
   // computation below — mixing the raw sandboxRoot with a realpath-resolved
@@ -172,4 +216,4 @@ function sandboxEnv() {
   return base;
 }
 
-module.exports = { readFile, writeFile, listFiles, runCommand, resolveSafe, SandboxPathError, MAX_READ_BYTES };
+module.exports = { readFile, writeFile, downloadFile, listFiles, runCommand, resolveSafe, SandboxPathError, MAX_READ_BYTES };

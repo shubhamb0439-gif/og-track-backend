@@ -1,6 +1,7 @@
 const OpenAI = require('openai');
 const config = require('../../../config');
 const tools = require('../tools');
+const browserless = require('../browserless');
 const { assertModuleWriteAllowed } = require('../moduleGuardrails');
 
 /**
@@ -82,6 +83,38 @@ const TOOL_SCHEMAS = [
   {
     type: 'function',
     function: {
+      name: 'inspect_website',
+      description: 'Crawls a real website (up to `maxPages` same-origin pages, default 15) via a hosted headless browser and saves its content (files land in the given repo\'s sandbox). Does NOT return full page content inline — it saves each page\'s cleaned HTML and a screenshot as files under _website_inspection/, and returns only a short index (url, title, a short text preview, a list of real image URLs found on the page, and file paths). Use read_file on the returned htmlFile path(s) to pull full content for whichever specific page(s) you actually need, and download_file on the returned image URLs to get the site\'s ACTUAL images into your replica. Use this before building a page/module that replicates or redesigns an existing website — never guess at a site\'s structure/content without inspecting it first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          repo: REPO_ENUM,
+          url: { type: 'string', description: 'The starting URL to inspect, e.g. "https://example.com".' },
+          maxPages: { type: 'integer', description: 'Max same-origin pages to crawl (default 15) — use a smaller number for a single-page task.' },
+        },
+        required: ['repo', 'url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'download_file',
+      description: 'Downloads a real file from an external http(s) URL (e.g. one of the image URLs inspect_website returned) into the given repo\'s sandbox, as a real, correctly-encoded binary file. Unlike write_file (which always encodes as text and would corrupt binary content), this is the ONLY way to get a real image/asset\'s actual bytes into the sandbox — use it whenever a replica needs to include the site\'s real images rather than just referencing the original site\'s URL.',
+      parameters: {
+        type: 'object',
+        properties: {
+          repo: REPO_ENUM,
+          url: { type: 'string', description: 'Absolute http(s) URL to download.' },
+          path: { type: 'string', description: 'Where to save it, relative to that repo\'s sandbox root, e.g. "images/logo.png".' },
+        },
+        required: ['repo', 'url', 'path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'finish',
       description: 'Call this exactly once, when you are completely done (whether you succeeded, partially succeeded, or could not build the module). Ends the session.',
       parameters: {
@@ -154,7 +187,15 @@ ${frontendRegistration}
 7. Call finish exactly once. Its summary is read directly by a human deciding whether to approve a live
    preview and push this to production — write it for that audience: what the module does, what you
    built on each side, and any manual step still genuinely needed (only for files outside your insert-only
-   access — see rule 5).`;
+   access — see rule 5).
+
+If your task is to replicate or redesign an existing website: use inspect_website FIRST — never guess at
+or paraphrase a site's real structure/content/images from memory. "1:1 replica" means reproduce what you
+actually captured as faithfully as possible, INCLUDING using download_file to get its real images into the
+sandbox — referencing the original site's own image URL is not a replica of the image, it's just a link
+back to the original site. "Better-looking version" means keep the same content and information
+architecture but improve the visual design — same inspection step, different instruction on what to do
+with what you found.`;
 }
 
 /**
@@ -240,6 +281,22 @@ function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalCont
         return { files: tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
       case 'run_command':
         return tools.runCommand(sandboxDir, args.command, args.args || []);
+      case 'inspect_website':
+        return browserless.inspectWebsite(sandboxDir, args.url, { maxPages: args.maxPages || 15 }).catch((e) => ({ error: e.message }));
+      case 'download_file': {
+        // Same guardrail check write_file gets, above — download_file writes
+        // to an arbitrary agent-chosen path just like write_file does, and
+        // without this an agent could silently overwrite any real existing
+        // file (e.g. src/config.js) with downloaded binary content.
+        assertModuleWriteAllowed({
+          relPath: args.path,
+          content: '', // binary/unknown content — the only content-based check here is the destructive-SQL regex, which doesn't apply to a downloaded asset
+          existingFiles: existingFiles[repo],
+          insertOnlyFiles: insertOnlyFiles[repo] || [],
+          previousContent: originalContents[repo]?.get(normalizeForLookup(args.path)),
+        });
+        return tools.downloadFile(sandboxDir, args.path, args.url).catch((e) => ({ error: e.message }));
+      }
       default:
         return { error: `Unknown tool "${name}".` };
     }

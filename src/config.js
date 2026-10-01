@@ -220,6 +220,23 @@ module.exports = {
           githubToken: process.env.AIDA_CODING_AGENT_GITHUB_TOKEN || null,
         };
       })(),
+      // AIDA roadmap item 7 — website inspection → 1:1 replica or redesign.
+      // A hosted browser-automation API (Browserless), not a self-hosted
+      // Playwright/Chromium — confirmed live that the coding-agent sandbox
+      // runs directly in Azure App Service's own default Node runtime (see
+      // codingAgent/sandbox.js's comment re: git being missing there), a
+      // minimal image known not to carry the graphics/rendering system
+      // libraries headless Chromium needs and which can't have packages
+      // installed onto it (no root, no apt-get) — so self-hosting was ruled
+      // out without spending the spike on it. See codingAgent/browserless.js.
+      browserless: (() => {
+        const apiKey = process.env.BROWSERLESS_API_KEY || null;
+        return {
+          enabled: !!apiKey,
+          apiKey,
+          baseUrl: process.env.BROWSERLESS_BASE_URL || 'https://production-sfo.browserless.io',
+        };
+      })(),
       // Phase 2 of the power-tier plan — "AIDA, create me a module." Builds
       // across the SAME two repos every time (unlike dev_repo_fix, which
       // takes a repo per chat call), so they're configured once here rather
@@ -415,6 +432,47 @@ module.exports = {
     // reasoning as the rest of this block).
     frontendBaseUrl: process.env.FRONTEND_BASE_URL || null,
   },
+  // Microsoft Graph — AIDA roadmap item 3 (email monitoring). Client-
+  // credentials OAuth2 app registration against a real Microsoft 365
+  // mailbox, with Mail.Read APPLICATION permission (admin-consented) scoped
+  // to that mailbox via an Exchange application access policy — the mailbox
+  // itself is NOT owned by whoever the credentials belong to, it's a
+  // dedicated shared mailbox this app is granted read access to. See
+  // src/aida/emailMonitor.js. Deliberately NOT validated via required() —
+  // same "keep booting either way" reasoning as every other integration here.
+  microsoftGraph: (() => {
+    const tenantId = process.env.MS_GRAPH_TENANT_ID || null;
+    const clientId = process.env.MS_GRAPH_CLIENT_ID || null;
+    const clientSecret = process.env.MS_GRAPH_CLIENT_SECRET || null;
+    // Which "To" address triggers a watch, mapped to which WhatsApp number
+    // gets the summary — e.g. {"shubham@ogplus.in":"918310066102",
+    // "sp@sanj.co":"919845009748"}. The watched mailbox itself
+    // (config.microsoftGraph.mailbox) only needs to be CC'd for AIDA to see
+    // the mail at all — it's the "To" address that decides who gets notified.
+    let recipientRouting = {};
+    if (process.env.MS_GRAPH_RECIPIENT_ROUTING) {
+      try { recipientRouting = JSON.parse(process.env.MS_GRAPH_RECIPIENT_ROUTING); }
+      catch (e) { console.error('[config] MS_GRAPH_RECIPIENT_ROUTING is not valid JSON, ignoring:', e.message); }
+    }
+    return {
+      enabled: !!(tenantId && clientId && clientSecret),
+      tenantId, clientId, clientSecret,
+      mailbox: process.env.MS_GRAPH_MAILBOX || 'aida@sanj.co',
+      recipientRouting,
+      pollIntervalMs: parseInt(process.env.MS_GRAPH_POLL_INTERVAL_MS || '', 10) || 4 * 60 * 1000,
+    };
+  })(),
+  // Twilio (src/aida/twilio.js) — urgent-email voice-call escalation only
+  // (AIDA roadmap item 3). Not used for anything else in this phase.
+  twilio: (() => {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID || null;
+    const authToken = process.env.TWILIO_AUTH_TOKEN || null;
+    const fromNumber = process.env.TWILIO_FROM_NUMBER || null;
+    return {
+      enabled: !!(accountSid && authToken && fromNumber),
+      accountSid, authToken, fromNumber,
+    };
+  })(),
   // BigCommerce (src/routes/sitara.js's webhook + outbound status push) —
   // Sitara Bespoke's own store, global env vars per the user's own choice
   // (only one company uses this today). Deliberately NOT validated via
