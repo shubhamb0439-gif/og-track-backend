@@ -1,8 +1,16 @@
 const config = require('../config');
 const coreDb = require('../db/core');
-const { sendWhatsAppMessage } = require('./whatsapp');
+const { sendWhatsAppMessage, sendWhatsAppDocument } = require('./whatsapp');
 const { placeUrgentCall } = require('./twilio');
 const { callLLM } = require('./llmCompletion');
+const { getGraphToken } = require('./graphClient');
+const { extractTextFromBuffer } = require('./attachmentText');
+const emailLog = require('./emailLog');
+
+// Bounded so a message with many large attachments doesn't turn one email
+// into a flood of WhatsApp messages — matches the "first N" convention
+// autoInspectSource already uses for downloaded images elsewhere in AIDA.
+const MAX_ATTACHMENTS_TO_FORWARD = 3;
 
 /**
  * AIDA roadmap item 3 — watches a shared mailbox (config.microsoftGraph.mailbox,
@@ -33,22 +41,6 @@ const POLL_STATE_ID = 'singleton';
 
 let pollTimer = null;
 let polling = false;
-
-async function getGraphToken() {
-  const res = await fetch(`https://login.microsoftonline.com/${config.microsoftGraph.tenantId}/oauth2/v2.0/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: config.microsoftGraph.clientId,
-      client_secret: config.microsoftGraph.clientSecret,
-      scope: 'https://graph.microsoft.com/.default',
-      grant_type: 'client_credentials',
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error_description || `Graph token request failed (${res.status})`);
-  return data.access_token;
-}
 
 async function getState() {
   const row = await coreDb('ai_email_monitor_state').where({ id: POLL_STATE_ID }).first();
@@ -81,47 +73,31 @@ async function fetchDeltaPages(token, startUrl) {
   return { messages, deltaLink };
 }
 
-/** Extracts plain text from PDF/.docx attachments; skips every other type gracefully (per the plan). */
-async function fetchAttachmentsText(token, messageId) {
+/**
+ * Fetches every real file attachment on a message — both its raw bytes (for
+ * forwarding over WhatsApp, item 8.1) and, where the type supports it,
+ * extracted text (for the summarization prompt). Previously only did the
+ * latter and discarded the bytes entirely.
+ */
+async function fetchAttachments(token, messageId) {
   const res = await fetch(`${GRAPH_BASE}/users/${config.microsoftGraph.mailbox}/messages/${messageId}/attachments`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   const data = await res.json();
   if (!res.ok) {
     console.error(`[email-monitor] attachment list fetch failed for message ${messageId}:`, data.error?.message);
-    return '';
+    return [];
   }
 
-  const texts = [];
+  const attachments = [];
   for (const att of data.value || []) {
     if (att['@odata.type'] !== '#microsoft.graph.fileAttachment' || !att.contentBytes) continue;
     const name = att.name || 'attachment';
-    const lower = name.toLowerCase();
-    try {
-      const buf = Buffer.from(att.contentBytes, 'base64');
-      if (lower.endsWith('.pdf')) {
-        // v2's API is a class, not the plain callable function older v1 had
-        // (confirmed by reading node_modules/pdf-parse's own .d.ts files —
-        // require('pdf-parse') now returns { PDFParse, ...exception types },
-        // not a function).
-        const { PDFParse } = require('pdf-parse');
-        const parser = new PDFParse({ data: buf });
-        try {
-          const parsed = await parser.getText();
-          texts.push(`--- ${name} ---\n${parsed.text}`);
-        } finally {
-          await parser.destroy();
-        }
-      } else if (lower.endsWith('.docx')) {
-        const mammoth = require('mammoth');
-        const result = await mammoth.extractRawText({ buffer: buf });
-        texts.push(`--- ${name} ---\n${result.value}`);
-      }
-    } catch (e) {
-      console.error(`[email-monitor] failed to extract text from attachment "${name}":`, e.message);
-    }
+    const buffer = Buffer.from(att.contentBytes, 'base64');
+    const text = await extractTextFromBuffer(buffer, name);
+    attachments.push({ name, mimeType: att.contentType || 'application/octet-stream', buffer, text });
   }
-  return texts.join('\n\n');
+  return attachments;
 }
 
 const SUMMARY_SYSTEM_PROMPT = [
@@ -177,7 +153,8 @@ async function processMessage(token, message) {
   const match = matchedRecipient(message);
   if (!match) return; // not addressed to a watched recipient
 
-  const attachmentsText = message.hasAttachments ? await fetchAttachmentsText(token, message.id) : '';
+  const attachments = message.hasAttachments ? await fetchAttachments(token, message.id) : [];
+  const attachmentsText = attachments.map((a) => (a.text ? `--- ${a.name} ---\n${a.text}` : null)).filter(Boolean).join('\n\n');
   const bodyText = (message.body?.content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   const from = message.from?.emailAddress?.address || 'unknown sender';
   const subject = message.subject || '(no subject)';
@@ -186,6 +163,19 @@ async function processMessage(token, message) {
 
   const text = `📧 New email to ${match.watchedAddress}\nFrom: ${from}\nSubject: ${subject}\n\n${summary}`;
   await sendWhatsAppMessage(match.phoneNumber, text);
+
+  for (const att of attachments.slice(0, MAX_ATTACHMENTS_TO_FORWARD)) {
+    await sendWhatsAppDocument(match.phoneNumber, att.buffer, att.name, att.mimeType);
+  }
+
+  await emailLog.logEmail({
+    graphMessageId: message.id,
+    watchedAddress: match.watchedAddress,
+    fromAddress: from,
+    subject,
+    summary,
+    isUrgent,
+  }).catch((e) => console.error('[email-monitor] failed to log email for later reply:', e.message));
 
   if (isUrgent) {
     await placeUrgentCall(

@@ -7,7 +7,11 @@ const { MASTERADMIN_SENTINEL_MODULE } = require('../aida/contextBuilder');
 const { runTurn } = require('../aida/engine');
 const sessionMemory = require('../aida/sessionMemory');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
-const { sendWhatsAppMessage } = require('../aida/whatsapp');
+const { sendWhatsAppMessage, downloadWhatsAppMedia } = require('../aida/whatsapp');
+const { extractTextFromBuffer } = require('../aida/attachmentText');
+const pendingAttachments = require('../aida/pendingAttachments');
+
+const MAX_ATTACHMENT_TEXT_CHARS = 8_000;
 
 const router = express.Router();
 
@@ -115,13 +119,10 @@ router.post('/webhook', async (req, res) => {
     }
 
     const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!message || message.type !== 'text') return; // status callbacks, non-text messages, etc. — nothing to do
+    if (!message || !['text', 'document', 'image'].includes(message.type)) return; // status callbacks, audio/video, etc. — nothing to do
     if (alreadyProcessed(message.id)) return;
 
     const from = message.from;
-    const text = (message.text?.body || '').trim();
-    if (!text) return;
-
     const isAllowed = config.whatsapp.allowedNumbers.some((n) => last10(n) === last10(from));
     if (!isAllowed) {
       await sendWhatsAppMessage(from, "You don't have access.");
@@ -129,6 +130,40 @@ router.post('/webhook', async (req, res) => {
     }
 
     const context = await buildWhatsAppMasterAdminContext(from);
+
+    let text;
+    if (message.type === 'text') {
+      text = (message.text?.body || '').trim();
+      if (!text) return;
+    } else {
+      // 'document' or 'image' — download the real file, extract whatever
+      // text we can (documents only; there's no OCR/vision step for images
+      // yet), and hold the raw bytes so a follow-up "send it to X" in this
+      // same conversation has something real to attach — see
+      // pendingAttachments.js.
+      const media = message.document || message.image;
+      const filename = media.filename || `attachment.${(media.mime_type || '').split('/').pop() || 'bin'}`;
+      let buffer, mimeType;
+      try {
+        const downloaded = await downloadWhatsAppMedia(media.id);
+        buffer = downloaded.buffer;
+        mimeType = downloaded.mimeType || media.mime_type;
+      } catch (e) {
+        console.error('[whatsapp] failed to download inbound media:', e.message);
+        await sendWhatsAppMessage(from, "I couldn't download that file — try sending it again?");
+        return;
+      }
+      const extractedText = await extractTextFromBuffer(buffer, filename);
+      pendingAttachments.setPending(context, { filename, mimeType, buffer, text: extractedText });
+
+      const caption = (media.caption || '').trim();
+      text = [
+        caption,
+        `[The human just attached a file: "${filename}". It's available to forward/email if they ask you to send it somewhere.]`,
+        extractedText ? `Extracted content from the file:\n${extractedText.slice(0, MAX_ATTACHMENT_TEXT_CHARS)}` : '(no text could be extracted from this file type — you can still forward/email the original file itself.)',
+      ].filter(Boolean).join('\n\n');
+    }
+
     const history = sessionMemory.getHistory(context);
     const directive = config.aida.emotionEnabled ? buildDirective(text) : safeDirective(null);
     const result = await runTurn(context, text, history, directive);

@@ -1,7 +1,18 @@
 const jwt = require('jsonwebtoken');
 const config = require('../../config');
+const coreDb = require('../../db/core');
 const { callPlatformApi, callTenantApi } = require('../apiClient');
 const memory = require('../memory');
+const contacts = require('../contacts');
+const emailLog = require('../emailLog');
+const graphMail = require('../graphMail');
+const pendingAttachments = require('../pendingAttachments');
+
+/** The real email address of the master admin acting in this turn — used to CC them on anything AIDA sends on their behalf. */
+async function currentAdminEmail(context) {
+  const admin = await coreDb('platform_admins').where({ id: context.userId }).first();
+  return admin?.email || null;
+}
 
 /**
  * Master-admin-only tools (domain.com/master-admin/aida). These operate on
@@ -160,6 +171,142 @@ module.exports = [
     async handler(context, { id }) {
       const found = await memory.forgetMemory(id);
       return found ? { success: true } : { error: `No memory found with id "${id}".` };
+    },
+  },
+
+  {
+    name: 'send_email',
+    description:
+      "Sends a real email, from aida@sanj.co, to anyone — a known contact by name, or a fresh address. If both " +
+      "`to` and `name` are given, that pairing is remembered so just `name` works next time (e.g. after once " +
+      "being told \"email pooja, her address is pooja@ogplus.in\", a later \"mail pooja\" resolves automatically). " +
+      "If only `name` is given and it's not a known contact yet, this returns an error — ask the human for the " +
+      "address rather than guessing one. Set includeAttachment: true ONLY when the human attached a file/photo " +
+      "earlier in this same conversation and asked you to send/forward THAT specific file. SAFETY — a real, " +
+      "irreversible action: call this WITHOUT confirmed first, it returns a preview instead of sending. Read the " +
+      "preview back to the human and wait for their explicit yes in their NEXT message, then call again with the " +
+      "exact same arguments plus confirmed: true.",
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Recipient email address. Omit if sending to an already-known contact by name only.' },
+        name: { type: 'string', description: "The recipient's name — used to remember/look up their address." },
+        subject: { type: 'string' },
+        body: { type: 'string' },
+        includeAttachment: { type: 'boolean', description: 'Set true to attach the file the human most recently sent AIDA in this conversation.' },
+        confirmed: { type: 'boolean', description: 'Only set true after the human has explicitly confirmed sending, in a later message.' },
+      },
+      required: ['subject', 'body'],
+    },
+    async handler(context, { to, name, subject, body, includeAttachment, confirmed }) {
+      let recipient = to;
+      if (!recipient && name) {
+        const known = await contacts.findContactByName(name);
+        if (!known) return { error: `I don't have an email address saved for "${name}" yet — ask the human for it, then call this again with both "to" and "name".` };
+        recipient = known.email;
+      }
+      if (!recipient) return { error: 'Need either "to" or a "name" that\'s already a known contact.' };
+
+      let attachment = null;
+      if (includeAttachment) {
+        const pending = pendingAttachments.getPending(context);
+        if (!pending) return { error: "There's no recently-attached file in this conversation to include — ask the human to resend it." };
+        attachment = pending;
+      }
+
+      if (!confirmed) {
+        return {
+          status: 'needs_confirmation',
+          preview: { to: recipient, subject, body, attachment: attachment ? attachment.filename : null },
+          instruction: 'Read this preview back to the human and ask them to confirm before sending. Do NOT send until they explicitly say yes in their next message — then call this tool again with confirmed: true.',
+        };
+      }
+
+      if (name && to) await contacts.saveContact({ name, email: to });
+      const ccAddress = await currentAdminEmail(context);
+      try {
+        await graphMail.sendMail({
+          to: recipient, cc: ccAddress, subject, body,
+          attachments: attachment ? [{ filename: attachment.filename, mimeType: attachment.mimeType, buffer: attachment.buffer }] : undefined,
+        });
+      } catch (e) {
+        return { error: `Failed to send: ${e.message}` };
+      }
+      return { success: true, to: recipient, cc: ccAddress };
+    },
+  },
+
+  {
+    name: 'reply_to_email',
+    description:
+      "Replies to a real email AIDA previously surfaced over WhatsApp (one of the emails it summarized from the " +
+      "watched inbox) — sends a genuine threaded reply to the original sender, with the master admin's own email " +
+      "CC'd so they stay in the loop. Omit emailId to reply to whichever email was MOST RECENTLY summarized in " +
+      "this conversation (the natural default for \"reply to them saying...\"). SAFETY — a real, irreversible " +
+      "action: call this WITHOUT confirmed first, it returns a preview instead of sending. Read the preview back " +
+      "to the human and wait for their explicit yes in their NEXT message, then call again with confirmed: true.",
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        emailId: { type: 'string', description: 'The internal log id of the email to reply to — omit to use the most recent one.' },
+        replyText: { type: 'string', description: 'What to actually say in the reply.' },
+        confirmed: { type: 'boolean', description: 'Only set true after the human has explicitly confirmed sending, in a later message.' },
+      },
+      required: ['replyText'],
+    },
+    async handler(context, { emailId, replyText, confirmed }) {
+      const logged = emailId ? await emailLog.getById(emailId) : await emailLog.getMostRecent();
+      if (!logged) return { error: emailId ? `No logged email found with id "${emailId}".` : 'No emails have been logged yet to reply to.' };
+
+      const ccAddress = await currentAdminEmail(context);
+      if (!confirmed) {
+        return {
+          status: 'needs_confirmation',
+          preview: { replyingTo: logged.from_address, subject: logged.subject, replyText, cc: ccAddress },
+          instruction: 'Read this preview back to the human and ask them to confirm before sending. Do NOT send until they explicitly say yes in their next message — then call this tool again with confirmed: true.',
+        };
+      }
+
+      try {
+        await graphMail.replyToEmailWithCc({ messageId: logged.graph_message_id, commentText: replyText, ccAddress });
+      } catch (e) {
+        return { error: `Failed to send reply: ${e.message}` };
+      }
+      return { success: true, repliedTo: logged.from_address, cc: ccAddress };
+    },
+  },
+
+  {
+    name: 'remember_contact',
+    description: 'Saves or updates a name -> email address pairing for later use with send_email, without sending anything right now.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' }, email: { type: 'string' } },
+      required: ['name', 'email'],
+    },
+    async handler(context, { name, email }) {
+      const saved = await contacts.saveContact({ name, email });
+      return { success: true, contact: saved };
+    },
+  },
+
+  {
+    name: 'forget_contact',
+    description: 'Deletes a remembered contact by name — use when the human explicitly asks you to forget someone\'s saved email.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    },
+    async handler(context, { name }) {
+      const existing = await contacts.findContactByName(name);
+      if (!existing) return { error: `No saved contact found named "${name}".` };
+      await contacts.forgetContact(existing.id);
+      return { success: true };
     },
   },
 ];
