@@ -19,6 +19,7 @@ const { getCombinedStatus } = require('../aida/codingAgent/github');
 const { matchTodayCelebrations } = require('../aida/celebrations');
 const { tryResolvePreviewUrl } = require('../aida/jobs/previewResolver');
 const memory = require('../aida/memory');
+const { extractTextFromBuffer } = require('../aida/attachmentText');
 
 registerAllTools();
 sessionMemory.startSweeper();
@@ -34,6 +35,25 @@ const voiceInputUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
 });
+
+// Same pattern again — POST /chat's optional file-attachment field (the
+// Android app's attach-a-file feature). Multer only engages for an actual
+// multipart/form-data request; a plain JSON POST /chat (every existing
+// caller) passes straight through untouched, so this is purely additive.
+const chatFileUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 },
+});
+
+// Wraps multer the same way handleAudioUpload does below — a bad/oversized
+// upload returns clean JSON (400) instead of falling through to the
+// generic error handler.
+function handleChatFileUpload(req, res, next) {
+  chatFileUpload.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.message || 'File upload failed.' });
+    next();
+  });
+}
 
 // Wraps multer so a bad/oversized upload returns clean JSON (400) instead of
 // falling through to the generic error handler — still JSON either way
@@ -268,9 +288,25 @@ function createAidaRouter({ requireAuth, buildContext }) {
   //         provider?: string, model?: string }
   // provider/model are optional per-message overrides — omit both to use the
   // server's configured default, exactly as before this existed.
-  router.post('/chat', async (req, res) => {
+  //
+  // Also accepts an OPTIONAL multipart file attachment (the Android app's
+  // attach-a-file feature) — handleChatFileUpload's multer middleware only
+  // engages for an actual multipart/form-data request, so every existing
+  // plain-JSON caller is completely unaffected. When a file IS attached,
+  // its extracted text (reusing attachmentText.js — the same PDF/.docx
+  // extraction already built for email/WhatsApp attachments) is folded
+  // into the turn's message text, same pattern as the WhatsApp inbound-
+  // attachment handling in routes/whatsapp.js.
+  router.post('/chat', handleChatFileUpload, async (req, res) => {
     try {
-      const { message, voice, provider, model } = req.body || {};
+      const { voice, provider, model } = req.body || {};
+      let { message } = req.body || {};
+      if (req.file) {
+        const extractedText = await extractTextFromBuffer(req.file.buffer, req.file.originalname);
+        const fileNote = `[The human attached a file: "${req.file.originalname}".]` +
+          (extractedText ? `\n\nExtracted content from the file:\n${extractedText.slice(0, 8_000)}` : '\n\n(No text could be extracted from this file type.)');
+        message = [message?.trim(), fileNote].filter(Boolean).join('\n\n');
+      }
       if (!message || typeof message !== 'string' || !message.trim()) {
         return res.status(400).json({ error: 'message is required' });
       }

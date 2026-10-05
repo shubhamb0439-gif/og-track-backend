@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { recomputeItemStock, consumeStockFIFO, createLot } = require('../utils/stockLots');
+const { getHistoricalRate, BASE_CURRENCY } = require('../utils/currencyConvert');
 
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapVendor = (r) => r && ({
@@ -529,6 +530,22 @@ router.post('/purchases/:id/receive', async (req, res) => {
     if (purchase.status === 'received') return res.status(400).json({ error: 'Already received.' });
     if (purchase.status === 'cancelled') return res.status(400).json({ error: 'Purchase was cancelled.' });
 
+    // Real currency conversion, fetched ONCE here (an external API call has
+    // no business running inside the DB transaction below), using the rate
+    // as of the PO's own order_date — not today's rate; see
+    // utils/currencyConvert.js for why. A purchase already in INR skips
+    // this entirely (fxRate stays 1, zero behavior change). This is the
+    // fix for the real incident where a non-INR purchase's cost was stored
+    // completely unconverted.
+    let fxRate = 1;
+    if (purchase.currency && purchase.currency !== BASE_CURRENCY) {
+      try {
+        fxRate = await getHistoricalRate(purchase.currency, new Date(purchase.order_date));
+      } catch (e) {
+        return res.status(502).json({ error: `Couldn't fetch a real ${purchase.currency}->${BASE_CURRENCY} exchange rate — try again shortly. (${e.message})` });
+      }
+    }
+
     const lines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
     const touchedItemIds = new Set();
 
@@ -542,8 +559,8 @@ router.post('/purchases/:id/receive', async (req, res) => {
         const outstanding = Number(line.quantity_ordered) - Number(line.quantity_received || 0);
         if (outstanding > 0) {
           await trx('inv_purchase_items').where({ id: line.id }).update({ quantity_received: line.quantity_ordered });
-          const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
-            + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
+          const landedUnitCost = (Number(line.unit_cost || 0) * fxRate * Number(line.quantity_ordered)
+            + Number(line.freight_cost || 0) * fxRate + Number(line.import_charges || 0) * fxRate)
             / Number(line.quantity_ordered);
           const lotId = await createLot(trx, {
             itemId: line.item_id,
@@ -596,6 +613,17 @@ router.post('/purchases/:id/receive-lines', async (req, res) => {
     if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
     if (purchase.status === 'cancelled') return res.status(400).json({ error: 'Purchase was cancelled.' });
 
+    // Same real conversion as /receive above — fetched once, before the
+    // transaction, using the rate as of the PO's order_date.
+    let fxRate = 1;
+    if (purchase.currency && purchase.currency !== BASE_CURRENCY) {
+      try {
+        fxRate = await getHistoricalRate(purchase.currency, new Date(purchase.order_date));
+      } catch (e) {
+        return res.status(502).json({ error: `Couldn't fetch a real ${purchase.currency}->${BASE_CURRENCY} exchange rate — try again shortly. (${e.message})` });
+      }
+    }
+
     const existingLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
     const touchedItemIds = new Set();
 
@@ -636,8 +664,8 @@ router.post('/purchases/:id/receive-lines', async (req, res) => {
         if (delta === 0) continue;
 
         if (delta > 0) {
-          const landedUnitCost = (Number(line.unit_cost || 0) * Number(line.quantity_ordered)
-            + Number(line.freight_cost || 0) + Number(line.import_charges || 0))
+          const landedUnitCost = (Number(line.unit_cost || 0) * fxRate * Number(line.quantity_ordered)
+            + Number(line.freight_cost || 0) * fxRate + Number(line.import_charges || 0) * fxRate)
             / Number(line.quantity_ordered);
           const lotId = await createLot(trx, {
             itemId: line.item_id,
