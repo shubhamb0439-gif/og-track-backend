@@ -11,6 +11,8 @@ const { requireAuth } = require('./utils/auth');
 
 const companiesRoutes = require('./routes/companies');
 const masteradminRoutes = require('./routes/masteradmin');
+const masteradminZohoRoutes = require('./routes/masteradminZoho');
+const zohoRoutes = require('./routes/zoho');
 const usersRoutes = require('./routes/users');
 const projectsRoutes = require('./routes/projects');
 const bugsRoutes = require('./routes/bugs');
@@ -86,6 +88,7 @@ app.get('/health', async (_req, res) => {
 // ── Platform-level (masteradmin) routes — operate on OGCore, NOT tenant-scoped ─
 app.use('/api/companies', companiesRoutes);
 app.use('/api/masteradmin', masteradminRoutes);
+app.use('/api/masteradmin/zoho', masteradminZohoRoutes);
 // AIDA for master admin (domain.com/master-admin/aida) — cross-company tools only.
 app.use('/api/masteradmin/aida', masterAdminAidaRouter);
 // WhatsApp Business Cloud API bridge to AIDA's master-admin context — see
@@ -113,6 +116,12 @@ app.use('/api/:slug/conversations', resolveTenant, requireModule('messages'), me
 app.use('/api/:slug/acc', resolveTenant, requireModule(['acc_clients', 'acc_timer', 'acc_eod']), accountingRoutes);
 // HR suite (jobs, candidates, interviews) — any HR-related module checkbox unlocks it.
 app.use('/api/:slug/hr', resolveTenant, requireModule(['hr_dashboard','hr_jobs','hr_candidates','hr_interviews']), hrRoutes);
+// Zoho Books (AIDA roadmap item 5) — its OWN dedicated module, same pattern
+// as Sitara's own module suite rather than being folded into generic
+// sales/crm — gated behind 'zoho_books' like any other module, on top of
+// the existing role check (accounts_manager/superadmin) inside zohoRoutes
+// and whether master admin has actually linked this company to a connection.
+app.use('/api/:slug/zoho', resolveTenant, requireModule('zoho_books'), zohoRoutes);
 // Sales / CRM funnel (leads, prospects, customers, sales log) — gated by crm.
 app.use('/api/:slug/crm', resolveTenant, requireModule('crm'), crmRoutes);
 // Inventory (vendors, items, purchases) — gated by inventory.

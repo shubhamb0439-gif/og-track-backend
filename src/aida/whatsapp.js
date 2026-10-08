@@ -6,19 +6,33 @@ const config = require('../config');
  * previewResolver.js (proactively notifying once a preview link is ready).
  * Best-effort: logs and swallows failures rather than throwing, since a
  * failed notification should never break whatever real work triggered it.
+ *
+ * Retries once (short backoff) before giving up — a real incident showed a
+ * transient failure here is otherwise completely invisible: the caller
+ * never knew whether an alert actually sent, since this always returned
+ * void. Now returns { success, error? } so a caller that cares (see
+ * emailMonitor.js) can record the real outcome — every existing caller
+ * already ignores the return value, so this is purely additive.
  */
-async function sendWhatsAppMessage(to, body) {
-  try {
-    const url = `https://graph.facebook.com/v20.0/${config.whatsapp.phoneNumberId}/messages`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${config.whatsapp.accessToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }),
-    });
-    if (!res.ok) console.error('[whatsapp] send failed:', res.status, await res.text());
-  } catch (e) {
-    console.error('[whatsapp] send threw:', e.message);
+async function sendWhatsAppMessage(to, body, { retries = 1 } = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const url = `https://graph.facebook.com/v20.0/${config.whatsapp.phoneNumberId}/messages`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${config.whatsapp.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }),
+      });
+      if (res.ok) return { success: true };
+      lastError = `${res.status} ${await res.text()}`;
+    } catch (e) {
+      lastError = e.message;
+    }
+    if (attempt < retries) await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
   }
+  console.error('[whatsapp] send failed after retries:', lastError);
+  return { success: false, error: lastError };
 }
 
 /**

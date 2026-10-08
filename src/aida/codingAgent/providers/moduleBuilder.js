@@ -268,14 +268,21 @@ function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalCont
       case 'read_file':
         return { content: tools.readFile(sandboxDir, args.path) };
       case 'write_file': {
+        // See anthropicModuleBuilder.js's write_file case for why this is
+        // checked explicitly rather than defaulting to '' — a missing
+        // content key usually means the call was cut off mid-argument, not
+        // a deliberate empty file.
+        if (args.content === undefined) {
+          return { error: 'write_file call had no content — it was likely cut off because the file content was too long for one response. Try writing it again; if it still fails, the file may genuinely be too large for one write_file call.' };
+        }
         assertModuleWriteAllowed({
           relPath: args.path,
-          content: args.content ?? '',
+          content: args.content,
           existingFiles: existingFiles[repo],
           insertOnlyFiles: insertOnlyFiles[repo] || [],
           previousContent: originalContents[repo]?.get(normalizeForLookup(args.path)),
         });
-        return tools.writeFile(sandboxDir, args.path, args.content ?? '');
+        return tools.writeFile(sandboxDir, args.path, args.content);
       }
       case 'list_files':
         return { files: tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };

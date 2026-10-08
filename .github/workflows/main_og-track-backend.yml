@@ -62,3 +62,21 @@ jobs:
           slot-name: 'Production'
           package: .
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_0C1D2C90133E42048ECE8F47A0F7A4FF }}
+
+      # AIDA roadmap item 4a — a WhatsApp ping once the deploy above actually
+      # succeeds. Best-effort (|| true): a failed notification should never
+      # fail the deploy itself, same reasoning as every other proactive
+      # notification in this codebase being swallow-and-log rather than
+      # fatal. Needs DEPLOY_NOTIFY_SECRET set as a GitHub Actions secret,
+      # matching the same value as the server's own env var.
+      - name: 'Notify WhatsApp of successful deploy'
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          SUMMARY_JSON=$(echo "$COMMIT_MESSAGE" | head -c 200 | jq -Rs .)
+          curl -s -X POST "https://og-track-backend.azurewebsites.net/api/masteradmin/deploy-notify" \
+            -H "Content-Type: application/json" \
+            -H "X-Deploy-Secret: ${{ secrets.DEPLOY_NOTIFY_SECRET }}" \
+            -d "{\"version\": \"$SHORT_SHA\", \"summary\": $SUMMARY_JSON}" \
+            || true

@@ -13,7 +13,7 @@ function newId() {
   return `emaillog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function logEmail({ graphMessageId, watchedAddress, fromAddress, subject, summary, isUrgent }) {
+async function logEmail({ graphMessageId, watchedAddress, fromAddress, subject, summary, isUrgent, whatsappSent, whatsappError }) {
   const id = newId();
   await coreDb('ai_email_log').insert({
     id,
@@ -23,6 +23,10 @@ async function logEmail({ graphMessageId, watchedAddress, fromAddress, subject, 
     subject,
     summary,
     is_urgent: !!isUrgent,
+    // Nullable rather than defaulted to false — null means "we don't know"
+    // (e.g. a caller that never checked), distinct from a confirmed failure.
+    whatsapp_sent: whatsappSent === undefined ? null : !!whatsappSent,
+    whatsapp_error: whatsappError || null,
   });
   return { id, graphMessageId };
 }

@@ -1,5 +1,48 @@
 const express = require('express');
 const router = express.Router();
+const { getActiveConnectionForCompany } = require('../zoho/zohoAuth');
+const zohoClient = require('../zoho/zohoClient');
+
+/**
+ * Best-effort push of a just-created sale out to Zoho Books as a real
+ * invoice (AIDA roadmap item 5) — same "never block or roll back the local
+ * action" convention as BigCommerce/Razorpay elsewhere in this codebase.
+ * Deliberately called AFTER the sale's own DB transaction commits (an
+ * external network call has no business being inside that transaction),
+ * and never awaited by the request handler — a slow or failing Zoho call
+ * must never delay the sale-creation response.
+ */
+async function pushSaleToZoho(db, io, company, sale, customer, lineItems) {
+  // Zoho Books is its own toggleable module (like Sitara's own module
+  // suite), not something that silently activates just because a
+  // connection happens to exist — a company can have a connection
+  // configured and the module turned off, and this must stay quiet then.
+  const enabledModules = Array.isArray(company.enabled_modules) ? company.enabled_modules : [];
+  if (!enabledModules.includes('zoho_books')) return;
+
+  const conn = await getActiveConnectionForCompany(company.id);
+  if (!conn) return; // module enabled but no connection linked yet — leave zoho_sync_status null, not 'failed'
+
+  try {
+    const { zohoInvoiceId } = await zohoClient.createInvoice(company.id, {
+      customer: { name: customer.name, email: customer.email, phone: customer.phone },
+      lineItems: lineItems.map((li) => ({ name: li.name, quantity: li.quantity, rate: li.unitPrice })),
+      invoiceNumber: sale.sale_number,
+      date: sale.sale_date,
+    });
+    await db('sales').where({ id: sale.id }).update({ zoho_invoice_id: zohoInvoiceId, zoho_sync_status: 'synced', zoho_sync_error: null });
+  } catch (e) {
+    console.error(`[sales] Zoho invoice push failed for ${sale.sale_number}:`, e.message);
+    await db('sales').where({ id: sale.id }).update({ zoho_sync_status: 'failed', zoho_sync_error: e.message.slice(0, 4000) });
+  }
+
+  // The push happens AFTER the sale-creation response already went out, so
+  // this is the only way the frontend finds out it finished (success or
+  // failure) without polling — same 'sales:' event-naming convention as
+  // sales:sale_created below.
+  const updated = await db('sales').where({ id: sale.id }).first();
+  io.to(company.slug).emit('sales:zoho_sync_updated', mapSale(updated));
+}
 
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapSale = (r) => r && ({
@@ -9,6 +52,13 @@ const mapSale = (r) => r && ({
   subtotal: Number(r.subtotal || 0), tax: Number(r.tax || 0), total: Number(r.total || 0),
   isDelivered: !!r.is_delivered, notes: r.notes,
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
+  // null/null/null when this company has no Zoho Books connection, or the
+  // 'zoho_books' module isn't enabled — not an error state, just "not
+  // applicable". 'synced'/'failed' only appear once a real push attempt
+  // happened (see pushSaleToZoho above).
+  zohoInvoiceId: r.zoho_invoice_id || null,
+  zohoSyncStatus: r.zoho_sync_status || null,
+  zohoSyncError: r.zoho_sync_error || null,
 });
 
 const mapSaleItem = (r) => r && ({
@@ -250,6 +300,18 @@ router.post('/', async (req, res) => {
     const saved = await req.db('sales').where({ id: saleId }).first();
     req.io.to(req.company.slug).emit('sales:sale_created', mapSale(saved));
     res.json(mapSale(saved));
+
+    // Fire-and-forget — see pushSaleToZoho's own comment for why this is
+    // never awaited. A no-op (not an error) for any company with no Zoho
+    // connection linked (checked first thing inside the function).
+    const zohoLineItems = await req.db('sale_items as si')
+      .join('inv_items as i', 'i.id', 'si.item_id')
+      .where('si.sale_id', saleId)
+      .select('si.quantity', 'si.unit_price as unitPrice', 'i.display_name', 'i.name');
+    const saleForZoho = { ...saved, sale_date: new Date(saved.sale_date).toISOString().slice(0, 10) };
+    pushSaleToZoho(req.db, req.io, req.company, saleForZoho, customer, zohoLineItems.map((li) => ({
+      name: li.display_name || li.name, quantity: Number(li.quantity), unitPrice: Number(li.unitPrice),
+    }))).catch((e) => console.error(`[sales] unexpected error pushing ${saved.sale_number} to Zoho:`, e.message));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

@@ -50,16 +50,25 @@ async function notifyPreviewReady(job) {
  * doesn't need it. Returns the job (updated in place if something resolved,
  * otherwise unchanged).
  */
+// A resolved preview URL is always a real https:// SWA address — anything
+// else (null, or a stray http://localhost:<port> written by some other code
+// path) still needs resolving. Checking "not a real URL" instead of just
+// "== null" lets this self-heal a bad value already sitting in a job's
+// result, not just fill in a blank one.
+function isUnresolved(url) {
+  return !url || !url.startsWith('https://');
+}
+
 async function tryResolvePreviewUrl(job) {
   let updated = null;
 
-  if ((job.kind === 'dev_repo_fix' || job.kind === 'user_reported_issue_build') && job.result?.prNumber && job.result?.previewUrl == null &&
+  if ((job.kind === 'dev_repo_fix' || job.kind === 'user_reported_issue_build') && job.result?.prNumber && isUnresolved(job.result?.previewUrl) &&
       job.result?.repo === config.aida.moduleBuilder.frontendRepo) {
     const previewUrl = await fetchUrl(job.result.repo, job.result.prNumber, job.id);
     if (previewUrl) {
       updated = await jobStore.updateJobStatus(job.id, job.status, { result: { ...job.result, previewUrl } });
     }
-  } else if (job.kind === 'create_module' && job.result?.frontendPr && job.result?.previewUrls?.frontendUrl == null) {
+  } else if (job.kind === 'create_module' && job.result?.frontendPr && isUnresolved(job.result?.previewUrls?.frontendUrl)) {
     let previewUrl = await fetchUrl(job.result.frontendRepo, job.result.frontendPr.number, job.id);
     // A standalone page (kind: 'page') lives at its own file — the SWA bot
     // comment only ever gives the site's root, which would just be a blank

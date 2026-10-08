@@ -131,10 +131,16 @@ async function runCodingAgent({ sandboxDir, task, maxIterations = 25, onEvent })
     const response = await getClient().messages.create({
       model: config.aida.codingAgent.model,
       // A write_file call has to fit an entire file's contents in THIS same
-      // response — 4096 was cutting off larger files mid-argument, which is
-      // its own problem (see below) but also, critically, must never be the
-      // reason we skip answering a tool_use block.
-      max_tokens: 8192,
+      // response. 8192 was still too tight — live-verified it was silently
+      // truncating a single-page HTML write mid-argument (the resulting
+      // tool_use input had no content string at all, not a short one),
+      // which write_file then wrote as a 0-byte file with no error, sending
+      // the agent into a multi-turn trial-and-error loop probing for "the"
+      // size limit instead of just writing the file once. Claude Sonnet 5
+      // supports up to 128,000 output tokens on the synchronous Messages
+      // API — 64000 gives enormous headroom for any realistic single file
+      // without the cost/latency of defaulting to the true ceiling.
+      max_tokens: 64000,
       system: SYSTEM_PROMPT,
       messages,
       tools: TOOL_SCHEMAS,
@@ -188,7 +194,18 @@ function executeTool(sandboxDir, name, args) {
       case 'read_file':
         return { content: tools.readFile(sandboxDir, args.path) };
       case 'write_file':
-        return tools.writeFile(sandboxDir, args.path, args.content ?? '');
+        // A missing `content` key (not an explicit "") means this tool_use
+        // block's JSON got cut off before the content string was written —
+        // see the max_tokens comment above. Silently falling back to ''
+        // wrote a 0-byte file with no error, which the agent had no way to
+        // tell apart from a deliberate empty-file write, and would then
+        // burn several turns trial-and-error-probing for a size limit that
+        // was never the real problem. An explicit string (even "") is a
+        // real choice; undefined is a truncated call — say so plainly.
+        if (args.content === undefined) {
+          return { error: 'write_file call had no content — it was likely cut off because the file content was too long for one response. Try writing it again (now that max_tokens is 64000, this should fit); if it still fails, the file may genuinely be too large for one write_file call.' };
+        }
+        return tools.writeFile(sandboxDir, args.path, args.content);
       case 'list_files':
         return { files: tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
       case 'run_command':

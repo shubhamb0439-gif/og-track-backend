@@ -1,7 +1,10 @@
 const express = require('express');
+const crypto = require('crypto');
 const coreDb = require('../db/core');
+const config = require('../config');
 const { hashPassword, verifyPassword, issueToken } = require('../utils/auth');
 const { provisionTenant, provisionModulesForExistingCompany } = require('../utils/provisioning');
+const { sendWhatsAppMessage } = require('../aida/whatsapp');
 
 const multer = require('multer');
 const path = require('path');
@@ -54,6 +57,32 @@ router.post('/login', async (req, res) => {
       { expiresIn: '12h' }
     );
     res.json({ token, admin: { id: admin.id, name: admin.name, email: admin.email } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/masteradmin/deploy-notify ──────────────────────────────────────
+// AIDA roadmap item 4a — a WhatsApp ping once a prod deploy finishes. Called
+// by the GitHub Actions workflow itself (.github/workflows/main_og-track-
+// backend.yml), not a logged-in admin — gated by a shared secret header
+// (DEPLOY_NOTIFY_SECRET, set as both a server env var and a GitHub Actions
+// secret) rather than a JWT, since CI has no human session to authenticate
+// with. Reuses the existing sendWhatsAppMessage fan-out, same as every other
+// proactive AIDA notification in this codebase.
+router.post('/deploy-notify', async (req, res) => {
+  try {
+    if (!config.deployNotify.secret) return res.status(503).json({ error: 'Deploy notifications are not configured on this server (missing DEPLOY_NOTIFY_SECRET).' });
+    const provided = req.headers['x-deploy-secret'] || '';
+    const expected = config.deployNotify.secret;
+    const match = provided.length === expected.length
+      && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+    if (!match) return res.status(401).json({ error: 'Invalid or missing deploy secret.' });
+
+    const { version, summary } = req.body || {};
+    if (!version || typeof version !== 'string') return res.status(400).json({ error: 'version is required' });
+
+    const text = `🚀 AIDA update — ${version}${summary ? `: ${summary}` : ''}`;
+    await Promise.all(config.whatsapp.allowedNumbers.map((n) => sendWhatsAppMessage(n, text)));
+    res.json({ success: true, notified: config.whatsapp.allowedNumbers.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

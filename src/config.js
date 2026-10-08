@@ -414,6 +414,13 @@ module.exports = {
       masterAdminNumber: process.env.WHATSAPP_MASTERADMIN_NUMBER || null,
     };
   })(),
+  // AIDA roadmap item 4a — a WhatsApp ping to every allowed number once a
+  // prod deploy finishes. Called by the GitHub Actions workflow itself
+  // (main_og-track-backend.yml), not a logged-in admin — a shared secret
+  // header is the right fit here, not a full JWT.
+  deployNotify: {
+    secret: process.env.DEPLOY_NOTIFY_SECRET || null,
+  },
   // Azure Communication Services Email (src/utils/email.js) — currently just
   // the "forgot password" flow (src/routes/users.js). Deliberately NOT
   // validated via required() — same reasoning as `aida`/`whatsapp` above.
@@ -460,6 +467,27 @@ module.exports = {
       mailbox: process.env.MS_GRAPH_MAILBOX || 'aida@sanj.co',
       recipientRouting,
       pollIntervalMs: parseInt(process.env.MS_GRAPH_POLL_INTERVAL_MS || '', 10) || 4 * 60 * 1000,
+    };
+  })(),
+  // Zoho Books (AIDA roadmap item 5) — per-company OAuth2, NOT a global
+  // API key like every integration above. clientId/clientSecret here are
+  // the ONE Zoho API console app's credentials (shared across every
+  // company's connection); each company's own access/refresh tokens live
+  // in OGCore's zoho_connections table instead, since multiple OG Track
+  // companies can point at the SAME Zoho organization (e.g. Sitara Drapes
+  // books through OG Plus's own org, distinguished by a Zoho "Branch").
+  zoho: (() => {
+    const clientId = process.env.ZOHO_CLIENT_ID || null;
+    const clientSecret = process.env.ZOHO_CLIENT_SECRET || null;
+    return {
+      enabled: !!(clientId && clientSecret),
+      clientId, clientSecret,
+      // Zoho has region-specific accounts/API hosts (.com/.eu/.in/.com.au/...)
+      // — India-registered Zoho accounts (the real case here) use .in, not
+      // the US .com default most of Zoho's generic docs show.
+      accountsBaseUrl: process.env.ZOHO_ACCOUNTS_BASE_URL || 'https://accounts.zoho.in',
+      apiBaseUrl: process.env.ZOHO_API_BASE_URL || 'https://www.zohoapis.in',
+      redirectUri: process.env.ZOHO_REDIRECT_URI || null,
     };
   })(),
   // Twilio (src/aida/twilio.js) — urgent-email voice-call escalation only

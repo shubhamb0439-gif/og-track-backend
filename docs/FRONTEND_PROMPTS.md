@@ -2073,3 +2073,143 @@ Don't change the #34 invoice popup, the Receipts list, or any other part of the 
 display was stale and nothing needs doing. If it still shows 0 / 10, a stale save already
 reversed the receipts. Re-enter the real received quantity: it will ask for an invoice and
 record a new receipt, and the two old receipt rows stay in the Receipts list as history.
+
+---
+
+## 36. Zoho Books — new standalone module (masteradmin connection management + tenant-side views)
+
+**Status: backend fully built and live-tested against a real Zoho org (2026-10-07/08) — real
+OAuth connect, real invoices/bills/expenses/contacts/bank-accounts pulled correctly (confirmed:
+239 real contacts, 600+ real invoices, pagination-verified), Sitara Drapes correctly isolated
+from OG Plus's shared org via three known placeholder customer contacts, and an outbound
+invoice push wired into CAJO's existing Sales module. Zero frontend exists yet — this is a
+complete standalone module, same category as Sitara's own dedicated module suite, NOT an
+extension of an existing module.**
+
+**Why this is its OWN module, not bolted onto Sales/CRM:** confirmed live that OG Plus (the
+first company connected) doesn't even use the generic Sales module at all — its real
+invoicing already lives entirely in Zoho, which is the whole reason this integration exists.
+CAJO is the one company with a generic Sales module, and its sales now auto-push to Zoho
+in the background — but viewing/managing Zoho Books data is its own thing, gated by its own
+`zoho_books` module flag, same pattern as `attendance` or `hr_dashboard`.
+
+**Architecture recap, so the UI design makes sense:** a Zoho "connection" is per ZOHO
+ORGANIZATION, not per OG Track company — Sitara Drapes (its own separate OG Track tenant)
+books through OG Plus's own Zoho org, isolated by three specific placeholder customer
+contacts (NOT a "Branch"/"Location" — confirmed live that feature is disabled on this org).
+CAJO will get its own separate connection when connected. P&L/Balance Sheet reports are
+NOT available for a company isolated this way (Zoho has no way to filter a report to
+specific customers) — the API returns a clear error for that case; the UI needs to handle
+it gracefully, not treat it as a generic failure.
+
+### Part A — Masteradmin: module checkbox + connection management (NEW page)
+
+1. **Add `zoho_books` as a checkbox** in masteradmin.html's existing ALL_MODULES-style
+   per-company module list, exactly like every other module checkbox. (OG Plus already has
+   it enabled directly in the database as a stopgap since no checkbox exists yet — the
+   checkbox should reflect that company's real current state when it's added.)
+2. **New masteradmin page/section, e.g. "Zoho Books"** (sidebar entry or a tab under an
+   existing Integrations-style area if one exists) showing:
+   - A list of every existing connection (`GET /api/masteradmin/zoho/connections`) — each
+     with its real Zoho org name, org id, connected-by, connected-at, and which OG Track
+     companies are linked to it.
+   - A **"Connect"** button per company that has `zoho_books` enabled but no link yet —
+     calls `GET /api/masteradmin/zoho/connect?companyId=X`, which returns `{ authUrl }`;
+     open that URL in a new tab/window (it's Zoho's real OAuth consent screen — the browser
+     needs to navigate there directly, this can't be an XHR/fetch). After the human approves
+     on Zoho's side, Zoho redirects back to our own backend's callback route directly (not
+     back to this frontend) and shows a plain confirmation page — the masteradmin UI should
+     just let the human close that tab and refresh the connections list afterward.
+   - A **"Link another company to this connection"** action per existing connection — for
+     the Sitara-style case (a second company sharing OG Plus's org). Needs: a company
+     picker, and a way to specify its isolation — either pick from
+     `GET /api/masteradmin/zoho/connections/:connectionId/branches` (real Zoho Locations, if
+     that org has them enabled) OR manually enter a list of Zoho customer contact_ids (the
+     Sitara case) — this second option needs a free-text/multi-input field since there's no
+     dedicated "list candidate customer contacts" endpoint yet; ask backend for one if this
+     turns out to be a common real workflow beyond Sitara's one-off setup.
+     `POST /api/masteradmin/zoho/connections/:connectionId/link-company` — body
+     `{ companyId, branchId? }` (branchId is the ONLY param this endpoint currently accepts;
+     the customer-ids-filter path was set up directly via a one-off script for Sitara, not
+     through this endpoint yet — flag to backend if the UI needs to set that itself).
+
+```
+GET /api/masteradmin/zoho/connections
+  → 200 {
+      connections: [{ id, display_name, zoho_organization_id, connected_at, connected_by }],
+      links: [{ companyId, companyName, companySlug, branchId, connectionId, connectionName }]
+    }
+
+GET /api/masteradmin/zoho/connect?companyId=<id>
+  → 200 { authUrl: "https://accounts.zoho.in/oauth/v2/auth?..." }   — navigate the browser here directly
+  → 400 if Zoho isn't configured server-side, or companyId is missing/unknown
+
+POST /api/masteradmin/zoho/connections/:connectionId/link-company
+  body: { companyId, branchId? }
+  → 200 { ok: true }
+  → 404 if connectionId doesn't exist
+
+GET /api/masteradmin/zoho/connections/:connectionId/branches
+  → 200 { branches: [{ branch_id, branch_name, ... }] }   — empty array is normal (most orgs don't use Locations)
+  → 404 if no company is linked to this connection yet (link one first, even unbranched)
+```
+
+### Part B — Tenant side: the actual "Zoho Books" section
+
+New sidebar entry, gated by the `zoho_books` module (same as any other module-gated nav item)
+AND visible only to `accounts_manager`/`superadmin` roles specifically — narrower than most
+modules, since this is real financial data. A user without that role should simply not see
+the nav entry at all (the backend already 403s if someone calls the API directly without the
+right role, so this is a UI nicety, not the actual security boundary).
+
+Sub-sections (tabs or separate pages, your call):
+- **Invoices** — `GET /api/:slug/zoho/invoices?status=` (status is optional, Zoho's own
+  values: draft/sent/overdue/paid/void/...). Show date, customer, invoice number, amount,
+  status.
+- **Bills** — `GET /api/:slug/zoho/bills?status=`. Same shape idea, vendor-side.
+- **Expenses** — `GET /api/:slug/zoho/expenses`.
+- **Contacts** — `GET /api/:slug/zoho/contacts?type=customer|vendor` (omit `type` for both).
+- **Bank Accounts** — `GET /api/:slug/zoho/bank-accounts`.
+- **Reports** — `GET /api/:slug/zoho/reports/profit-and-loss?from=YYYY-MM-DD&to=YYYY-MM-DD`
+  and `GET /api/:slug/zoho/reports/balance-sheet?to=YYYY-MM-DD`. **Important:** for a
+  company isolated via customer-contact filtering (Sitara today, possibly others later),
+  both of these return a `502` with a clear human-readable message explaining reports aren't
+  available for this company — show that message plainly (e.g. an info banner), not a
+  generic "something went wrong" error state.
+
+All six endpoints share the same two real error cases to handle distinctly from a generic
+failure:
+```
+403 { error: "Module \"zoho_books\" is not enabled for this company." }
+  — shouldn't normally be reachable if the nav entry is correctly gated, but handle it.
+
+409 { error: "This company has no Zoho Books connection linked yet — ask master admin to connect it." }
+  — real, expected state for a newly-enabled company before masteradmin connects it. Show
+  this as a clear "not connected yet" empty state, not an error toast.
+```
+
+Raw Zoho field names come through as-is from Zoho's own API shape (e.g. an invoice has
+`invoice_id`, `invoice_number`, `customer_name`, `total`, `status`, `date` — snake_case,
+unlike the rest of this codebase's camelCase convention) since these are pass-through reads,
+not mapped through this app's own row-mapper pattern. Don't assume camelCase for anything
+under these six endpoints.
+
+### Part C — Sales module (CAJO): show Zoho sync status per sale
+
+Every sale object from `GET /api/:slug/sales`, `POST /api/:slug/sales`, and the
+`sales:sale_created` socket event now ALSO includes:
+```
+zohoInvoiceId: string | null     — Zoho's own invoice id once synced
+zohoSyncStatus: "synced" | "failed" | null   — null = no Zoho connection/module for this company, not an error
+zohoSyncError: string | null     — only set when zohoSyncStatus is "failed"
+```
+These are **null at creation time** even for a Zoho-connected company — the push happens
+asynchronously right after the sale is created, not inside the same request. A NEW socket
+event, `sales:zoho_sync_updated`, fires once the push actually finishes (success or
+failure) with the full updated sale object — listen for it and patch the matching row in
+whatever sales list/detail view is open, the same way `sales:sale_created` is already
+handled. On the sales list/detail view, show a small status indicator per row: nothing for
+`null`, a subtle "Synced to Zoho" badge (maybe linking to `zohoInvoiceId` if useful) for
+`"synced"`, and a visible warning badge with `zohoSyncError` in a tooltip for `"failed"` —
+this is the only way a human finds out a push silently failed, since it never blocks or
+shows up as an error on the sale itself.

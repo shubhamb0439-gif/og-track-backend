@@ -162,7 +162,9 @@ async function processMessage(token, message) {
   const { summary, isUrgent } = await summarizeEmail({ subject, from, bodyText, attachmentsText });
 
   const text = `📧 New email to ${match.watchedAddress}\nFrom: ${from}\nSubject: ${subject}\n\n${summary}`;
-  await sendWhatsAppMessage(match.phoneNumber, text);
+  // Now retries internally (see whatsapp.js) and reports its real outcome —
+  // previously this was fire-and-forget with zero visibility into failure.
+  const whatsappResult = await sendWhatsAppMessage(match.phoneNumber, text);
 
   for (const att of attachments.slice(0, MAX_ATTACHMENTS_TO_FORWARD)) {
     await sendWhatsAppDocument(match.phoneNumber, att.buffer, att.name, att.mimeType);
@@ -175,6 +177,8 @@ async function processMessage(token, message) {
     subject,
     summary,
     isUrgent,
+    whatsappSent: whatsappResult.success,
+    whatsappError: whatsappResult.error,
   }).catch((e) => console.error('[email-monitor] failed to log email for later reply:', e.message));
 
   if (isUrgent) {

@@ -7,6 +7,7 @@ const contacts = require('../contacts');
 const emailLog = require('../emailLog');
 const graphMail = require('../graphMail');
 const pendingAttachments = require('../pendingAttachments');
+const zohoClient = require('../../zoho/zohoClient');
 
 /** The real email address of the master admin acting in this turn — used to CC them on anything AIDA sends on their behalf. */
 async function currentAdminEmail(context) {
@@ -307,6 +308,43 @@ module.exports = [
       if (!existing) return { error: `No saved contact found named "${name}".` };
       await contacts.forgetContact(existing.id);
       return { success: true };
+    },
+  },
+
+  {
+    name: 'query_zoho_books',
+    description: 'Fetches real Zoho Books data (invoices, bills, expenses, contacts, bank accounts, or P&L/balance-sheet reports) for ANY connected company, by slug — cross-company, master-admin only. Returns an error naming the company if it has no Zoho connection linked yet.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        companySlug: { type: 'string', description: 'The OG Track company slug, e.g. "cajo", "ogplus", "sitara".' },
+        dataType: { type: 'string', enum: ['invoices', 'bills', 'expenses', 'contacts', 'bank_accounts', 'profit_and_loss', 'balance_sheet'] },
+        fromDate: { type: 'string', description: 'YYYY-MM-DD, for profit_and_loss only.' },
+        toDate: { type: 'string', description: 'YYYY-MM-DD, for profit_and_loss/balance_sheet.' },
+      },
+      required: ['companySlug', 'dataType'],
+    },
+    async handler(context, { companySlug, dataType, fromDate, toDate }) {
+      const company = await coreDb('companies').where({ slug: companySlug }).first();
+      if (!company) return { error: `No company found with slug "${companySlug}".` };
+      try {
+        switch (dataType) {
+          case 'invoices': return { invoices: await zohoClient.getInvoices(company.id) };
+          case 'bills': return { bills: await zohoClient.getBills(company.id) };
+          case 'expenses': return { expenses: await zohoClient.getExpenses(company.id) };
+          case 'contacts': return { contacts: await zohoClient.getContacts(company.id) };
+          case 'bank_accounts': return { bankAccounts: await zohoClient.getBankAccounts(company.id) };
+          case 'profit_and_loss': return await zohoClient.getProfitAndLoss(company.id, { fromDate, toDate });
+          case 'balance_sheet': return await zohoClient.getBalanceSheet(company.id, { toDate });
+          default: return { error: `Unknown dataType "${dataType}".` };
+        }
+      } catch (e) {
+        if (e instanceof zohoClient.ZohoNotConnectedError) {
+          return { error: `${company.name} has no Zoho Books connection linked yet — connect it from the masteradmin panel first.` };
+        }
+        return { error: `Zoho Books request failed: ${e.message}` };
+      }
     },
   },
 ];

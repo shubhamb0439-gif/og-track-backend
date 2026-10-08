@@ -1,3 +1,5 @@
 node_modules/
 .env
 *.log
+# One-off data exports (customer/payment PII) — never committed.
+exports/
