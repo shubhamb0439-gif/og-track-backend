@@ -8,7 +8,7 @@ const emailLog = require('../emailLog');
 const graphMail = require('../graphMail');
 const pendingAttachments = require('../pendingAttachments');
 const zohoClient = require('../../zoho/zohoClient');
-const { sendWhatsAppMessage } = require('../whatsapp');
+const { sendWhatsAppMessage, sendWhatsAppDocument } = require('../whatsapp');
 
 /** The real email address of the master admin acting in this turn — used to CC them on anything AIDA sends on their behalf. */
 async function currentAdminEmail(context) {
@@ -353,7 +353,10 @@ module.exports = [
     name: 'message_contact',
     description:
       "Sends a real freeform WhatsApp message to a saved contact by name (or to a number given alongside a name, which " +
-      "saves that pairing for next time — same save-on-first-use pattern as send_email). SAFETY — this is a real, " +
+      "saves that pairing for next time — same save-on-first-use pattern as send_email), optionally forwarding the " +
+      "file the human most recently sent AIDA in this conversation (set includeAttachment: true — same mechanism as " +
+      "send_email's includeAttachment). text may be omitted if includeAttachment is true and the file should go with " +
+      "just a caption-less send, but at least one of text/includeAttachment is required. SAFETY — this is a real, " +
       "visible action: call this tool WITHOUT confirmed first — it returns a preview instead of sending anything. Read " +
       "that preview back to the user in plain language and wait for their explicit yes in their NEXT message. Only " +
       "then call this again with the exact same arguments plus confirmed: true to actually send it. " +
@@ -367,11 +370,14 @@ module.exports = [
         name: { type: 'string', description: "The contact's name — resolved against saved contacts if phoneNumber is omitted." },
         phoneNumber: { type: 'string', description: 'Full number with country code (e.g. "919845009748") — only needed the first time, or to update a saved number.' },
         text: { type: 'string' },
+        includeAttachment: { type: 'boolean', description: 'Set true to forward the file the human most recently sent AIDA in this conversation.' },
         confirmed: { type: 'boolean', description: 'Only set true after the user has explicitly confirmed sending, in a later message.' },
       },
-      required: ['name', 'text'],
+      required: ['name'],
     },
-    async handler(context, { name, phoneNumber, text, confirmed }) {
+    async handler(context, { name, phoneNumber, text, includeAttachment, confirmed }) {
+      if (!text && !includeAttachment) return { error: 'Need either text or includeAttachment: true.' };
+
       let resolvedNumber = phoneNumber ? contacts.normalizeWhatsAppNumber(phoneNumber) : null;
       if (!resolvedNumber) {
         const existing = await contacts.findContactByName(context.userId, name);
@@ -381,10 +387,16 @@ module.exports = [
         resolvedNumber = existing.whatsapp_number;
       }
 
+      let attachment = null;
+      if (includeAttachment) {
+        attachment = pendingAttachments.getPending(context);
+        if (!attachment) return { error: "There's no recently-attached file in this conversation to forward — ask the human to resend it." };
+      }
+
       if (!confirmed) {
         return {
           status: 'needs_confirmation',
-          preview: { to: name, phoneNumber: resolvedNumber, text },
+          preview: { to: name, phoneNumber: resolvedNumber, text: text || null, attachment: attachment ? attachment.filename : null },
           instruction: 'Read this preview back to the user and ask them to confirm. Do NOT send anything until they explicitly say yes in their next message — then call this tool again with confirmed: true.',
         };
       }
@@ -394,11 +406,16 @@ module.exports = [
         catch (e) { return { error: `Failed to save contact: ${e.message}` }; }
       }
 
-      const result = await sendWhatsAppMessage(resolvedNumber, text);
-      if (!result.success) {
-        return { error: `WhatsApp send failed — this is usually Meta's real 24-hour-window rule (the contact hasn't messaged this number recently), not a bug: ${result.error}` };
+      if (text) {
+        const result = await sendWhatsAppMessage(resolvedNumber, text);
+        if (!result.success) {
+          return { error: `WhatsApp send failed — this is usually Meta's real 24-hour-window rule (the contact hasn't messaged this number recently), not a bug: ${result.error}` };
+        }
       }
-      return { success: true, to: name, phoneNumber: resolvedNumber };
+      if (attachment) {
+        await sendWhatsAppDocument(resolvedNumber, attachment.buffer, attachment.filename, attachment.mimeType, text ? undefined : 'Sent via AIDA');
+      }
+      return { success: true, to: name, phoneNumber: resolvedNumber, forwardedFile: attachment?.filename || null };
     },
   },
 ];

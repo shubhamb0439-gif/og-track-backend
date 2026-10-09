@@ -7,7 +7,7 @@ const { MASTERADMIN_SENTINEL_MODULE } = require('../aida/contextBuilder');
 const { runTurn } = require('../aida/engine');
 const sessionMemory = require('../aida/sessionMemory');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
-const { sendWhatsAppMessage, downloadWhatsAppMedia } = require('../aida/whatsapp');
+const { sendWhatsAppMessage, sendWhatsAppDocument, downloadWhatsAppMedia } = require('../aida/whatsapp');
 const { extractTextFromBuffer } = require('../aida/attachmentText');
 const pendingAttachments = require('../aida/pendingAttachments');
 const contacts = require('../aida/contacts');
@@ -128,13 +128,15 @@ router.post('/webhook', async (req, res) => {
     const isAllowed = config.whatsapp.allowedNumbers.some((n) => last10(n) === last10(from));
     if (!isAllowed) {
       // Not an admin number — but might still be a known contact (AIDA
-      // roadmap item 9) reaching out for the first time, e.g. after an
-      // email asking them to message in. Only 'text' is supported here —
-      // keep this path deliberately minimal (no file handling) since it's
-      // talking to someone outside the company.
-      if (message.type === 'text') {
-        const contact = await contacts.findContactByPhone(from);
-        if (contact) {
+      // roadmap item 9) reaching out, e.g. after an email asking them to
+      // message in. Deliberately minimal and tool-free throughout (see
+      // contactChat.js's own comment) since this is someone outside the
+      // company — a document/image gets downloaded, summarized, and
+      // optionally forwarded to a NAMED admin via fixed, deterministic
+      // code, never by giving this conversation any real tool to call.
+      const contact = await contacts.findContactByPhone(from);
+      if (contact) {
+        if (message.type === 'text') {
           const text = (message.text?.body || '').trim();
           if (text) {
             const reply = await contactChat.respondToContact(contact, text);
@@ -142,6 +144,34 @@ router.post('/webhook', async (req, res) => {
           }
           return;
         }
+        if (message.type === 'document' || message.type === 'image') {
+          const media = message.document || message.image;
+          const filename = media.filename || `attachment.${(media.mime_type || '').split('/').pop() || 'bin'}`;
+          let buffer, mimeType;
+          try {
+            const downloaded = await downloadWhatsAppMedia(media.id);
+            buffer = downloaded.buffer;
+            mimeType = downloaded.mimeType || media.mime_type;
+          } catch (e) {
+            console.error('[whatsapp] failed to download inbound media from a contact:', e.message);
+            await sendWhatsAppMessage(from, "I couldn't download that file — try sending it again?");
+            return;
+          }
+          const extractedText = await extractTextFromBuffer(buffer, filename);
+          const caption = (media.caption || '').trim();
+          const { summary, forwardToName } = await contactChat.summarizeAndRouteAttachment({ filename, caption, extractedText });
+
+          const admin = await contactChat.resolveAdminByFirstName(forwardToName);
+          if (admin) {
+            await sendWhatsAppMessage(admin.whatsapp_number, `📎 ${contact.name} sent you a file on WhatsApp: "${filename}"\n\nSummary: ${summary}`);
+            await sendWhatsAppDocument(admin.whatsapp_number, buffer, filename, mimeType, `From ${contact.name}`);
+            await sendWhatsAppMessage(from, `Got it — I've forwarded "${filename}" to ${admin.name} along with a quick summary.`);
+          } else {
+            await sendWhatsAppMessage(from, `Got your file "${filename}". Quick summary: ${summary}`);
+          }
+          return;
+        }
+        return; // some other message type from a known contact — nothing to do yet
       }
       await sendWhatsAppMessage(from, "You don't have access.");
       return;
