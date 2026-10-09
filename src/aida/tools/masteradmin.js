@@ -372,7 +372,7 @@ module.exports = [
       required: ['name', 'text'],
     },
     async handler(context, { name, phoneNumber, text, confirmed }) {
-      let resolvedNumber = phoneNumber ? phoneNumber.replace(/[^\d]/g, '') : null;
+      let resolvedNumber = phoneNumber ? contacts.normalizeWhatsAppNumber(phoneNumber) : null;
       if (!resolvedNumber) {
         const existing = await contacts.findContactByName(context.userId, name);
         if (!existing?.whatsapp_number) {

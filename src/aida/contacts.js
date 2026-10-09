@@ -20,6 +20,22 @@ function newId() {
   return `contact_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Strips a phone number down to digits and adds the country code when it's
+ * missing — live-confirmed as a real bug otherwise: a human naturally says
+ * "message pooja at 7624840126" (the normal way to state an Indian number,
+ * no one actually says "91" out loud), the LLM passes that bare 10-digit
+ * string straight through, and WhatsApp's send API silently rejects it since
+ * it's not a real international number — the message never arrives, with no
+ * error surfaced anywhere obvious. A number that's already 11+ digits (has
+ * SOME country code, even if not India's) is left alone.
+ */
+function normalizeWhatsAppNumber(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (digits.length === 10) return `91${digits}`;
+  return digits;
+}
+
 async function getContacts(ownerId) {
   return coreDb('ai_contacts').where({ owner_id: ownerId }).orderBy('name', 'asc');
 }
@@ -61,7 +77,7 @@ async function saveContact(ownerId, { name, email, whatsappNumber }) {
   }
   const updates = { updated_at: new Date() };
   if (email && email.trim()) updates.email = email.trim();
-  if (whatsappNumber && whatsappNumber.trim()) updates.whatsapp_number = whatsappNumber.trim();
+  if (whatsappNumber && whatsappNumber.trim()) updates.whatsapp_number = normalizeWhatsAppNumber(whatsappNumber);
 
   const existing = await findContactByName(ownerId, name);
   if (existing) {
@@ -79,4 +95,4 @@ async function forgetContact(ownerId, id) {
   return deleted > 0;
 }
 
-module.exports = { getContacts, findContactByName, findContactByPhone, saveContact, forgetContact };
+module.exports = { getContacts, findContactByName, findContactByPhone, saveContact, forgetContact, normalizeWhatsAppNumber };
