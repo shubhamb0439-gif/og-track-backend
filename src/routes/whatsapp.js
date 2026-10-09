@@ -10,6 +10,8 @@ const { buildDirective, safeDirective } = require('../aida/responseDirector');
 const { sendWhatsAppMessage, downloadWhatsAppMedia } = require('../aida/whatsapp');
 const { extractTextFromBuffer } = require('../aida/attachmentText');
 const pendingAttachments = require('../aida/pendingAttachments');
+const contacts = require('../aida/contacts');
+const contactChat = require('../aida/contactChat');
 
 const MAX_ATTACHMENT_TEXT_CHARS = 8_000;
 
@@ -125,6 +127,22 @@ router.post('/webhook', async (req, res) => {
     const from = message.from;
     const isAllowed = config.whatsapp.allowedNumbers.some((n) => last10(n) === last10(from));
     if (!isAllowed) {
+      // Not an admin number — but might still be a known contact (AIDA
+      // roadmap item 9) reaching out for the first time, e.g. after an
+      // email asking them to message in. Only 'text' is supported here —
+      // keep this path deliberately minimal (no file handling) since it's
+      // talking to someone outside the company.
+      if (message.type === 'text') {
+        const contact = await contacts.findContactByPhone(from);
+        if (contact) {
+          const text = (message.text?.body || '').trim();
+          if (text) {
+            const reply = await contactChat.respondToContact(contact, text);
+            await sendWhatsAppMessage(from, reply);
+          }
+          return;
+        }
+      }
       await sendWhatsAppMessage(from, "You don't have access.");
       return;
     }

@@ -1287,5 +1287,9 @@ router.get('/dashboard', async (req, res) => {
 // sync logic the webhook uses rather than a second copy of it.
 router.syncBigCommerceOrder = syncBigCommerceOrder;
 router.listAllBigCommerceOrderIds = listAllBigCommerceOrderIds;
+// Same reasoning — src/sitaraRazorpayScheduler.js reuses these directly for
+// the scheduled backfill rather than a second copy of the Razorpay sync logic.
+router.listAllRazorpayPayments = listAllRazorpayPayments;
+router.syncRazorpayPayment = syncRazorpayPayment;
 
 module.exports = router;

@@ -63,6 +63,7 @@ aidaJobRunner.start(io);
 // urgent ones with a Twilio call. No-op (logs once and returns) if
 // Microsoft Graph credentials aren't configured on this server yet.
 require('./aida/emailMonitor').start();
+require('./sitaraRazorpayScheduler').start();
 
 // ── Socket.io: per-tenant rooms ──────────────────────────────────────────────
 // Every client joins a room named after its company slug. All real-time

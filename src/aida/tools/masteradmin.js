@@ -8,6 +8,7 @@ const emailLog = require('../emailLog');
 const graphMail = require('../graphMail');
 const pendingAttachments = require('../pendingAttachments');
 const zohoClient = require('../../zoho/zohoClient');
+const { sendWhatsAppMessage } = require('../whatsapp');
 
 /** The real email address of the master admin acting in this turn — used to CC them on anything AIDA sends on their behalf. */
 async function currentAdminEmail(context) {
@@ -203,7 +204,7 @@ module.exports = [
     async handler(context, { to, name, subject, body, includeAttachment, confirmed }) {
       let recipient = to;
       if (!recipient && name) {
-        const known = await contacts.findContactByName(name);
+        const known = await contacts.findContactByName(context.userId, name);
         if (!known) return { error: `I don't have an email address saved for "${name}" yet — ask the human for it, then call this again with both "to" and "name".` };
         recipient = known.email;
       }
@@ -224,7 +225,7 @@ module.exports = [
         };
       }
 
-      if (name && to) await contacts.saveContact({ name, email: to });
+      if (name && to) await contacts.saveContact(context.userId, { name, email: to });
       const ccAddress = await currentAdminEmail(context);
       try {
         await graphMail.sendMail({
@@ -289,7 +290,7 @@ module.exports = [
       required: ['name', 'email'],
     },
     async handler(context, { name, email }) {
-      const saved = await contacts.saveContact({ name, email });
+      const saved = await contacts.saveContact(context.userId, { name, email });
       return { success: true, contact: saved };
     },
   },
@@ -304,9 +305,9 @@ module.exports = [
       required: ['name'],
     },
     async handler(context, { name }) {
-      const existing = await contacts.findContactByName(name);
+      const existing = await contacts.findContactByName(context.userId, name);
       if (!existing) return { error: `No saved contact found named "${name}".` };
-      await contacts.forgetContact(existing.id);
+      await contacts.forgetContact(context.userId, existing.id);
       return { success: true };
     },
   },
@@ -345,6 +346,59 @@ module.exports = [
         }
         return { error: `Zoho Books request failed: ${e.message}` };
       }
+    },
+  },
+
+  {
+    name: 'message_contact',
+    description:
+      "Sends a real freeform WhatsApp message to a saved contact by name (or to a number given alongside a name, which " +
+      "saves that pairing for next time — same save-on-first-use pattern as send_email). SAFETY — this is a real, " +
+      "visible action: call this tool WITHOUT confirmed first — it returns a preview instead of sending anything. Read " +
+      "that preview back to the user in plain language and wait for their explicit yes in their NEXT message. Only " +
+      "then call this again with the exact same arguments plus confirmed: true to actually send it. " +
+      "IMPORTANT real platform limit, not a bug: WhatsApp only allows a freeform message (any text) to someone who has " +
+      "themselves messaged this WhatsApp number within the last 24 hours — outside that window Meta will reject the " +
+      "send, and this tool will report that real rejection back rather than pretending it worked.",
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: "The contact's name — resolved against saved contacts if phoneNumber is omitted." },
+        phoneNumber: { type: 'string', description: 'Full number with country code (e.g. "919845009748") — only needed the first time, or to update a saved number.' },
+        text: { type: 'string' },
+        confirmed: { type: 'boolean', description: 'Only set true after the user has explicitly confirmed sending, in a later message.' },
+      },
+      required: ['name', 'text'],
+    },
+    async handler(context, { name, phoneNumber, text, confirmed }) {
+      let resolvedNumber = phoneNumber ? phoneNumber.replace(/[^\d]/g, '') : null;
+      if (!resolvedNumber) {
+        const existing = await contacts.findContactByName(context.userId, name);
+        if (!existing?.whatsapp_number) {
+          return { error: `No saved WhatsApp number for "${name}" — give me the number (with country code) to message them.` };
+        }
+        resolvedNumber = existing.whatsapp_number;
+      }
+
+      if (!confirmed) {
+        return {
+          status: 'needs_confirmation',
+          preview: { to: name, phoneNumber: resolvedNumber, text },
+          instruction: 'Read this preview back to the user and ask them to confirm. Do NOT send anything until they explicitly say yes in their next message — then call this tool again with confirmed: true.',
+        };
+      }
+
+      if (phoneNumber) {
+        try { await contacts.saveContact(context.userId, { name, whatsappNumber: resolvedNumber }); }
+        catch (e) { return { error: `Failed to save contact: ${e.message}` }; }
+      }
+
+      const result = await sendWhatsAppMessage(resolvedNumber, text);
+      if (!result.success) {
+        return { error: `WhatsApp send failed — this is usually Meta's real 24-hour-window rule (the contact hasn't messaged this number recently), not a bug: ${result.error}` };
+      }
+      return { success: true, to: name, phoneNumber: resolvedNumber };
     },
   },
 ];

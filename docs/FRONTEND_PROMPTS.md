@@ -2213,3 +2213,56 @@ handled. On the sales list/detail view, show a small status indicator per row: n
 `"synced"`, and a visible warning badge with `zohoSyncError` in a tooltip for `"failed"` —
 this is the only way a human finds out a push silently failed, since it never blocks or
 shows up as an error on the sale itself.
+
+---
+
+## 37. URGENT BUG FIX — Zoho Books tabs (#36) fetch in an uncontrolled loop, triggered Zoho's rate limit
+
+**Status: live-confirmed 2026-10-08 — the Invoices tab on `aida.sanj.co/ogplus`'s Zoho Books
+page fired thousands of identical `GET .../api/ogplus/zoho/invoices` requests in a tight loop
+(3972+ console errors in one session). This flooded Zoho's own token-refresh endpoint hard
+enough that Zoho's abuse protection kicked in and started rejecting every refresh with
+`"You have made too many requests continuously. Please try again after some time."` — a real,
+confirmed rate-limit response from Zoho itself, not a credentials or backend bug (Azure's
+ZOHO_CLIENT_ID/SECRET are correctly configured; a single manual token-refresh call made
+directly, outside any loop, returned this exact message). This needs fixing before anyone
+reopens that page again — reopening it unfixed will just reproduce the same flood immediately
+and risk Zoho escalating from a temporary throttle to actually revoking the connection's
+refresh token (which would mean reconnecting OG Plus to Zoho from scratch).**
+
+**What almost certainly happened, based on the symptom (not guessed blindly — these are the
+two patterns that produce exactly this behavior):**
+- A `useEffect` (or equivalent) that fetches on mount but has a missing/unstable dependency
+  array, so it re-runs on every render instead of once — each render re-fires the fetch,
+  which on failure likely re-renders (e.g. to show the error state), which fires the fetch
+  again, forever.
+- OR an error handler that reacts to a failed fetch by immediately retrying, with no backoff
+  and no retry cap — every failure immediately becomes another attempt.
+
+**Required fix, applies to ALL SIX Zoho Books endpoints from #36** (Invoices, Bills, Expenses,
+Contacts, Bank Accounts, both Reports — not just the Invoices tab that happened to be open
+when this was caught):
+
+1. **Fetch exactly once per real reason to fetch** — on initial mount of that tab, and again
+   only when the user explicitly changes something that should change the data (e.g. the
+   status filter dropdown, or switching to a different tab). Never on every render. If using
+   React, this means a correct, minimal dependency array (e.g. `[slug, statusFilter]`, not
+   left empty by mistake or including something that changes every render like a new object/
+   function reference).
+2. **On a failed fetch, show the error ONCE and stop** — no automatic retry, ever, for this
+   page. If a retry affordance is wanted, make it a manual "Retry" button the human has to
+   click — never something that fires again on its own.
+3. **No polling/interval for this page at all.** Zoho data doesn't need live polling — if
+   there's a `setInterval`/`setTimeout`-based refresh anywhere in this component or a shared
+   hook it's using, remove it for this page specifically.
+4. **If a shared data-fetching hook is used across tabs**, check it isn't re-created (and
+   therefore re-triggered) every time its parent re-renders — e.g. an inline function/object
+   passed as a hook dependency that's a new reference every render looks "unchanged" to the
+   developer but isn't to React's dependency comparison.
+
+**Before calling this fixed:** open DevTools' Network tab, open the Zoho Books page once, and
+confirm EXACTLY ONE request fires per tab per load — not zero (broken), not two-or-more
+(partially fixed), not continuous (not fixed at all). Do this check before reloading the page
+again casually; given the rate-limit is still likely active, even a careful manual test should
+wait a while after the last flood before trying, and should be a single page load, not a
+reload-and-check loop.

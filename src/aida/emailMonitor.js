@@ -105,10 +105,24 @@ const SUMMARY_SYSTEM_PROMPT = [
   'You are given the email body and any text extracted from its attachments.',
   'Respond with ONLY a single JSON object, no markdown fencing: ' +
     '{"summary": "2-4 sentence plain-language summary of what this email is about and what (if anything) is being asked", ' +
-    '"isUrgent": true|false}',
+    '"isUrgent": true|false, ' +
+    '"needsPlan": true|false}',
   'Mark isUrgent true only for something that genuinely needs attention today/immediately — a real complaint, ' +
     'a payment/legal/compliance issue, a system outage, an angry customer, a deadline today — NOT routine ' +
     'correspondence, newsletters, FYI notices, or anything that can wait.',
+  'Mark needsPlan true ONLY when the email implies a real, specific decision or action the master admin needs ' +
+    'to actually take — e.g. approving a purchase order, signing/renewing a contract by a stated date, ' +
+    'responding to a vendor proposal, confirming a shipment or payment detail. This should be RARE — do NOT ' +
+    'set it true for routine correspondence, FYI notices, newsletters, a simple "thanks"/"got it", or anything ' +
+    'that genuinely needs no action from the recipient.',
+].join(' ');
+
+const PLAN_SYSTEM_PROMPT = [
+  'An incoming business email implies the recipient needs to take some real action. Given the email body and',
+  'any attachment text, write a SHORT suggested plan — not a diagnosis, not code, just what a busy person',
+  'should actually do about this email. Respond with ONLY a single JSON object, no markdown fencing:',
+  '{"summary": "1-2 sentence plain-language statement of what decision/action is implied",',
+  '"actionItems": ["short action 1", "short action 2", ...]} — 2 to 5 short, concrete action items.',
 ].join(' ');
 
 async function summarizeEmail({ subject, from, bodyText, attachmentsText }) {
@@ -120,7 +134,7 @@ async function summarizeEmail({ subject, from, bodyText, attachmentsText }) {
     bodyText,
     attachmentsText ? `\nAttachments:\n${attachmentsText}` : '',
   ].join('\n');
-  const fallback = { summary: `New email from ${from}: "${subject}"`, isUrgent: false };
+  const fallback = { summary: `New email from ${from}: "${subject}"`, isUrgent: false, needsPlan: false };
   let raw;
   try {
     raw = await callLLM(SUMMARY_SYSTEM_PROMPT, userContent, 400);
@@ -133,9 +147,40 @@ async function summarizeEmail({ subject, from, bodyText, attachmentsText }) {
     return {
       summary: typeof parsed.summary === 'string' && parsed.summary.trim() ? parsed.summary.trim() : fallback.summary,
       isUrgent: parsed.isUrgent === true,
+      needsPlan: parsed.needsPlan === true,
     };
   } catch {
     return { ...fallback, note: 'Summarization response was not valid JSON — used a generic fallback.' };
+  }
+}
+
+/**
+ * Only called for the rare email summarizeEmail flagged needsPlan:true —
+ * keeps the common case (routine mail) to a single cheap LLM call, same
+ * "one call, not two" convention isUrgent already uses, while still
+ * affording a second short call for the genuinely rare case that warrants
+ * it. Deliberately a suggestion only, no job/approval pipeline — AIDA
+ * should suggest here, never act.
+ */
+async function generateEmailActionPlan({ subject, from, bodyText, attachmentsText }) {
+  const userContent = [
+    `From: ${from}`,
+    `Subject: ${subject}`,
+    '',
+    'Body:',
+    bodyText,
+    attachmentsText ? `\nAttachments:\n${attachmentsText}` : '',
+  ].join('\n');
+  try {
+    const raw = await callLLM(PLAN_SYSTEM_PROMPT, userContent, 300);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+    const actionItems = Array.isArray(parsed.actionItems) ? parsed.actionItems.filter((a) => typeof a === 'string' && a.trim()) : [];
+    if (!actionItems.length) return null;
+    return { summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : '', actionItems };
+  } catch (e) {
+    console.error('[email-monitor] action-plan generation failed:', e.message);
+    return null; // a failed suggestion is just a skipped suggestion, never a reason to fail the whole email notification
   }
 }
 
@@ -159,9 +204,18 @@ async function processMessage(token, message) {
   const from = message.from?.emailAddress?.address || 'unknown sender';
   const subject = message.subject || '(no subject)';
 
-  const { summary, isUrgent } = await summarizeEmail({ subject, from, bodyText, attachmentsText });
+  const { summary, isUrgent, needsPlan } = await summarizeEmail({ subject, from, bodyText, attachmentsText });
 
-  const text = `📧 New email to ${match.watchedAddress}\nFrom: ${from}\nSubject: ${subject}\n\n${summary}`;
+  let planLine = '';
+  if (needsPlan) {
+    const plan = await generateEmailActionPlan({ subject, from, bodyText, attachmentsText });
+    if (plan) {
+      const items = plan.actionItems.map((a) => `  • ${a}`).join('\n');
+      planLine = `\n\n⚠️ Possible action needed: ${plan.summary}\n${items}`;
+    }
+  }
+
+  const text = `📧 New email to ${match.watchedAddress}\nFrom: ${from}\nSubject: ${subject}\n\n${summary}${planLine}`;
   // Now retries internally (see whatsapp.js) and reports its real outcome —
   // previously this was fire-and-forget with zero visibility into failure.
   const whatsappResult = await sendWhatsAppMessage(match.phoneNumber, text);

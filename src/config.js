@@ -528,6 +528,15 @@ module.exports = {
     // body (unlike BigCommerce) — this is that secret, set when creating
     // the webhook in Razorpay's own dashboard (Settings > Webhooks).
     webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || null,
+    // Live-confirmed 2026-10-08: Razorpay's webhook delivery to this server
+    // isn't 100% reliable — 4 real captured payments for Sitara never
+    // arrived at all for 10-26 days, and one never got its "captured"
+    // follow-up after an initial "authorized" webhook. src/sitaraRazorpayScheduler.js
+    // re-syncs directly against Razorpay's own API (the actual source of
+    // truth) on this interval so a missed webhook doesn't silently stay
+    // missed. Daily default — this data doesn't need near-real-time
+    // correction, just regular enough that a gap can't go unnoticed for long.
+    backfillIntervalMs: parseInt(process.env.RAZORPAY_BACKFILL_INTERVAL_MS || '', 10) || 24 * 60 * 60 * 1000,
   },
   // Sitara order-staleness threshold — computed at read time (src/routes/
   // sitara.js), not a background poller, so there's no extra always-on job
