@@ -2266,3 +2266,65 @@ confirm EXACTLY ONE request fires per tab per load — not zero (broken), not tw
 again casually; given the rate-limit is still likely active, even a careful manual test should
 wait a while after the last flood before trying, and should be a single page load, not a
 reload-and-check loop.
+
+---
+
+## 38. Sitara Drapes — "Send Confirmation Email" button + customer address in Orders view
+
+**Status: backend built and tested 2026-10-12. Replaces an earlier automatic-BigCommerce-
+recreation approach that was tried and deliberately abandoned the same day — see the note below
+if you're wondering why this is manual-only. No frontend exists yet for either piece.**
+
+**Why this exists:** BigCommerce sometimes silently drops a real paid order (the customer pays
+via Razorpay, but a failed post-payment redirect causes BigCommerce to soft-delete the order —
+hidden from the customer's own account, even though the money is real and the order often still
+looks fine internally). The original plan was to detect this and automatically recreate the
+order on BigCommerce — that was built, deployed, and **caused a real incident**: the detection
+signal turned out to be unreliable (a completely normal, healthy order also matched it) and the
+automatic trigger created 53 duplicate orders on the live store before it was caught and
+disabled. The automatic version is now fully off. This prompt is the replacement: a deliberately
+simple, manual, staff-triggered action that never touches BigCommerce at all — just sends the
+customer a real confirmation email on request, which is the actual thing that matters to them.
+
+### Part A — "Send Confirmation Email" action
+
+Add a button/menu action on each order (in the row's overflow menu, or wherever per-order
+actions already live) — works for **any** order, not just a specific status, though showing it
+most prominently for `awaiting_fulfillment` orders (the common "customer asks, did my order go
+through?" case) makes sense. Calls:
+
+```
+POST /api/:slug/sitara/orders/:id/send-confirmation-email
+  → 200 { sent: true, to: "customer@email.com" }
+  → 400 { error: "This order has no items to list in the email." }
+  → 502 { error: "..." }  — e.g. "This order has no customer email on file to send to.",
+                             or "Email is not configured." (SITARA_ORDER_EMAIL_SENDER not set up yet)
+```
+
+No body needed — it looks up the order's own items/customer server-side and sends a complete,
+nicely formatted email (order number, item list with quantities/prices, total, shipping
+address) from Sitara's own branded sender. Show a toast/confirmation on success ("Sent to
+{email}"), and surface the error message plainly on failure — the 502 cases are real, expected
+states (no email configured yet, or no customer email on file), not generic failures.
+
+**The real workflow this supports:** a customer emails/messages saying they didn't get a
+confirmation → staff opens the Orders view, searches for that customer, clicks Send on their
+order → done. No BigCommerce involved at any point.
+
+### Part B — Customer address details in the Orders view
+
+Every order object from `GET /api/:slug/sitara/orders` and `GET /api/:slug/sitara/orders/:id`
+now ALSO includes (previously only `customerName`/`customerCity` were there):
+```
+customerEmail: string | null
+customerPhone: string | null
+customerAddressLine1: string | null
+customerAddressLine2: string | null
+customerState: string | null
+customerPostalCode: string | null
+customerCountry: string | null
+```
+Show these in the order detail/expanded row view (email and phone are also useful right next to
+the Send Confirmation Email button, to confirm there's actually an address/email on file before
+clicking it). All nullable — a cart-recovered or manually-entered order may genuinely have no
+address on file yet; show a plain "No address on file" rather than blank space.

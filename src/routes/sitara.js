@@ -53,6 +53,15 @@ const mapExpense = (r) => r && ({
 const mapOrder = (r) => r && ({
   id: r.id, bigcommerceOrderId: r.bigcommerce_order_id, orderNumber: r.order_number,
   customerId: r.customer_id, customerName: r.customer_name ?? null, customerCity: r.customer_city ?? null,
+  // Full contact/shipping details, so a staff member can see exactly who an
+  // order belongs to and where it ships without leaving the Orders view —
+  // added specifically so the "send confirmation email" action (manual,
+  // staff-triggered — no BigCommerce writes, no automatic anything) has
+  // what it needs right there, and so address issues are visible at a glance.
+  customerEmail: r.customer_email ?? null, customerPhone: r.customer_phone ?? null,
+  customerAddressLine1: r.customer_address_line1 ?? null, customerAddressLine2: r.customer_address_line2 ?? null,
+  customerState: r.customer_state ?? null, customerPostalCode: r.customer_postal_code ?? null,
+  customerCountry: r.customer_country ?? null,
   status: r.status, total: Number(r.total || 0), source: r.source,
   statusChangedAt: r.status_changed_at, flagged: !!r.flagged, notes: r.notes,
   excludedFromReporting: !!r.excluded_from_reporting,
@@ -77,7 +86,13 @@ function newId(prefix) {
 function ordersQuery(db) {
   return db('sitara_orders')
     .leftJoin('sitara_customers', 'sitara_orders.customer_id', 'sitara_customers.id')
-    .select('sitara_orders.*', 'sitara_customers.name as customer_name', 'sitara_customers.city as customer_city');
+    .select(
+      'sitara_orders.*', 'sitara_customers.name as customer_name', 'sitara_customers.city as customer_city',
+      'sitara_customers.email as customer_email', 'sitara_customers.phone as customer_phone',
+      'sitara_customers.address_line1 as customer_address_line1', 'sitara_customers.address_line2 as customer_address_line2',
+      'sitara_customers.state as customer_state', 'sitara_customers.postal_code as customer_postal_code',
+      'sitara_customers.country as customer_country'
+    );
 }
 
 // Mirrors BigCommerce's own order status list — see BC_STATUS_MAP below for
@@ -1078,6 +1093,74 @@ async function sendOrderRecoveryEmail(order, items, customer) {
   return { sent: true };
 }
 
+/**
+ * General-purpose "send order confirmation" email — staff-triggered, for ANY
+ * order (not just a recovered/deleted one), usable any time a customer
+ * writes in asking "did my order go through?" Deliberately plain wording,
+ * no mention of any technical issue (unlike sendOrderRecoveryEmail above,
+ * which is specifically for the BigCommerce-deleted-the-order case) — this
+ * is the generic "here's your real receipt" email, safe to send for a
+ * completely normal order too.
+ */
+async function sendOrderConfirmationEmail(order, items, customer) {
+  if (!config.email.enabled) throw new Error('Email is not configured.');
+  if (!customer?.email) throw new Error('This order has no customer email on file to send to.');
+
+  const addressLines = [customer.address_line1, customer.address_line2, [customer.city, customer.state, customer.postal_code].filter(Boolean).join(', '), customer.country]
+    .filter(Boolean);
+
+  const itemRows = items.map((i) => `
+    <tr>
+      <td style="padding:8px 0;border-bottom:1px solid #eee;">${i.product_name}</td>
+      <td style="padding:8px 0;border-bottom:1px solid #eee;text-align:center;">${i.quantity}</td>
+      <td style="padding:8px 0;border-bottom:1px solid #eee;text-align:right;">₹${Number(i.unit_price).toFixed(2)}</td>
+    </tr>`).join('');
+  const itemTextLines = items.map((i) => `  - ${i.product_name} x${i.quantity} — ₹${Number(i.unit_price).toFixed(2)}`).join('\n');
+
+  const text = [
+    `Hi ${customer.name || 'there'},`,
+    '',
+    `This confirms we've received your payment and your order is confirmed.`,
+    '',
+    `Order: ${order.order_number}`,
+    `Total: ₹${Number(order.total).toFixed(2)}`,
+    '',
+    `Items:`,
+    itemTextLines,
+    '',
+    addressLines.length ? `Shipping to:\n  ${addressLines.join('\n  ')}` : '',
+    '',
+    `Thank you for shopping with us!`,
+    '',
+    `— Sitara Drapes`,
+  ].filter((l) => l !== '').join('\n');
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:480px;">
+      <p>Hi ${customer.name || 'there'},</p>
+      <p>This confirms we've received your payment and your order is confirmed.</p>
+      <p><strong>Order:</strong> ${order.order_number}<br/><strong>Total:</strong> ₹${Number(order.total).toFixed(2)}</p>
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+        <thead><tr>
+          <th style="text-align:left;border-bottom:2px solid #333;padding:8px 0;">Item</th>
+          <th style="text-align:center;border-bottom:2px solid #333;padding:8px 0;">Qty</th>
+          <th style="text-align:right;border-bottom:2px solid #333;padding:8px 0;">Price</th>
+        </tr></thead>
+        <tbody>${itemRows}</tbody>
+      </table>
+      ${addressLines.length ? `<p><strong>Shipping to:</strong><br/>${addressLines.join('<br/>')}</p>` : ''}
+      <p>Thank you for shopping with us!</p>
+      <p>— Sitara Drapes</p>
+    </div>`;
+
+  await sendEmail({
+    to: customer.email,
+    from: config.email.sitaraOrderSender || undefined,
+    subject: `Your Sitara Drapes order ${order.order_number} is confirmed`,
+    text, html,
+  });
+}
+
 /** Runs both steps for one order — best-effort, same convention as every other outbound integration here: a failure never blocks or rolls back anything that already happened, just logs clearly. */
 async function recreateOnBigCommerceAndNotify(db, orderId) {
   let pushResult;
@@ -1430,12 +1513,11 @@ async function pushStatusToBigCommerce(bcOrderId, status) {
   if (!res.ok) throw new Error(`BigCommerce order status push failed (${res.status}): ${await res.text()}`);
 }
 
-// POST /api/:slug/sitara/orders/:id/push-to-bigcommerce — manual trigger for
-// an order that needs a replacement pushed (source:'recovered' or
-// bigcommerce_deleted:true) — new cases push automatically as soon as
-// they're detected, but the 2 already sitting from before this existed need
-// an explicit human go-ahead once reviewed, same spirit as every other
-// real/irreversible action in this codebase.
+// POST /api/:slug/sitara/orders/:id/push-to-bigcommerce — manual, human-
+// triggered ONLY (automatic pushing was disabled 2026-10-12 after a bad
+// detection signal created 53 real duplicate orders on the live store — see
+// recoverOrderFromCart's own comment). For a 'recovered' order or one
+// flagged bigcommerce_deleted, review it first, THEN call this explicitly.
 router.post('/orders/:id/push-to-bigcommerce', async (req, res) => {
   try {
     const order = await req.db('sitara_orders').where({ id: req.params.id }).first();
@@ -1449,6 +1531,25 @@ router.post('/orders/:id/push-to-bigcommerce', async (req, res) => {
     req.io.to(req.company.slug).emit('sitara:order_updated', mapOrder(saved));
     res.json({ ...mapOrder(saved), bigcommerceOrderId: result.bigcommerceOrderId, customerEmailed: result.emailed });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/:slug/sitara/orders/:id/send-confirmation-email — the actual
+// safe, manual-only replacement for automatic BigCommerce recreation
+// (2026-10-12): never touches BigCommerce at all, just sends the customer a
+// proper confirmation email (order id, items, total, shipping address) via
+// our own email system. Works for ANY order, not just a recovered one — the
+// real use case is a staff member hitting this whenever a customer writes
+// in asking "did my order go through?"
+router.post('/orders/:id/send-confirmation-email', async (req, res) => {
+  try {
+    const order = await req.db('sitara_orders').where({ id: req.params.id }).first();
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const items = await req.db('sitara_order_items').where({ order_id: order.id });
+    if (!items.length) return res.status(400).json({ error: 'This order has no items to list in the email.' });
+    const customer = order.customer_id ? await req.db('sitara_customers').where({ id: order.customer_id }).first() : null;
+    await sendOrderConfirmationEmail(order, items, customer);
+    res.json({ sent: true, to: customer.email });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 router.patch('/orders/:id/status', async (req, res) => {
