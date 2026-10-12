@@ -858,7 +858,117 @@ async function listAllRazorpayPayments() {
  * linked to another payment — leaves order_id null (surfaced as unmatched
  * in the reconciliation list) if no confident match is found at either step.
  */
+async function fetchBigCommerceCart(cartId) {
+  const res = await fetch(
+    `https://api.bigcommerce.com/stores/${config.bigcommerce.storeHash}/v3/carts/${cartId}?include=line_items.physical_items.options,line_items.digital_items.options`,
+    { headers: bigcommerceApiHeaders() }
+  );
+  if (res.status === 404) return null; // expired/already-converted cart — the real "nothing left to recover" case
+  if (!res.ok) throw new Error(`BigCommerce cart fetch failed (${res.status})`);
+  const body = await res.json();
+  return body.data;
+}
+
+/**
+ * Real, recurring failure mode confirmed live: Razorpay captures payment
+ * successfully, but BigCommerce's post-payment redirect fails, and
+ * BigCommerce deletes the order entirely even though the customer paid —
+ * leaving no order, nothing in their account, a real trust problem. The
+ * BigCommerce-Razorpay checkout integration stamps the cart id onto the
+ * payment's own notes (notes.bigc_cart_id); BigCommerce carts persist 30
+ * days from last modification, so the REAL cart contents (not guessed) are
+ * usually still recoverable even after the order itself is gone.
+ *
+ * Deliberately does NOT push anything to BigCommerce itself — creates the
+ * order locally only, source:'recovered', so a human can review real
+ * recovered orders before anything customer-facing happens. That push
+ * mechanism needs its own decision (BigCommerce's v2 order-create API does
+ * NOT send the customer the usual confirmation email — their own docs
+ * recommend a cart->checkout conversion for that — not decided yet).
+ *
+ * Returns the new order's id, or null if nothing could be recovered (cart
+ * also expired/gone — genuinely nothing left to reconstruct from).
+ */
+async function recoverOrderFromCart(db, entity) {
+  const bigcCartId = entity.notes?.bigc_cart_id;
+  if (!bigcCartId || !config.bigcommerce.enabled) return null;
+
+  // Idempotency — don't recreate an order for the same payment/cart on a
+  // later backfill run just because it's still sitting unpushed.
+  const already = await db('sitara_orders').where({ source: 'recovered' }).whereRaw("notes LIKE ?", [`%${entity.id}%`]).first();
+  if (already) return already.id;
+
+  let cart;
+  try {
+    cart = await fetchBigCommerceCart(bigcCartId);
+  } catch (e) {
+    console.error(`[sitara] cart recovery: fetch failed for cart ${bigcCartId} (payment ${entity.id}):`, e.message);
+    return null;
+  }
+  if (!cart) return null; // cart genuinely expired/gone — nothing left to recover from
+
+  const lineItems = [
+    ...(cart.line_items?.physical_items || []),
+    ...(cart.line_items?.digital_items || []),
+  ];
+  if (!lineItems.length) return null; // cart exists but is empty — nothing meaningful to recreate
+
+  let customerId = null;
+  if (entity.email || entity.contact) {
+    let customer = entity.email ? await db('sitara_customers').where({ email: entity.email }).first() : null;
+    if (!customer && entity.contact) customer = await db('sitara_customers').where({ phone: entity.contact }).first();
+    if (!customer) {
+      const custId = newId('cust');
+      await db('sitara_customers').insert({
+        id: custId, name: entity.email ? entity.email.split('@')[0] : `Customer ${entity.contact || ''}`.trim(),
+        email: entity.email || null, phone: entity.contact || null, source: 'manual',
+      });
+      customer = await db('sitara_customers').where({ id: custId }).first();
+    }
+    customerId = customer.id;
+  }
+
+  const orderId = newId('sord');
+  const orderNumber = await nextOrderNumber(db);
+  const total = Number(entity.amount || 0) / 100;
+  await db('sitara_orders').insert({
+    id: orderId, order_number: orderNumber, customer_id: customerId,
+    status: 'awaiting_fulfillment', total, source: 'recovered',
+    notes: `Recovered from Razorpay payment ${entity.id} (original BigCommerce order ${entity.notes?.bigc_order_id || 'unknown'}, cart ${bigcCartId}) — BigCommerce deleted the original order after a failed checkout redirect. NOT YET pushed to BigCommerce — needs manual review.`,
+  });
+  for (const li of lineItems) {
+    await db('sitara_order_items').insert({
+      id: newId('soi'), order_id: orderId, product_id: null,
+      product_name: li.name || li.sku || 'Recovered item',
+      quantity: li.quantity || 1,
+      unit_price: Number(li.list_price?.value ?? li.sale_price?.value ?? li.unit_price ?? 0),
+      line_total: Number(li.extended_list_price?.value ?? li.extended_sale_price?.value ?? 0) || undefined,
+    });
+  }
+  console.log(`[sitara] recovered order ${orderNumber} from Razorpay payment ${entity.id} (cart ${bigcCartId}) — needs manual review before pushing to BigCommerce.`);
+  return orderId;
+}
+
 async function matchRazorpayPaymentToOrder(db, entity) {
+  // Primary match: the BigCommerce-Razorpay checkout integration stamps the
+  // real BigCommerce order id straight onto the payment's own notes
+  // (notes.bigc_order_id) — an exact key, confirmed live to be present on
+  // the real majority of payments. This is far more reliable than the
+  // customer+amount heuristic below, which depends on a sitara_customers
+  // row already existing with a matching email/phone AND the amount landing
+  // within a ₹1 tolerance — live-confirmed that heuristic alone was leaving
+  // ~80% of real, already-synced orders sitting unlinked for no good reason.
+  const bigcOrderId = entity.notes?.bigc_order_id;
+  if (bigcOrderId) {
+    const order = await db('sitara_orders').where({ bigcommerce_order_id: String(bigcOrderId) }).first();
+    if (order) {
+      const alreadyLinked = await db('sitara_razorpay_payments').where({ order_id: order.id }).first();
+      if (!alreadyLinked) return order.id;
+    }
+  }
+
+  // Fallback: the older customer+amount heuristic, for payments from before
+  // this metadata existed or from a flow that doesn't set it.
   const amountRupees = Number(entity.amount || 0) / 100; // Razorpay amounts are in paise
   let customer = null;
   if (entity.email) customer = await db('sitara_customers').where({ email: entity.email }).first();
@@ -903,7 +1013,13 @@ async function reconcileIncompleteOrder(db, io, companySlug, orderId) {
 
 async function syncRazorpayPayment(db, io, companySlug, entity) {
   const existing = await db('sitara_razorpay_payments').where({ razorpay_payment_id: entity.id }).first();
-  const orderId = await matchRazorpayPaymentToOrder(db, entity);
+  let orderId = await matchRazorpayPaymentToOrder(db, entity);
+  // Real money captured, no matching order anywhere, but the payment's own
+  // notes gives us a cart to recover from — the actual "BigCommerce deleted
+  // the order" case this whole function exists to catch.
+  if (!orderId && entity.status === 'captured') {
+    orderId = await recoverOrderFromCart(db, entity);
+  }
   const row = {
     amount: Number(entity.amount || 0) / 100,
     status: entity.status,
