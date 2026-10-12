@@ -438,6 +438,13 @@ module.exports = {
     // though it's not required() at boot (same "keep booting either way"
     // reasoning as the rest of this block).
     frontendBaseUrl: process.env.FRONTEND_BASE_URL || null,
+    // Sitara's own order-recovery confirmation emails (AIDA roadmap item —
+    // BigCommerce/Razorpay order recovery) need a Sitara-branded sender, NOT
+    // the platform's generic no-reply address above — a Sitara customer
+    // shouldn't get an email that looks like it's from unrelated OG Track
+    // infrastructure. Falls back to the main sender if unset, so this never
+    // silently fails to send, just looks less branded until configured.
+    sitaraOrderSender: process.env.SITARA_ORDER_EMAIL_SENDER || null,
   },
   // Microsoft Graph — AIDA roadmap item 3 (email monitoring). Client-
   // credentials OAuth2 app registration against a real Microsoft 365

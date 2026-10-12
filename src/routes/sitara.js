@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const config = require('../config');
+const { sendEmail } = require('../utils/email');
 const router = express.Router();
 
 // ── Row mappers ──────────────────────────────────────────────────────────────
@@ -624,6 +625,16 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
   // with a created_at of "today", making "this month" == "all time".
   const realOrderDate = bcOrder.date_created ? new Date(bcOrder.date_created) : new Date();
 
+  // Live-confirmed real failure mode: BigCommerce soft-deletes a
+  // failed-redirect checkout (is_deleted: true) rather than 404-ing it — the
+  // order keeps syncing normally and can look perfectly healthy locally
+  // (payment matched, status fine) while the customer sees nothing on
+  // BigCommerce's own side at all. Track it explicitly rather than ignore it.
+  const bcDeleted = !!bcOrder.is_deleted;
+  if (bcDeleted) {
+    console.log(`[sitara] order ${bcOrderId} is soft-deleted on BigCommerce (is_deleted: true) — flagging for a replacement push.`);
+  }
+
   let orderId = existing?.id;
   if (!existing) {
     orderId = newId('sord');
@@ -631,6 +642,7 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
       id: orderId, bigcommerce_order_id: String(bcOrderId), order_number: `BC-${bcOrderId}`,
       customer_id: customerId, status: mappedStatus, total: Number(bcOrder.total_inc_tax || 0),
       source: 'bigcommerce', status_changed_at: new Date(), created_at: realOrderDate,
+      bigcommerce_deleted: bcDeleted,
     });
   } else {
     await db('sitara_orders').where({ id: orderId }).update({
@@ -638,6 +650,7 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
       status_changed_at: statusChanged ? new Date() : existing.status_changed_at,
       flagged: statusChanged ? 0 : existing.flagged,
       created_at: realOrderDate, updated_at: new Date(),
+      bigcommerce_deleted: bcDeleted,
     });
     await db('sitara_order_items').where({ order_id: orderId }).delete();
   }
@@ -945,8 +958,147 @@ async function recoverOrderFromCart(db, entity) {
       line_total: Number(li.extended_list_price?.value ?? li.extended_sale_price?.value ?? 0) || undefined,
     });
   }
-  console.log(`[sitara] recovered order ${orderNumber} from Razorpay payment ${entity.id} (cart ${bigcCartId}) — needs manual review before pushing to BigCommerce.`);
+  console.log(`[sitara] recovered order ${orderNumber} from Razorpay payment ${entity.id} (cart ${bigcCartId}) — pushing a replacement to BigCommerce now.`);
+  await recreateOnBigCommerceAndNotify(db, orderId);
   return orderId;
+}
+
+/**
+ * Creates a REAL replacement order on BigCommerce for a local order that
+ * needs one (source:'recovered', or bigcommerce_deleted:true) — via the
+ * plain v2 Orders API. Deliberately NOT the cart->checkout conversion path:
+ * confirmed via BigCommerce's own docs this customer already paid outside
+ * BigCommerce's checkout (via Razorpay directly), so there's no live
+ * payment step to complete through BigCommerce's own gateway flow, and
+ * faking one would be genuinely fragile against a real store with no
+ * sandbox to test against. The real tradeoff, accepted deliberately:
+ * BigCommerce's own order-confirmation email does NOT fire for a v2-created
+ * order — sendOrderRecoveryEmail below is what actually tells the customer,
+ * using OUR OWN email system instead of depending on BigCommerce's.
+ *
+ * Catalog products use a real product_id (via sitara_products.bigcommerce_product_id)
+ * when known; anything else (every 'recovered' order's items, since cart
+ * recovery never resolves back to our own catalog) falls back to a BigCommerce
+ * "custom product" line item — still billed correctly, just not linked to
+ * BigCommerce's own inventory tracking for that line.
+ */
+async function pushReplacementOrderToBigCommerce(db, orderId) {
+  const order = await db('sitara_orders').where({ id: orderId }).first();
+  if (!order) throw new Error(`Order ${orderId} not found.`);
+  const items = await db('sitara_order_items').where({ order_id: orderId });
+  if (!items.length) throw new Error(`Order ${order.order_number} has no line items to push.`);
+  const customer = order.customer_id ? await db('sitara_customers').where({ id: order.customer_id }).first() : null;
+  if (!customer?.email) throw new Error(`Order ${order.order_number} has no customer email on file — can't create a BigCommerce order or notify the customer.`);
+
+  const nameParts = (customer.name || 'Customer').trim().split(/\s+/);
+  const firstName = nameParts[0] || 'Customer';
+  const lastName = nameParts.slice(1).join(' ') || '.';
+  // zip is a hard requirement of BigCommerce's own API — a recovered order's
+  // customer record often has no real address (Razorpay's payment data only
+  // gives email/phone, not a shipping address). Using a clearly-fake
+  // placeholder rather than failing outright: the ORDER existing and the
+  // customer being notified matters more than shipping logistics being
+  // perfect on the first try — staff_notes flags it for manual correction.
+  const hasRealAddress = !!(customer.address_line1 && customer.postal_code);
+  const billing_address = {
+    first_name: firstName, last_name: lastName,
+    street_1: customer.address_line1 || 'ADDRESS NEEDED — contact customer',
+    city: customer.city || 'Unknown', state: customer.state || 'Unknown',
+    zip: customer.postal_code || '000000',
+    country: customer.country || 'India', country_iso2: 'IN',
+    email: customer.email, phone: customer.phone || '',
+  };
+
+  const products = [];
+  for (const item of items) {
+    let bcProductId = null;
+    if (item.product_id) {
+      const product = await db('sitara_products').where({ id: item.product_id }).first();
+      bcProductId = product?.bigcommerce_product_id ? Number(product.bigcommerce_product_id) : null;
+    }
+    if (bcProductId) {
+      products.push({ product_id: bcProductId, quantity: Number(item.quantity) || 1 });
+    } else {
+      products.push({
+        name: item.product_name || 'Item', quantity: Number(item.quantity) || 1,
+        price_inc_tax: Number(item.unit_price) || 0, price_ex_tax: Number(item.unit_price) || 0,
+      });
+    }
+  }
+
+  const staffNotes = [
+    `REPLACEMENT ORDER — ALREADY PAID, DO NOT RE-CHARGE.`,
+    order.bigcommerce_order_id ? `Original BigCommerce order ${order.bigcommerce_order_id} was soft-deleted by BigCommerce after a failed checkout redirect.` : `Original order was never created on BigCommerce at all (checkout redirect failed) — recreated from the real cart via Razorpay's payment metadata.`,
+    `Internal order: ${order.order_number}.`,
+    !hasRealAddress ? `NO REAL SHIPPING ADDRESS ON FILE — contact the customer (${customer.email}${customer.phone ? ', ' + customer.phone : ''}) to confirm before shipping.` : '',
+  ].filter(Boolean).join(' ');
+
+  const res = await fetch(`https://api.bigcommerce.com/stores/${config.bigcommerce.storeHash}/v2/orders`, {
+    method: 'POST',
+    headers: { ...bigcommerceApiHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ billing_address, products, status_id: 11, staff_notes: staffNotes, customer_message: '' }),
+  });
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`BigCommerce order creation failed (${res.status}): ${errBody}`);
+  }
+  const created = await res.json();
+
+  await db('sitara_orders').where({ id: orderId }).update({
+    bigcommerce_order_id: String(created.id), bigcommerce_deleted: false,
+    notes: `${order.notes || ''}\n\nPushed as new BigCommerce order ${created.id} on ${new Date().toISOString()}.`.trim(),
+    updated_at: new Date(),
+  });
+  return { bigcommerceOrderId: created.id, hasRealAddress };
+}
+
+/** Tells the actual customer their order is confirmed — using OUR OWN email, since BigCommerce's own confirmation email never fires for a v2-created order (see pushReplacementOrderToBigCommerce's own comment). */
+async function sendOrderRecoveryEmail(order, items, customer) {
+  if (!config.email.enabled || !customer?.email) return { sent: false, reason: 'email not configured or no customer email on file' };
+  const itemLines = items.map((i) => `- ${i.product_name} x${i.quantity} (₹${Number(i.unit_price).toFixed(2)})`).join('\n');
+  const text = [
+    `Hi ${customer.name || 'there'},`,
+    '',
+    `We had a brief technical issue with our checkout system, but your payment went through successfully and your order is fully confirmed.`,
+    '',
+    `Order ${order.order_number} — total ₹${Number(order.total).toFixed(2)}:`,
+    itemLines,
+    '',
+    `We'll be in touch with shipping details shortly. Sorry for any confusion, and thank you for your patience!`,
+    '',
+    `— Sitara Drapes`,
+  ].join('\n');
+
+  await sendEmail({
+    to: customer.email,
+    from: config.email.sitaraOrderSender || undefined,
+    subject: `Your Sitara Drapes order ${order.order_number} is confirmed`,
+    text,
+    html: text.split('\n').map((l) => `<p>${l || '&nbsp;'}</p>`).join(''),
+  });
+  return { sent: true };
+}
+
+/** Runs both steps for one order — best-effort, same convention as every other outbound integration here: a failure never blocks or rolls back anything that already happened, just logs clearly. */
+async function recreateOnBigCommerceAndNotify(db, orderId) {
+  let pushResult;
+  try {
+    pushResult = await pushReplacementOrderToBigCommerce(db, orderId);
+  } catch (e) {
+    console.error(`[sitara] BigCommerce replacement push failed for order ${orderId}:`, e.message);
+    return { pushed: false, emailed: false, error: e.message };
+  }
+  const order = await db('sitara_orders').where({ id: orderId }).first();
+  const items = await db('sitara_order_items').where({ order_id: orderId });
+  const customer = order.customer_id ? await db('sitara_customers').where({ id: order.customer_id }).first() : null;
+  try {
+    await sendOrderRecoveryEmail(order, items, customer);
+  } catch (e) {
+    console.error(`[sitara] customer recovery email failed for order ${orderId}:`, e.message);
+    return { pushed: true, bigcommerceOrderId: pushResult.bigcommerceOrderId, emailed: false, error: e.message };
+  }
+  console.log(`[sitara] order ${order.order_number} pushed to BigCommerce as ${pushResult.bigcommerceOrderId} and customer notified.`);
+  return { pushed: true, bigcommerceOrderId: pushResult.bigcommerceOrderId, emailed: true };
 }
 
 async function matchRazorpayPaymentToOrder(db, entity) {
@@ -1033,6 +1185,32 @@ async function syncRazorpayPayment(db, io, companySlug, entity) {
   }
   if (orderId && entity.status === 'captured') {
     await reconcileIncompleteOrder(db, io, companySlug, orderId);
+    // Safety net, same reasoning as the daily Razorpay backfill existing for
+    // exactly this reason — don't rely on BigCommerce's own deletion webhook
+    // alone (confirmed live elsewhere this exact session: webhook delivery
+    // genuinely isn't 100% reliable). Re-checks BigCommerce's live is_deleted
+    // flag for this specific order on every payment sync, not just when a
+    // webhook happens to fire for it.
+    await refreshBigCommerceDeletedFlag(db, orderId);
+  }
+}
+
+/** Re-fetches ONE order's live BigCommerce state and updates bigcommerce_deleted if it's drifted — cheap (one order, not a full re-sync) and safe to call often. */
+async function refreshBigCommerceDeletedFlag(db, orderId) {
+  const order = await db('sitara_orders').where({ id: orderId }).first();
+  if (!order?.bigcommerce_order_id) return; // a 'recovered' or 'manual' order has nothing on BigCommerce to check
+  try {
+    const bcOrder = await fetchBigCommerceOrder(order.bigcommerce_order_id);
+    const bcDeleted = !!bcOrder.is_deleted;
+    if (bcDeleted !== !!order.bigcommerce_deleted) {
+      await db('sitara_orders').where({ id: orderId }).update({ bigcommerce_deleted: bcDeleted, updated_at: new Date() });
+      if (bcDeleted) {
+        console.log(`[sitara] order ${order.order_number} (BC ${order.bigcommerce_order_id}) found soft-deleted on BigCommerce during payment reconciliation — pushing a replacement now.`);
+        await recreateOnBigCommerceAndNotify(db, orderId);
+      }
+    }
+  } catch (e) {
+    console.error(`[sitara] refreshBigCommerceDeletedFlag failed for order ${orderId}:`, e.message);
   }
 }
 
@@ -1253,6 +1431,27 @@ async function pushStatusToBigCommerce(bcOrderId, status) {
   });
   if (!res.ok) throw new Error(`BigCommerce order status push failed (${res.status}): ${await res.text()}`);
 }
+
+// POST /api/:slug/sitara/orders/:id/push-to-bigcommerce — manual trigger for
+// an order that needs a replacement pushed (source:'recovered' or
+// bigcommerce_deleted:true) — new cases push automatically as soon as
+// they're detected, but the 2 already sitting from before this existed need
+// an explicit human go-ahead once reviewed, same spirit as every other
+// real/irreversible action in this codebase.
+router.post('/orders/:id/push-to-bigcommerce', async (req, res) => {
+  try {
+    const order = await req.db('sitara_orders').where({ id: req.params.id }).first();
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.source !== 'recovered' && !order.bigcommerce_deleted) {
+      return res.status(400).json({ error: 'This order doesn\'t need a replacement push — it already has a healthy BigCommerce order.' });
+    }
+    const result = await recreateOnBigCommerceAndNotify(req.db, order.id);
+    if (!result.pushed) return res.status(502).json({ error: result.error || 'Push failed' });
+    const saved = await ordersQuery(req.db).where('sitara_orders.id', order.id).first();
+    req.io.to(req.company.slug).emit('sitara:order_updated', mapOrder(saved));
+    res.json({ ...mapOrder(saved), bigcommerceOrderId: result.bigcommerceOrderId, customerEmailed: result.emailed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 router.patch('/orders/:id/status', async (req, res) => {
   try {
