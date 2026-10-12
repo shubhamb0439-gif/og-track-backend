@@ -952,8 +952,13 @@ async function recoverOrderFromCart(db, entity) {
       line_total: Number(li.extended_list_price?.value ?? li.extended_sale_price?.value ?? 0) || undefined,
     });
   }
-  console.log(`[sitara] recovered order ${orderNumber} from Razorpay payment ${entity.id} (cart ${bigcCartId}) — pushing a replacement to BigCommerce now.`);
-  await recreateOnBigCommerceAndNotify(db, orderId);
+  // AUTOMATIC push DISABLED 2026-10-12 (user instruction, after the
+  // is_deleted bug created 53 live duplicate orders) — recovery still
+  // happens and the order is still created LOCALLY, but nothing gets
+  // pushed to BigCommerce or emailed to a customer without an explicit
+  // human trigger via POST /orders/:id/push-to-bigcommerce. Do not
+  // re-enable this call without explicit instruction.
+  console.log(`[sitara] recovered order ${orderNumber} from Razorpay payment ${entity.id} (cart ${bigcCartId}) — sitting locally, needs manual review/push.`);
   return orderId;
 }
 
