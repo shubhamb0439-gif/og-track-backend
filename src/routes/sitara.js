@@ -625,15 +625,11 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
   // with a created_at of "today", making "this month" == "all time".
   const realOrderDate = bcOrder.date_created ? new Date(bcOrder.date_created) : new Date();
 
-  // Live-confirmed real failure mode: BigCommerce soft-deletes a
-  // failed-redirect checkout (is_deleted: true) rather than 404-ing it — the
-  // order keeps syncing normally and can look perfectly healthy locally
-  // (payment matched, status fine) while the customer sees nothing on
-  // BigCommerce's own side at all. Track it explicitly rather than ignore it.
-  const bcDeleted = !!bcOrder.is_deleted;
-  if (bcDeleted) {
-    console.log(`[sitara] order ${bcOrderId} is soft-deleted on BigCommerce (is_deleted: true) — flagging for a replacement push.`);
-  }
+  // bigcommerce_deleted tracking DISABLED 2026-10-12 — live-confirmed
+  // BigCommerce's own is_deleted field is not a reliable signal (a
+  // completely normal, long-fulfilled order also returned is_deleted:
+  // true) — never set it from here until a real signal is found; see
+  // refreshBigCommerceDeletedFlag's own comment for the full story.
 
   let orderId = existing?.id;
   if (!existing) {
@@ -642,7 +638,6 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
       id: orderId, bigcommerce_order_id: String(bcOrderId), order_number: `BC-${bcOrderId}`,
       customer_id: customerId, status: mappedStatus, total: Number(bcOrder.total_inc_tax || 0),
       source: 'bigcommerce', status_changed_at: new Date(), created_at: realOrderDate,
-      bigcommerce_deleted: bcDeleted,
     });
   } else {
     await db('sitara_orders').where({ id: orderId }).update({
@@ -650,7 +645,6 @@ async function syncBigCommerceOrder(db, io, companySlug, bcOrderId) {
       status_changed_at: statusChanged ? new Date() : existing.status_changed_at,
       flagged: statusChanged ? 0 : existing.flagged,
       created_at: realOrderDate, updated_at: new Date(),
-      bigcommerce_deleted: bcDeleted,
     });
     await db('sitara_order_items').where({ order_id: orderId }).delete();
   }
@@ -1196,22 +1190,21 @@ async function syncRazorpayPayment(db, io, companySlug, entity) {
 }
 
 /** Re-fetches ONE order's live BigCommerce state and updates bigcommerce_deleted if it's drifted — cheap (one order, not a full re-sync) and safe to call often. */
-async function refreshBigCommerceDeletedFlag(db, orderId) {
-  const order = await db('sitara_orders').where({ id: orderId }).first();
-  if (!order?.bigcommerce_order_id) return; // a 'recovered' or 'manual' order has nothing on BigCommerce to check
-  try {
-    const bcOrder = await fetchBigCommerceOrder(order.bigcommerce_order_id);
-    const bcDeleted = !!bcOrder.is_deleted;
-    if (bcDeleted !== !!order.bigcommerce_deleted) {
-      await db('sitara_orders').where({ id: orderId }).update({ bigcommerce_deleted: bcDeleted, updated_at: new Date() });
-      if (bcDeleted) {
-        console.log(`[sitara] order ${order.order_number} (BC ${order.bigcommerce_order_id}) found soft-deleted on BigCommerce during payment reconciliation — pushing a replacement now.`);
-        await recreateOnBigCommerceAndNotify(db, orderId);
-      }
-    }
-  } catch (e) {
-    console.error(`[sitara] refreshBigCommerceDeletedFlag failed for order ${orderId}:`, e.message);
-  }
+/**
+ * DISABLED 2026-10-12 — live-confirmed BigCommerce's v2 order object's
+ * is_deleted field is NOT a reliable "hidden from the customer" signal: a
+ * completely normal, long-fulfilled control order (BC #100) ALSO returned
+ * is_deleted: true, proving the single data point this was built on (order
+ * 401) didn't mean what it looked like it meant. Acting on it created 53
+ * real duplicate orders on the live BigCommerce store before this was
+ * caught. Left as a no-op (not deleted) so the call site doesn't need
+ * touching again once a real signal is found — do NOT re-enable the
+ * recreateOnBigCommerceAndNotify call below without first validating
+ * whatever new signal is used against BOTH a known-good order AND a
+ * known-bad one, the exact check that was skipped the first time.
+ */
+async function refreshBigCommerceDeletedFlag() {
+  return;
 }
 
 function verifyRazorpayWebhook(req) {
