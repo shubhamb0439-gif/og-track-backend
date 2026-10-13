@@ -521,6 +521,21 @@ module.exports = {
       accountSid, authToken, fromNumber,
     };
   })(),
+  // AIDA roadmap item 6 — Azure Cost Management dashboard (masteradmin-only).
+  // A SEPARATE Azure AD app registration ("og-track-cost-reader") from the
+  // app's own identity, scoped via IAM to ONLY "Cost Management Reader" on
+  // the subscription — read-only spend data, nothing else. Same soft-
+  // optional idiom as every other integration here.
+  azureCost: (() => {
+    const tenantId = process.env.AZURE_COST_TENANT_ID || null;
+    const clientId = process.env.AZURE_COST_CLIENT_ID || null;
+    const clientSecret = process.env.AZURE_COST_CLIENT_SECRET || null;
+    const subscriptionId = process.env.AZURE_COST_SUBSCRIPTION_ID || null;
+    return {
+      enabled: !!(tenantId && clientId && clientSecret && subscriptionId),
+      tenantId, clientId, clientSecret, subscriptionId,
+    };
+  })(),
   // BigCommerce (src/routes/sitara.js's webhook + outbound status push) —
   // Sitara Bespoke's own store, global env vars per the user's own choice
   // (only one company uses this today). Deliberately NOT validated via

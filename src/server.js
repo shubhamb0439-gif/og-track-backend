@@ -12,6 +12,7 @@ const { requireAuth } = require('./utils/auth');
 const companiesRoutes = require('./routes/companies');
 const masteradminRoutes = require('./routes/masteradmin');
 const masteradminZohoRoutes = require('./routes/masteradminZoho');
+const masteradminAzureCostsRoutes = require('./routes/masteradminAzureCosts');
 const zohoRoutes = require('./routes/zoho');
 const usersRoutes = require('./routes/users');
 const projectsRoutes = require('./routes/projects');
@@ -90,6 +91,7 @@ app.get('/health', async (_req, res) => {
 app.use('/api/companies', companiesRoutes);
 app.use('/api/masteradmin', masteradminRoutes);
 app.use('/api/masteradmin/zoho', masteradminZohoRoutes);
+app.use('/api/masteradmin/azure-costs', masteradminAzureCostsRoutes);
 // AIDA for master admin (domain.com/master-admin/aida) — cross-company tools only.
 app.use('/api/masteradmin/aida', masterAdminAidaRouter);
 // WhatsApp Business Cloud API bridge to AIDA's master-admin context — see

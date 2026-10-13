@@ -533,6 +533,28 @@ tenantAidaRouter.post('/report-issue', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /tts — plain, non-streaming text-to-speech: the Android app has no
+// socket.io connection (unlike the web panel, which gets its spoken reply
+// via real-time streamed chunks — see voiceSession.createStreamingSpeaker),
+// so this gives it one complete ElevenLabs-synthesized audio file in the
+// HTTP response body instead. Reuses the exact same synthesis pipeline
+// (cleanForSpeech, voice settings) the streaming path already uses —
+// nothing new on the ElevenLabs side, just a different delivery shape.
+masterAdminAidaRouter.post('/tts', async (req, res) => {
+  try {
+    if (!config.aida.voice.enabled) {
+      return res.status(503).json({ error: 'Voice is not configured on this server (missing ELEVENLABS_API_KEY/ELEVENLABS_VOICE_ID).' });
+    }
+    const { text } = req.body || {};
+    if (!text || typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ error: 'text is required' });
+    }
+    const { buffer, mimeType } = await voiceSession.synthesizeFullReply(text);
+    res.set('Content-Type', mimeType);
+    res.send(buffer);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Async job endpoints — master admin only for now ──────────────────────────
 // Added directly to the already-built router (still behind its 'enabled'
 // check + requireMasterAdminAidaAuth from createAidaRouter above) rather than

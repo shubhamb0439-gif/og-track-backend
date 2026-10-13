@@ -13,6 +13,30 @@ async function synthesizeChunkFully(text, opts = {}) {
   return Buffer.concat(pieces);
 }
 
+/**
+ * Non-streaming "give me one complete audio file for this whole reply" —
+ * for a client that isn't on socket.io at all (the Android app's TTS
+ * endpoint, routes/aida.js's POST /tts). Reuses the exact same
+ * cleanForSpeech + synthesizeChunkFully pieces every streaming reply
+ * already goes through, just without the per-sentence chunking/streaming
+ * (not needed here — nothing plays until the whole file is downloaded
+ * anyway, so there's no latency win from chunking in this path).
+ * Truncates to maxCharsPerReply same as the streaming path, so one
+ * runaway-long reply can't turn into a huge/expensive synthesis call.
+ */
+async function synthesizeFullReply(text) {
+  const voice = config.aida.voice;
+  const cleaned = cleanForSpeech(text).slice(0, voice.maxCharsPerReply);
+  if (!cleaned) return { buffer: Buffer.alloc(0), mimeType: mimeTypeForFormat(voice.outputFormat) };
+  const adapted = adaptDirective(safeDirective(null), { modelId: voice.modelId, baseSpeed: voice.speed });
+  const buffer = await synthesizeChunkFully(cleaned, {
+    stability: adapted.voiceSettings.stability,
+    style: adapted.voiceSettings.style,
+    speed: adapted.voiceSettings.speed,
+  });
+  return { buffer, mimeType: mimeTypeForFormat(voice.outputFormat) };
+}
+
 // ── Barge-in / cancellation ───────────────────────────────────────────────
 // A turn is cancelled by a client-side interrupt (POST /aida/voice-cancel).
 // Tracked here rather than per-request state since speech generation runs
@@ -337,6 +361,7 @@ function createStreamingSpeaker({ io, room, chunkEvent, errorEvent, turnId, dire
 module.exports = {
   speakReply,
   createStreamingSpeaker,
+  synthesizeFullReply,
   playFiller,
   cancelTurn,
   isCancelled,
