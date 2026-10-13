@@ -31,6 +31,7 @@ const READABLE_TENANT_TOOL_MODULES = [
   require('./inventory'),
   require('./finance'),
   require('./hr'),
+  require('./sitara'),
 ];
 
 function wrapForCrossTenant(tool) {

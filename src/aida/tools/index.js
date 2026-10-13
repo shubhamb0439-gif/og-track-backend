@@ -13,6 +13,7 @@ const MODULE_TOOL_FILES = [
   require('./inventory'),
   require('./finance'),
   require('./hr'),
+  require('./sitara'),
   require('./masteradmin'),
   require('./masteradminCrossTenant'),
   require('./devops'),
