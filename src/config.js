@@ -237,6 +237,19 @@ module.exports = {
           baseUrl: process.env.BROWSERLESS_BASE_URL || 'https://production-sfo.browserless.io',
         };
       })(),
+      // AIDA roadmap item 11 — real web search (src/aida/tools/webResearch.js's
+      // search_web tool). Brave was the original pick but its free tier was
+      // discontinued since that plan was written — Tavily instead (built for
+      // LLM-agent use cases, similar pricing, no surprise rug-pull risk right
+      // now). Soft-optional like every other integration here.
+      tavily: (() => {
+        const apiKey = process.env.TAVILY_API_KEY || null;
+        return {
+          enabled: !!apiKey,
+          apiKey,
+          baseUrl: process.env.TAVILY_BASE_URL || 'https://api.tavily.com',
+        };
+      })(),
       // Phase 2 of the power-tier plan — "AIDA, create me a module." Builds
       // across the SAME two repos every time (unlike dev_repo_fix, which
       // takes a repo per chat call), so they're configured once here rather

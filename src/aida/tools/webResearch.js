@@ -2,6 +2,8 @@ const { MASTERADMIN_SENTINEL_MODULE } = require('../contextBuilder');
 const config = require('../../config');
 const browserless = require('../codingAgent/browserless');
 
+const MAX_SEARCH_RESULTS = 8;
+
 /**
  * Master-admin-only "AIDA can look at a real webpage" tool. Lightweight,
  * dependency-free HTML-to-text extraction (regex-based, same spirit as
@@ -191,6 +193,73 @@ module.exports = [
       }
 
       return { startUrl: startUrl.toString(), pagesVisited: pages.length, pages };
+    },
+  },
+
+  {
+    name: 'search_web',
+    description:
+      'Searches the real, live web by keywords/name and returns the top matching pages (title, url, short ' +
+      'snippet). Use this FIRST whenever you need to find something but do NOT already have its exact URL — a ' +
+      "product, a company, a news topic, documentation for something you're unsure of, anything where the user " +
+      'named a thing rather than a link. Once this gives you a real URL, call scrape_webpage (or browse_website ' +
+      "for a JS-heavy site) on it to get that page's actual content — search_web's own snippets are too short to " +
+      'reason over directly, they only tell you WHERE to look next.',
+    requiredModules: [MASTERADMIN_SENTINEL_MODULE],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What to search for, e.g. "Drug Assist by OG Plus official website"' },
+        maxResults: { type: 'integer', description: `How many results to return (default 5, max ${MAX_SEARCH_RESULTS}).` },
+      },
+      required: ['query'],
+    },
+    async handler(context, { query, maxResults }) {
+      if (!config.aida.tavily.enabled) {
+        return { error: 'Web search is not configured on this server yet (missing TAVILY_API_KEY) — ask the master admin to set it up.' };
+      }
+      if (!query || !query.trim()) {
+        return { error: 'query is required.' };
+      }
+      const cappedMaxResults = Math.min(Math.max(Number(maxResults) || 5, 1), MAX_SEARCH_RESULTS);
+
+      let res;
+      try {
+        res = await fetch(`${config.aida.tavily.baseUrl}/search`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: config.aida.tavily.apiKey,
+            query: query.trim(),
+            max_results: cappedMaxResults,
+            search_depth: 'basic',
+          }),
+          signal: AbortSignal.timeout(15_000),
+        });
+      } catch (e) {
+        return { error: `Web search request failed: ${e.message}` };
+      }
+      if (!res.ok) {
+        const bodyText = await res.text().catch(() => '');
+        return { error: `Web search returned HTTP ${res.status}${bodyText ? `: ${bodyText.slice(0, 300)}` : ''}` };
+      }
+
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        return { error: `Web search returned an unreadable response: ${e.message}` };
+      }
+
+      const results = Array.isArray(data.results)
+        ? data.results.map((r) => ({
+          title: r.title || null,
+          url: r.url || null,
+          snippet: (r.content || '').slice(0, 500),
+        }))
+        : [];
+
+      return { query: query.trim(), results };
     },
   },
 ];

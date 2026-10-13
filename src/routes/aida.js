@@ -20,6 +20,7 @@ const { matchTodayCelebrations } = require('../aida/celebrations');
 const { tryResolvePreviewUrl } = require('../aida/jobs/previewResolver');
 const memory = require('../aida/memory');
 const { extractTextFromBuffer } = require('../aida/attachmentText');
+const { detectAndProposeCapabilityGap } = require('../aida/capabilityGapDetector');
 
 registerAllTools();
 sessionMemory.startSweeper();
@@ -243,6 +244,10 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
   }
 
   if (result.reply && result.reply.trim()) sessionMemory.appendTurn(context, userMessage, result.reply);
+
+  // AIDA roadmap item 8.5 — fire-and-forget, never delays or affects this
+  // response (see the function's own try/catch — it can't throw out here).
+  detectAndProposeCapabilityGap({ context, userMessage, reply: result.reply, toolCalls: result.toolCalls });
 
   return { ...result, turnId };
 }

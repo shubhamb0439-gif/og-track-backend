@@ -62,6 +62,13 @@ const kinds = {
   //     stage 1 already resolved.
   user_reported_issue: require('./userReportedIssue'),
   user_reported_issue_build: require('./userReportedIssueBuild'),
+  // AIDA roadmap item 8.5 — "self-evolving": AIDA proposes a plan when it
+  // detects it couldn't help with something (see capabilityGapDetector.js,
+  // hooked into routes/aida.js's runConversationTurn). Same plan-first-gate
+  // shape as user_reported_issue, but resume() hands straight to a plain
+  // dev_repo_fix job — no separate "_build" stage needed, see the file's own
+  // header comment for why.
+  capability_gap_proposal: require('./capabilityGapProposal'),
 };
 
 function getJobKind(kind) {

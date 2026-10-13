@@ -2328,3 +2328,46 @@ Show these in the order detail/expanded row view (email and phone are also usefu
 the Send Confirmation Email button, to confirm there's actually an address/email on file before
 clicking it). All nullable — a cart-recovered or manually-entered order may genuinely have no
 address on file yet; show a plain "No address on file" rather than blank space.
+
+---
+
+## 39. BUG FIX — Sitara Orders shows "No email on file" even though #38's API already returns it
+
+**Status: confirmed live 2026-10-12 — the backend is NOT the problem.** A direct, raw API call
+to production for the exact order shown in the screenshot (BC-459) returns the real data
+correctly:
+```json
+{
+  "customerEmail": "shubhamb0439@gmail.com",
+  "customerPhone": "+918310066102",
+  "customerAddressLine1": "gottigere",
+  "customerState": "Karnataka",
+  "customerPostalCode": "560083",
+  "customerCountry": "India",
+  ...
+}
+```
+But the built UI shows "No email on file" (in red) and no address at all for this same order.
+This means the component rendering the CUSTOMER section in the order row/detail view isn't
+actually reading `customerEmail`/`customerAddressLine1`/`customerPhone`/etc. from the order
+object the API already returns — it's either reading the wrong field name, falling through to a
+hardcoded/placeholder "No email on file" string unconditionally, or working from a stale
+type/interface that was defined before #38 added these fields and never got updated.
+
+**Fix:** find the component that renders that CUSTOMER block (the one showing name, "No email on
+file", city in the screenshot) and make it read directly from the SAME order object already
+returned by `GET /api/:slug/sitara/orders` — specifically `customerEmail`, `customerPhone`,
+`customerAddressLine1`, `customerAddressLine2`, `customerState`, `customerPostalCode`,
+`customerCountry` (all already present on every order, confirmed above). Only show a "No email
+on file" / "No address on file" fallback when the field is ACTUALLY `null` — not unconditionally.
+If this is TypeScript, check whether the Order type/interface even declares these fields at all;
+if it predates #38, it may be silently dropping them even though the raw API response has them.
+
+**Separately, verify Send Confirmation Email is actually working** — triggered it directly for
+this exact order (BC-459, `sord_1791793145575xf9h`) and the backend confirms
+`{"sent":true,"to":"shubhamb0439@gmail.com"}`, a real successful send through Azure
+Communication Services. If the button in the UI still shows no feedback either way (success or
+error toast) after clicking, that's the same kind of gap as the customer-field issue above — the
+button's response handling isn't surfacing what the API already tells it. If the email genuinely
+never arrives despite the API reporting success, that's a mail-delivery/spam-filtering question
+(check the spam folder first), not a frontend bug.
