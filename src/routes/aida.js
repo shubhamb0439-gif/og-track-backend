@@ -21,6 +21,7 @@ const { tryResolvePreviewUrl } = require('../aida/jobs/previewResolver');
 const memory = require('../aida/memory');
 const { extractTextFromBuffer } = require('../aida/attachmentText');
 const { detectAndProposeCapabilityGap } = require('../aida/capabilityGapDetector');
+const { decideAgentStep } = require('../aida/agentStep');
 
 registerAllTools();
 sessionMemory.startSweeper();
@@ -552,6 +553,27 @@ masterAdminAidaRouter.post('/tts', async (req, res) => {
     const { buffer, mimeType } = await voiceSession.synthesizeFullReply(text);
     res.set('Content-Type', mimeType);
     res.send(buffer);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /agent-step — ONE decision in AIDA's autonomous multi-step app
+// control loop (e.g. "find a traditional dress on Flipkart and add it to
+// cart"). The Android app owns the actual loop (describe screen → call
+// this → execute the returned action → repeat); this endpoint only ever
+// decides ONE action at a time and never touches the device itself. See
+// src/aida/agentStep.js for the hard, twice-enforced rule against ever
+// choosing to tap a payment/checkout screen.
+masterAdminAidaRouter.post('/agent-step', async (req, res) => {
+  try {
+    const { task, elements, history } = req.body || {};
+    if (!task || typeof task !== 'string' || !task.trim()) {
+      return res.status(400).json({ error: 'task is required' });
+    }
+    if (!Array.isArray(elements)) {
+      return res.status(400).json({ error: 'elements (array) is required' });
+    }
+    const decision = await decideAgentStep({ task, elements }, Array.isArray(history) ? history : []);
+    res.json(decision);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
