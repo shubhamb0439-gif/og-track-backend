@@ -1484,6 +1484,17 @@ router.get('/orders', async (req, res) => {
       const s = `%${req.query.search}%`;
       q = q.where((qb) => qb.where('sitara_orders.order_number', 'like', s).orWhere('sitara_customers.name', 'like', s));
     }
+    // Real gap confirmed live: AIDA had no way to answer "how many orders
+    // came in today" at all — neither this endpoint nor sitara_get_dashboard
+    // exposes a created-date filter, so the model was guessing from whatever
+    // numbers it could see (the overall awaiting_fulfillment count, or a
+    // misread 'completed'-status filter) and answering confidently wrong.
+    // createdFrom/createdTo are plain ISO date(-time) strings — the caller
+    // (AIDA's tool call) computes the actual range, e.g. "today" = today's
+    // date through tomorrow's, so this stays a general date-range filter
+    // rather than a single hardcoded "today" special case.
+    if (req.query.createdFrom) q = q.where('sitara_orders.created_at', '>=', new Date(req.query.createdFrom));
+    if (req.query.createdTo) q = q.where('sitara_orders.created_at', '<', new Date(req.query.createdTo));
     const rows = await q.orderBy('sitara_orders.created_at', 'desc');
     const mapped = rows.map(mapOrder);
     // Stale orders float to the top (oldest-unchanged first) so the ones

@@ -20,7 +20,9 @@ module.exports = [
     description:
       'Sitara Drapes business overview: total sales, this month\'s sales, order count, pending order count, ' +
       'stock on hand, the 10 most recent orders, best-selling products, and top regions by revenue. Start here ' +
-      'for any "how is the business doing" / "give me a summary" question before pulling individual records.',
+      'for any "how is the business doing" / "give me a summary" question before pulling individual records. ' +
+      'These counts are OVERALL/current-state totals, NOT scoped to today or any specific date — for "how many ' +
+      'orders came in today/this week" use sitara_list_orders with createdFrom/createdTo instead, never this tool.',
     requiredModules: ['sitara_dashboard'],
     inputSchema: { type: 'object', properties: {} },
     async handler(context) {
@@ -33,7 +35,11 @@ module.exports = [
     description:
       'List Sitara Drapes orders (from BigCommerce, Razorpay, or manually entered), newest first. Filter by ' +
       'status (e.g. completed, awaiting_fulfillment, cancelled, refunded), source (bigcommerce|manual|recovered), ' +
-      'or search (matches order number or customer name).',
+      'search (matches order number or customer name), or createdFrom/createdTo for "how many orders came in ' +
+      'today/this week/this month" style questions — compute the actual date range yourself (e.g. for "today", ' +
+      'createdFrom = today\'s date at midnight, createdTo = tomorrow\'s date at midnight) and pass it here rather ' +
+      'than guessing a count from an unfiltered total or from a status that doesn\'t mean what was asked (e.g. ' +
+      '"orders received" is about WHEN an order was created, not whether its status happens to be "completed").',
     requiredModules: ['sitara_orders'],
     inputSchema: {
       type: 'object',
@@ -41,10 +47,12 @@ module.exports = [
         status: { type: 'string' },
         source: { type: 'string' },
         search: { type: 'string' },
+        createdFrom: { type: 'string', description: 'ISO date/datetime (inclusive) — orders created on or after this.' },
+        createdTo: { type: 'string', description: 'ISO date/datetime (exclusive) — orders created before this.' },
       },
     },
-    async handler(context, { status, source, search } = {}) {
-      const rows = await callTenantApi(context, 'GET', '/sitara/orders', { query: { status, source, search } });
+    async handler(context, { status, source, search, createdFrom, createdTo } = {}) {
+      const rows = await callTenantApi(context, 'GET', '/sitara/orders', { query: { status, source, search, createdFrom, createdTo } });
       return { count: (rows || []).length, orders: rows };
     },
   },
