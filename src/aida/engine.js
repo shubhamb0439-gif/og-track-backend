@@ -29,6 +29,36 @@ function lastAssistantOpener(history) {
  * provider adapter matches config.aida.provider (see src/aida/providers/).
  */
 
+// IST (UTC+5:30) — every tenant on this platform operates in India, and
+// "today"/"this week"/"this month" in a tool call needs to mean the IST
+// calendar day/week/month the business actually experiences, not a UTC one
+// (they diverge by up to 5:30 near midnight — a 7pm IST order is still
+// "today" in IST but already "tomorrow" by UTC's own clock).
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * Real gap confirmed live (2026-10-14): without this, the model has NO way
+ * to know what "today" even is — it was asked for "today's orders", had no
+ * current-date anchor at all, and either guessed wrong or gave up and
+ * reported zero. Precomputes "today"'s IST range as ready-to-use UTC ISO
+ * timestamps (the common case) while still stating the general method, so
+ * the model can also work out "this week"/"this month" itself.
+ */
+function currentDateContextLine() {
+  const nowUtc = new Date();
+  const nowIst = new Date(nowUtc.getTime() + IST_OFFSET_MS);
+  const istDateStr = nowIst.toISOString().slice(0, 10);
+  const todayIstStartUtc = new Date(Date.parse(`${istDateStr}T00:00:00+05:30`));
+  const tomorrowIstStartUtc = new Date(todayIstStartUtc.getTime() + 24 * 60 * 60 * 1000);
+  return (
+    `- Current date/time: ${nowUtc.toISOString()} (UTC). This business operates on India Standard Time ` +
+    `(IST, UTC+5:30) — today's IST calendar date is ${istDateStr}. When a tool takes a date range (e.g. ` +
+    `createdFrom/createdTo) for something relative like "today", "this week", or "this month", compute the ` +
+    `boundaries using IST calendar days and pass them as UTC ISO timestamps — e.g. right now, "today" spans ` +
+    `${todayIstStartUtc.toISOString()} through ${tomorrowIstStartUtc.toISOString()}.`
+  );
+}
+
 function buildSystemPrompt(context, { history, directive } = {}) {
   const identity =
     context.kind === 'masteradmin'
@@ -39,6 +69,7 @@ function buildSystemPrompt(context, { history, directive } = {}) {
     identity,
     '',
     'Current session context (do not ask the user to repeat this):',
+    currentDateContextLine(),
     `- User ID: ${context.userId}`,
     `- Role: ${context.role}`,
     context.tenantSlug ? `- Company / tenant slug: ${context.tenantSlug}` : null,
