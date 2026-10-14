@@ -1274,6 +1274,29 @@ async function reconcileIncompleteOrder(db, io, companySlug, orderId) {
   if (io) io.to(companySlug).emit('sitara:order_updated', mapOrder(saved));
 }
 
+// Real, recurring race CONFIRMED LIVE (2026-10-14): Razorpay's payment.captured
+// webhook and BigCommerce's own order-creation webhook are two independent
+// deliveries that can land in EITHER order. When Razorpay's arrives first,
+// matchRazorpayPaymentToOrder finds nothing — the real BigCommerce order
+// hasn't been inserted by ITS OWN webhook yet — and recoverOrderFromCart used
+// to run immediately, creating a genuine DUPLICATE order moments before the
+// real one landed normally. This is a DIFFERENT race from the one
+// recovered_from_payment_id's unique index already fixed (that one was two
+// concurrent calls for the SAME payment; this is one payment racing a
+// SEPARATE webhook for the same purchase) — confirmed via three real pairs
+// the same day: in every case, zero sitara_razorpay_payments rows existed
+// for the real BigCommerce order at all (so it's not a same-payment
+// collision), and the real order's OWN webhook landed only 22-29s after this
+// one fired (sitara_orders.created_at for a 'bigcommerce' row is backdated
+// to BigCommerce's own order date, which is why that gap wasn't visible
+// just from comparing timestamps already in the table).
+//
+// Retries the match a few times with backoff before concluding the order is
+// genuinely gone — comfortably past the observed 22-29s gap, short enough
+// that a truly deleted order still recovers well within ~65s, same end
+// result as before, just no longer racing a webhook that's already in flight.
+const LATE_BIGCOMMERCE_WEBHOOK_RETRY_DELAYS_MS = [15_000, 20_000, 30_000]; // cumulative 15s / 35s / 65s
+
 async function syncRazorpayPayment(db, io, companySlug, entity) {
   const existing = await db('sitara_razorpay_payments').where({ razorpay_payment_id: entity.id }).first();
   let orderId = await matchRazorpayPaymentToOrder(db, entity);
@@ -1281,7 +1304,12 @@ async function syncRazorpayPayment(db, io, companySlug, entity) {
   // notes gives us a cart to recover from — the actual "BigCommerce deleted
   // the order" case this whole function exists to catch.
   if (!orderId && entity.status === 'captured') {
-    orderId = await recoverOrderFromCart(db, entity);
+    for (const delay of LATE_BIGCOMMERCE_WEBHOOK_RETRY_DELAYS_MS) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      orderId = await matchRazorpayPaymentToOrder(db, entity);
+      if (orderId) break;
+    }
+    if (!orderId) orderId = await recoverOrderFromCart(db, entity);
   }
   const row = {
     amount: Number(entity.amount || 0) / 100,
