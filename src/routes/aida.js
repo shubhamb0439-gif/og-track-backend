@@ -499,6 +499,18 @@ function createAidaRouter({ requireAuth, buildContext }) {
       // transcript isn't known yet at this point, so the filler (if one
       // fires before transcription+reply are ready) uses a generic
       // 'thinking' category rather than one classified from the message.
+      //
+      // EXCEPTION: a very short recording (a bare "hi"/"thanks"-length
+      // clip) skips this blind timer entirely — confirmed live as a real
+      // bug otherwise: the filler's 400ms threshold almost always loses the
+      // race against Whisper's OWN network round trip regardless of how
+      // short the utterance was, so "hi" was getting an "umm, let me
+      // think" before the transcript (and the greeting fast-path that
+      // depends on it, see isGreeting below) ever had a chance to run. File
+      // SIZE is a cheap, good-enough proxy for utterance length here (voice
+      // recordings are roughly constant-bitrate) — no need to decode the
+      // audio just to estimate how long it is.
+      const isLikelyShortRecording = (req.file.size ?? req.file.buffer.length) < config.aida.voice.shortRecordingBytes;
       if (wantsVoice) {
         const turnId = newTurnId();
         const target = voiceTargetFor(context);
@@ -506,7 +518,7 @@ function createAidaRouter({ requireAuth, buildContext }) {
         const controller = voiceSession.createTurnController(turnId);
         timer.mark('sttStart');
         let fillerTimer = null;
-        if (config.aida.voice.fillerEnabled) {
+        if (config.aida.voice.fillerEnabled && !isLikelyShortRecording) {
           fillerTimer = setTimeout(() => {
             voiceSession.playFiller({
               io: req.io, room: target.room, chunkEvent: target.chunkEvent, turnId,

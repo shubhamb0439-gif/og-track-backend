@@ -2371,3 +2371,85 @@ error toast) after clicking, that's the same kind of gap as the customer-field i
 button's response handling isn't surfacing what the API already tells it. If the email genuinely
 never arrives despite the API reporting success, that's a mail-delivery/spam-filtering question
 (check the spam folder first), not a frontend bug.
+
+---
+
+## 40. AIDA — multi-chat history (masteradmin), like ChatGPT's conversation sidebar
+
+**Status: backend built and live-tested 2026-10-14 (not yet wired into masteradmin.html's
+Messages panel) — this entry is a pure frontend build against endpoints that already exist and
+work.**
+
+**Why this exists:** today, masteradmin.html's Messages panel restores history on load via
+`GET /api/masteradmin/aida/history`, which reads `sessionMemory.js` — an in-memory, single
+rolling window per admin (not per-conversation), capped at 20 messages, that expires after 2
+hours and is shared across EVERY surface the same admin uses (web, the Android app, WhatsApp) —
+because it's keyed only by adminId, not by any notion of a separate "thread." That's actually WHY
+a screenshot this session showed old/unrelated exchanges mixed in when switching devices: it's
+not a bug in the new work, it's `/history` doing exactly what it was ever designed to do (one
+continuous rolling buffer, nothing more) — now visibly a problem since there's no way to start a
+clean thread or see past ones separately.
+
+A real, durable, multi-thread store now exists alongside it — `src/aida/conversationStore.js`,
+backed by two new OGCore tables (`ai_conversations`/`ai_conversation_messages`). **`/history` is
+NOT being removed** (nothing else depends on this prompt to keep working), but the Messages panel
+should stop calling it and use the three endpoints below instead, which give you real, separate,
+nameable conversations plus a working "start a new chat" — exactly the ChatGPT-style sidebar
+being asked for.
+
+**Scope: masteradmin only** (not the tenant-facing AIDA chat) — matches where this was asked for.
+
+```
+GET /api/masteradmin/aida/conversations
+  → 200 { conversations: [
+      { id: "conv_...", title: "When is Pooja's birthday" | null, createdAt, updatedAt, lastMessageAt }
+    ] }
+  Ordered most-recently-active first. `title` is auto-filled from that conversation's first
+  message once one exists — null only for a just-created, still-empty conversation. Call this to
+  populate the history sidebar/list.
+
+POST /api/masteradmin/aida/conversations
+  body: { title?: string }   (optional — normally omit it, auto-fills from the first message)
+  → 200 { conversation: { id, title: null, createdAt, updatedAt, lastMessageAt } }
+  "Start a new chat": creates a fresh, EMPTY thread. Clear the visible transcript and remember
+  this id as the active conversation — the next message sent with it becomes that thread's first
+  turn, instead of continuing whatever was active before.
+
+GET /api/masteradmin/aida/conversations/:id/messages
+  → 200 { conversation: {...}, messages: [{ role: "user"|"assistant", content: string, createdAt }] }
+  Opening a past chat from the sidebar — loads its full transcript. Render exactly like the
+  existing Messages panel already renders `GET /history`'s `messages` (same role/content shape,
+  just `content` instead of `text` — map accordingly).
+
+POST /api/masteradmin/aida/chat   (and POST /voice-input, same contract)
+  body ALSO now accepts: { ..., conversationId?: string }
+  → 200 response ALSO now includes: { ..., conversationId: string }
+  Pass the currently-active conversationId (from opening an old chat, or from "new chat") on
+  EVERY send once you have one. Omit it entirely only on first load before any conversation has
+  been resolved yet — the server will auto-pick whichever conversation was most recently active
+  for this admin (continuing it from wherever it was left, including another device) and hand
+  its id back in the response; store that as the active conversation from then on.
+```
+
+**Frontend prompt:** add a collapsible sidebar (or a slide-in panel, whichever fits
+masteradmin.html's existing layout conventions) to the AIDA Messages panel — a "+ New chat"
+button at the top, then a scrollable list from `GET /conversations` below it (each row: `title`
+or "New conversation" if null, with `lastMessageAt` shown small/muted). Clicking a row calls
+`GET /conversations/:id/messages`, replaces the visible transcript with it, and sets it as the
+active conversation. Clicking "+ New chat" calls `POST /conversations`, clears the transcript,
+and sets the NEW id as active — don't call this automatically on page load, only on an explicit
+click (a fresh page load should instead silently restore the admin's own most-recently-active
+conversation, same auto-resolve behavior described above, so reopening the panel shows the same
+ongoing chat rather than a blank one every time).
+
+On first load of the Messages panel in a session: call `GET /conversations`, take the first
+result (most recent) if any exist, call `GET /conversations/:id/messages` for it, and render that
+as the initial transcript with its id set active — replacing the current `GET /history` call
+entirely. If `GET /conversations` comes back empty (a genuinely new admin), just show the normal
+empty-chat state and let the first message sent create a conversation implicitly (conversationId
+omitted on that first send, then stored from the response).
+
+Every `POST /chat` and the voice/mic request (if the mic feature in this panel calls `/voice-input`
+instead) needs the active conversationId threaded through, and its response's conversationId
+stored back — this is what keeps every subsequent message landing in the SAME thread rather than
+occasionally drifting onto a different "most recently active" one server-side.
