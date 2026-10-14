@@ -129,6 +129,29 @@ async function playFiller({ io, room, chunkEvent, turnId, category, sessionKey }
 }
 
 /**
+ * Plays an already-synthesized reply instantly as the turn's ENTIRE
+ * response — used for the greeting fast-path (see greetingReplies.js /
+ * routes/aida.js), where there is no live LLM or TTS pipeline at all, just
+ * one cached buffer to emit. A single chunk, isFinal from the start.
+ */
+function speakCachedReply({ io, room, chunkEvent, turnId, audio, mimeType }) {
+  try {
+    if (!io || !room || isCancelled(turnId)) return;
+    io.to(room).emit(chunkEvent, {
+      turnId,
+      seq: 0,
+      isFinal: true,
+      audioBase64: audio.toString('base64'),
+      mimeType,
+    });
+  } catch (e) {
+    console.error('[aida-voice] speakCachedReply failed:', e);
+  } finally {
+    releaseTurn(turnId);
+  }
+}
+
+/**
  * Speaks one AIDA reply: splits it into sentence-chunks, synthesizes them
  * with bounded concurrency, but emits to the client strictly in original
  * order (a later sentence finishing its network round trip first must never
@@ -360,6 +383,7 @@ function createStreamingSpeaker({ io, room, chunkEvent, errorEvent, turnId, dire
 
 module.exports = {
   speakReply,
+  speakCachedReply,
   createStreamingSpeaker,
   synthesizeFullReply,
   playFiller,

@@ -13,6 +13,7 @@ const jobRunner = require('../aida/jobs/jobRunner');
 const voiceSession = require('../aida/voice/voiceSession');
 const { transcribeAudio } = require('../aida/voice/speechToText');
 const { warmFillerCache } = require('../aida/voice/fillerPhrases');
+const { isGreeting, pickGreetingText, getGreetingAudio, warmGreetingCache } = require('../aida/voice/greetingReplies');
 const { createTurnTimer } = require('../aida/latency');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
 const { getCombinedStatus } = require('../aida/codingAgent/github');
@@ -26,6 +27,7 @@ const { decideAgentStep } = require('../aida/agentStep');
 registerAllTools();
 sessionMemory.startSweeper();
 warmFillerCache().catch((e) => console.error('[aida-voice] filler cache warm-up failed:', e));
+warmGreetingCache().catch((e) => console.error('[aida-voice] greeting cache warm-up failed:', e));
 
 function newTurnId() {
   return `voice_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -107,6 +109,29 @@ function voiceTargetFor(context) {
 async function runConversationTurn({ req, context, userMessage, wantsVoice, pre, llmProvider, llmModel }) {
   const history = sessionMemory.getHistory(context);
   const useStreaming = wantsVoice && config.aida.streamingEnabled;
+
+  // A bare greeting ("hi", "hello", "good morning") never needs the LLM at
+  // all — answered instantly from a small pre-cached pool (greetingReplies.js),
+  // same instant-audio trick fillerPhrases.js uses for fillers, except this
+  // IS the whole reply, not a stall before one. Skips every other per-turn
+  // lookup below (birthday/memory) too — none of those can change a bare
+  // greeting's answer anyway. Deliberately narrow: only a message that is
+  // JUST a greeting takes this path (see GREETING_RE) — "hi, also check my
+  // orders" still goes through the real engine.
+  if (isGreeting(userMessage)) {
+    const greetingText = pickGreetingText();
+    const turnId = pre?.turnId ?? (wantsVoice ? newTurnId() : null);
+    if (wantsVoice) {
+      const target = pre?.target ?? voiceTargetFor(context);
+      if (!pre?.controller) voiceSession.createTurnController(turnId);
+      if (pre?.fillerTimer) clearTimeout(pre.fillerTimer);
+      const { audio, mimeType } = await getGreetingAudio(greetingText);
+      voiceSession.speakCachedReply({ io: req.io, room: target.room, chunkEvent: target.chunkEvent, turnId, audio, mimeType });
+    }
+    sessionMemory.appendTurn(context, userMessage, greetingText);
+    const resolvedForGreeting = resolveProviderAndModel(llmProvider, llmModel);
+    return { reply: greetingText, toolCalls: [], turnId, provider: resolvedForGreeting.provider, model: resolvedForGreeting.model };
+  }
 
   // First turn of a fresh conversation ("the user just opened/activated
   // AIDA") — check once whether today is this user's birthday or work

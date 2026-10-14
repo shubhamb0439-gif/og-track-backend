@@ -13,6 +13,7 @@ const pendingAttachments = require('../aida/pendingAttachments');
 const contacts = require('../aida/contacts');
 const contactChat = require('../aida/contactChat');
 const emailLog = require('../aida/emailLog');
+const { isGreeting, pickGreetingText } = require('../aida/voice/greetingReplies');
 
 const MAX_ATTACHMENT_TEXT_CHARS = 8_000;
 
@@ -240,6 +241,17 @@ router.post('/webhook', async (req, res) => {
         `[The human just attached a file: "${filename}". It's available to forward/email if they ask you to send it somewhere.]`,
         extractedText ? `Extracted content from the file:\n${extractedText.slice(0, MAX_ATTACHMENT_TEXT_CHARS)}` : '(no text could be extracted from this file type — you can still forward/email the original file itself.)',
       ].filter(Boolean).join('\n\n');
+    }
+
+    // A bare greeting ("hi", "hello", "good morning") never needs the LLM at
+    // all — same instant fast-path as routes/aida.js, just text-only here
+    // (no voice on WhatsApp). "hi, also check my orders" still falls through
+    // to the real engine — see GREETING_RE's whole-message match.
+    if (isGreeting(text)) {
+      const greetingText = pickGreetingText();
+      sessionMemory.appendTurn(context, text, greetingText);
+      await sendWhatsAppMessage(from, greetingText);
+      return;
     }
 
     const history = sessionMemory.getHistory(context);
