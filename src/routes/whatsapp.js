@@ -12,6 +12,7 @@ const { extractTextFromBuffer } = require('../aida/attachmentText');
 const pendingAttachments = require('../aida/pendingAttachments');
 const contacts = require('../aida/contacts');
 const contactChat = require('../aida/contactChat');
+const emailLog = require('../aida/emailLog');
 
 const MAX_ATTACHMENT_TEXT_CHARS = 8_000;
 
@@ -120,8 +121,37 @@ router.post('/webhook', async (req, res) => {
       return;
     }
 
-    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!message || !['text', 'document', 'image'].includes(message.type)) return; // status callbacks, audio/video, etc. — nothing to do
+    const value = req.body?.entry?.[0]?.changes?.[0]?.value;
+
+    // Delivery-status callbacks (sent/delivered/read/FAILED) for messages WE
+    // sent — previously silently discarded entirely (see the old comment
+    // this replaced), which is exactly why a real incident (2026-10-14)
+    // showed an email alert logged as "whatsapp_sent: true" that the
+    // recipient never actually got: Meta's /messages API returning 2xx only
+    // means the send was ACCEPTED, not delivered — a 'failed' status here,
+    // arriving later/async, is the only place the real outcome ever shows up
+    // (commonly: the recipient hasn't messaged this WhatsApp Business number
+    // within Meta's 24-hour customer-service window). Always logged, and
+    // also written back to ai_email_log when it matches a message that
+    // module sent — a status for some other AIDA reply is just logged.
+    if (value?.statuses?.length) {
+      for (const s of value.statuses) {
+        if (s.status !== 'failed' && s.status !== 'delivered' && s.status !== 'read') continue;
+        const err = s.errors?.[0];
+        if (s.status === 'failed') {
+          console.error(`[whatsapp] delivery FAILED for message ${s.id} to ${s.recipient_id}: ${err?.title || err?.message || 'unknown error'} (code ${err?.code ?? 'n/a'})`);
+        }
+        await emailLog
+          .updateWhatsAppDeliveryStatus(s.id, {
+            status: s.status,
+            error: err ? `${err.code ?? ''} ${err.title || err.message || ''}`.trim() : null,
+          })
+          .catch((e) => console.error('[whatsapp] failed to record delivery status:', e.message));
+      }
+    }
+
+    const message = value?.messages?.[0];
+    if (!message || !['text', 'document', 'image'].includes(message.type)) return; // status-only callback, audio/video, etc. — nothing further to do
     if (alreadyProcessed(message.id)) return;
 
     const from = message.from;

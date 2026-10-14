@@ -233,6 +233,7 @@ async function processMessage(token, message) {
     isUrgent,
     whatsappSent: whatsappResult.success,
     whatsappError: whatsappResult.error,
+    whatsappMessageId: whatsappResult.messageId,
   }).catch((e) => console.error('[email-monitor] failed to log email for later reply:', e.message));
 
   if (isUrgent) {

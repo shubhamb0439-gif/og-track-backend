@@ -10,9 +10,18 @@ const config = require('../config');
  * Retries once (short backoff) before giving up — a real incident showed a
  * transient failure here is otherwise completely invisible: the caller
  * never knew whether an alert actually sent, since this always returned
- * void. Now returns { success, error? } so a caller that cares (see
- * emailMonitor.js) can record the real outcome — every existing caller
+ * void. Now returns { success, messageId?, error? } so a caller that cares
+ * (see emailMonitor.js) can record the real outcome — every existing caller
  * already ignores the return value, so this is purely additive.
+ *
+ * IMPORTANT: `success: true` here only means Meta's API ACCEPTED the
+ * request (HTTP 2xx) — not that the message was actually delivered to the
+ * phone. Real delivery/failure is reported ASYNCHRONOUSLY, later, as a
+ * separate "statuses" webhook callback keyed by the messageId returned here
+ * (see routes/whatsapp.js's handling of value.statuses) — e.g. a message
+ * can be accepted and then fail delivery because the recipient hasn't
+ * messaged this WhatsApp Business number within Meta's 24-hour customer
+ * service window, which the send call itself has no way to know in advance.
  */
 async function sendWhatsAppMessage(to, body, { retries = 1 } = {}) {
   let lastError = null;
@@ -24,7 +33,10 @@ async function sendWhatsAppMessage(to, body, { retries = 1 } = {}) {
         headers: { Authorization: `Bearer ${config.whatsapp.accessToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }),
       });
-      if (res.ok) return { success: true };
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        return { success: true, messageId: data?.messages?.[0]?.id || null };
+      }
       lastError = `${res.status} ${await res.text()}`;
     } catch (e) {
       lastError = e.message;
