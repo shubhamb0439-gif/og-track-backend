@@ -9,6 +9,7 @@ const graphMail = require('../graphMail');
 const pendingAttachments = require('../pendingAttachments');
 const zohoClient = require('../../zoho/zohoClient');
 const { sendWhatsAppMessage, sendWhatsAppDocument } = require('../whatsapp');
+const { isTrivialMessage } = require('../messageTriviality');
 
 /** The real email address of the master admin acting in this turn — used to CC them on anything AIDA sends on their behalf. */
 async function currentAdminEmail(context) {
@@ -185,9 +186,13 @@ module.exports = [
       "If only `name` is given and it's not a known contact yet, this returns an error — ask the human for the " +
       "address rather than guessing one. Set includeAttachment: true ONLY when the human attached a file/photo " +
       "earlier in this same conversation and asked you to send/forward THAT specific file. SAFETY — a real, " +
-      "irreversible action: call this WITHOUT confirmed first, it returns a preview instead of sending. Read the " +
-      "preview back to the human and wait for their explicit yes in their NEXT message, then call again with the " +
-      "exact same arguments plus confirmed: true.",
+      "irreversible action, confirmed first for anything that matters: a SHORT, casual message (roughly a " +
+      "sentence or two, no attachment, nothing sensitive like payments/legal/confidential topics) sends " +
+      "IMMEDIATELY on the first call — no need to preview or ask first, exactly like a human firing off a quick " +
+      "email themselves. Anything longer, anything with an attachment, or anything touching a sensitive/" +
+      "high-stakes topic instead returns a preview (status: needs_confirmation) on that first call — read it back " +
+      "to the human, wait for their explicit yes in their NEXT message, then call again with the exact same " +
+      "arguments plus confirmed: true.",
     requiredModules: ['__masteradmin__'],
     inputSchema: {
       type: 'object',
@@ -217,7 +222,7 @@ module.exports = [
         attachment = pending;
       }
 
-      if (!confirmed) {
+      if (!confirmed && !isTrivialMessage({ text: body, hasAttachment: !!attachment })) {
         return {
           status: 'needs_confirmation',
           preview: { to: recipient, subject, body, attachment: attachment ? attachment.filename : null },
@@ -246,8 +251,11 @@ module.exports = [
       "watched inbox) — sends a genuine threaded reply to the original sender, with the master admin's own email " +
       "CC'd so they stay in the loop. Omit emailId to reply to whichever email was MOST RECENTLY summarized in " +
       "this conversation (the natural default for \"reply to them saying...\"). SAFETY — a real, irreversible " +
-      "action: call this WITHOUT confirmed first, it returns a preview instead of sending. Read the preview back " +
-      "to the human and wait for their explicit yes in their NEXT message, then call again with confirmed: true.",
+      "action, confirmed first for anything that matters: a SHORT, casual reply (roughly a sentence or two, " +
+      "nothing sensitive like payments/legal/confidential topics) sends IMMEDIATELY on the first call — no need " +
+      "to preview or ask first. A longer or sensitive reply instead returns a preview (status: needs_confirmation) " +
+      "on that first call — read it back to the human, wait for their explicit yes in their NEXT message, then " +
+      "call again with confirmed: true.",
     requiredModules: ['__masteradmin__'],
     inputSchema: {
       type: 'object',
@@ -263,7 +271,7 @@ module.exports = [
       if (!logged) return { error: emailId ? `No logged email found with id "${emailId}".` : 'No emails have been logged yet to reply to.' };
 
       const ccAddress = await currentAdminEmail(context);
-      if (!confirmed) {
+      if (!confirmed && !isTrivialMessage({ text: replyText })) {
         return {
           status: 'needs_confirmation',
           preview: { replyingTo: logged.from_address, subject: logged.subject, replyText, cc: ccAddress },
@@ -357,9 +365,13 @@ module.exports = [
       "file the human most recently sent AIDA in this conversation (set includeAttachment: true — same mechanism as " +
       "send_email's includeAttachment). text may be omitted if includeAttachment is true and the file should go with " +
       "just a caption-less send, but at least one of text/includeAttachment is required. SAFETY — this is a real, " +
-      "visible action: call this tool WITHOUT confirmed first — it returns a preview instead of sending anything. Read " +
-      "that preview back to the user in plain language and wait for their explicit yes in their NEXT message. Only " +
-      "then call this again with the exact same arguments plus confirmed: true to actually send it. " +
+      "visible action, confirmed first for anything that matters: a SHORT, casual message (roughly a sentence or " +
+      "two, no attachment, nothing sensitive like payments/legal/confidential topics) sends IMMEDIATELY on the " +
+      "first call — no need to preview or ask first, exactly like a human firing off a quick \"hi\" themselves. " +
+      "Anything longer, anything with an attachment, or anything touching a sensitive/high-stakes topic instead " +
+      "returns a preview (status: needs_confirmation) on that first call — read it back to the user in plain " +
+      "language, wait for their explicit yes in their NEXT message, then call this again with the exact same " +
+      "arguments plus confirmed: true to actually send it. " +
       "IMPORTANT real platform limit, not a bug: WhatsApp only allows a freeform message (any text) to someone who has " +
       "themselves messaged this WhatsApp number within the last 24 hours — outside that window Meta will reject the " +
       "send, and this tool will report that real rejection back rather than pretending it worked.",
@@ -393,7 +405,7 @@ module.exports = [
         if (!attachment) return { error: "There's no recently-attached file in this conversation to forward — ask the human to resend it." };
       }
 
-      if (!confirmed) {
+      if (!confirmed && !isTrivialMessage({ text, hasAttachment: !!attachment })) {
         return {
           status: 'needs_confirmation',
           preview: { to: name, phoneNumber: resolvedNumber, text: text || null, attachment: attachment ? attachment.filename : null },
