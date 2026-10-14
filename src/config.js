@@ -333,14 +333,6 @@ module.exports = {
           // goal is AIDA saying *something* almost immediately, not silence
           // followed eventually by the real answer).
           fillerDelayMs: parseInt(process.env.AIDA_FILLER_DELAY_MS || process.env.AIDA_VOICE_FILLER_DELAY_MS || '400', 10),
-          // Below this many bytes, POST /voice-input's recording is treated
-          // as a short utterance ("hi", "thanks") and skips the blind
-          // pre-transcription filler timer entirely — see that route's own
-          // comment for why. ~8KB is a generous cutoff for typical
-          // WebM/Opus voice recordings at common MediaRecorder bitrates
-          // (roughly 2-4 seconds' worth) — a real multi-clause question
-          // almost always records larger than this.
-          shortRecordingBytes: parseInt(process.env.AIDA_SHORT_RECORDING_BYTES || '8000', 10),
           fillerEnabled: (process.env.AIDA_FILLER_ENABLED || 'true') === 'true',
           // Minimum gap between two fillers in the SAME session (keyed by
           // the per-user voice-chunk event name, so it persists across the

@@ -502,15 +502,18 @@ function createAidaRouter({ requireAuth, buildContext }) {
       //
       // EXCEPTION: a very short recording (a bare "hi"/"thanks"-length
       // clip) skips this blind timer entirely — confirmed live as a real
-      // bug otherwise: the filler's 400ms threshold almost always loses the
+      // bug otherwise: the filler's 400ms threshold almost always lost the
       // race against Whisper's OWN network round trip regardless of how
-      // short the utterance was, so "hi" was getting an "umm, let me
-      // think" before the transcript (and the greeting fast-path that
-      // depends on it, see isGreeting below) ever had a chance to run. File
-      // SIZE is a cheap, good-enough proxy for utterance length here (voice
-      // recordings are roughly constant-bitrate) — no need to decode the
-      // audio just to estimate how long it is.
-      const isLikelyShortRecording = (req.file.size ?? req.file.buffer.length) < config.aida.voice.shortRecordingBytes;
+      // short the utterance was, so "hi" could get an "umm, let me think"
+      // before the transcript was known. Deliberately kept anyway, per
+      // explicit product decision: NEVER having dead air after releasing
+      // the mic matters more than occasionally playing a filler ahead of a
+      // short greeting — runConversationTurn's own greeting fast-path still
+      // cancels this timer the instant the transcript resolves to a
+      // greeting IF IT HASN'T FIRED YET, so the only real-world cost is a
+      // brief filler blip immediately followed by the correct instant
+      // greeting reply on the (less common) occasions the filler wins the
+      // race, not silence and not a wrong/confusing answer either way.
       if (wantsVoice) {
         const turnId = newTurnId();
         const target = voiceTargetFor(context);
@@ -518,7 +521,7 @@ function createAidaRouter({ requireAuth, buildContext }) {
         const controller = voiceSession.createTurnController(turnId);
         timer.mark('sttStart');
         let fillerTimer = null;
-        if (config.aida.voice.fillerEnabled && !isLikelyShortRecording) {
+        if (config.aida.voice.fillerEnabled) {
           fillerTimer = setTimeout(() => {
             voiceSession.playFiller({
               io: req.io, room: target.room, chunkEvent: target.chunkEvent, turnId,
