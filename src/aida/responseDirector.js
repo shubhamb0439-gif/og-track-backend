@@ -35,6 +35,29 @@ function classifyFromMessage(userMessage) {
   return { emotion: DEFAULT_EMOTION, fillerCategory: 'thinking' };
 }
 
+// Emotions that mean the user actually described something needing real
+// thought (a bug report, an urgent/compliance matter, a "why/how does X
+// work" question) — a short message classified into one of these still gets
+// the filler, everything else short doesn't.
+const HEAVY_EMOTIONS = new Set(['frustrated', 'serious', 'thoughtful']);
+
+/**
+ * A short, simple message ("hi", "thanks", "good morning", "what's up")
+ * should get an immediate real reply, not AIDA saying "umm, let me think"
+ * first — that stall exists to mask genuinely slower turns (tool calls,
+ * longer answers), not every single exchange. Only a heuristic on the INPUT
+ * (the real reply's length/speed isn't known yet when this runs) — good
+ * enough for the common case of short greetings/acknowledgements, not meant
+ * to perfectly predict every turn's real latency.
+ */
+function isLikelySimple(userMessage, emotion) {
+  const trimmed = (userMessage || '').trim();
+  if (!trimmed) return false;
+  if (HEAVY_EMOTIONS.has(emotion)) return false;
+  if (TECHNICAL_RE.test(trimmed)) return false;
+  return trimmed.split(/\s+/).length <= 6;
+}
+
 function pacingFor(emotion, replyLength) {
   if (emotion === 'empathetic' || emotion === 'frustrated' || emotion === 'serious' || emotion === 'thoughtful') return 'slow';
   if (replyLength > 0 && replyLength < 80) return 'quick';
@@ -52,6 +75,7 @@ function buildDirective(userMessage, replyText) {
   const emotion = isValidEmotion(rawEmotion) ? rawEmotion : DEFAULT_EMOTION;
   const profile = emotionProfile(emotion);
   const pacing = pacingFor(emotion, (replyText || '').length);
+  const skipFiller = isLikelySimple(userMessage, emotion);
 
   return {
     emotion,
@@ -59,6 +83,7 @@ function buildDirective(userMessage, replyText) {
     energy: profile.energy,
     pacing,
     fillerCategory,
+    skipFiller,
   };
 }
 
@@ -66,7 +91,7 @@ function buildDirective(userMessage, replyText) {
 function safeDirective(directive) {
   if (!directive || !isValidEmotion(directive.emotion)) {
     const profile = emotionProfile(DEFAULT_EMOTION);
-    return { emotion: DEFAULT_EMOTION, delivery: profile.description, energy: profile.energy, pacing: 'moderate', fillerCategory: 'thinking' };
+    return { emotion: DEFAULT_EMOTION, delivery: profile.description, energy: profile.energy, pacing: 'moderate', fillerCategory: 'thinking', skipFiller: false };
   }
   return directive;
 }

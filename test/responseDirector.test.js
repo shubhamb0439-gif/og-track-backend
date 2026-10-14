@@ -59,3 +59,20 @@ test('pacing slows down for empathetic/serious/thoughtful emotions', () => {
   const d = buildDirective("This is broken and it's really frustrating.");
   assert.equal(d.pacing, 'slow');
 });
+
+test('short greetings/acknowledgements skip the filler', () => {
+  for (const m of ['hi', 'hello', 'hii', 'thanks!', 'good morning', "what's up"]) {
+    assert.equal(buildDirective(m).skipFiller, true, `expected skipFiller for "${m}"`);
+  }
+});
+
+test('a short but frustrated/technical message still keeps the filler', () => {
+  assert.equal(buildDirective('this is broken').skipFiller, false);
+  assert.equal(buildDirective('production down right now').skipFiller, false);
+  assert.equal(buildDirective('explain how tax works here').skipFiller, false);
+});
+
+test('a long message keeps the filler even with a neutral emotion', () => {
+  const d = buildDirective('Can you pull up the full list of open purchase orders for this month please');
+  assert.equal(d.skipFiller, false);
+});

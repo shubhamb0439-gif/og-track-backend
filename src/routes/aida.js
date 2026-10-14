@@ -167,6 +167,16 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
   let controller = pre?.controller ?? null;
   let speaker = null;
 
+  // Now that the real message is known, a short/simple one ("hi", "thanks")
+  // skips the filler entirely — see responseDirector.js's isLikelySimple.
+  // This also cancels a filler clock started EARLY (pre.fillerTimer, from
+  // POST /voice-input, started before the transcript existed) — now that
+  // the transcript is in, this is the first point that can veto it.
+  if (directive.skipFiller && fillerTimer) {
+    clearTimeout(fillerTimer);
+    fillerTimer = null;
+  }
+
   if (wantsVoice) {
     if (!controller) controller = voiceSession.createTurnController(turnId);
     if (useStreaming) {
@@ -185,8 +195,9 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
     }
     // Only start a NEW filler clock if the caller didn't already start one
     // early (pre.fillerTimer) — starting a second one here would race a
-    // filler that may already be about to play.
-    if (!pre && config.aida.voice.fillerEnabled) {
+    // filler that may already be about to play. Also skipped entirely for a
+    // short/simple message — see above.
+    if (!pre && config.aida.voice.fillerEnabled && !directive.skipFiller) {
       fillerTimer = setTimeout(() => {
         voiceSession.playFiller({
           io: req.io, room: target.room, chunkEvent: target.chunkEvent, turnId,
