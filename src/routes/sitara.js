@@ -911,13 +911,30 @@ async function fetchBigCommerceCart(cartId) {
  * Returns the new order's id, or null if nothing could be recovered (cart
  * also expired/gone — genuinely nothing left to reconstruct from).
  */
+// SQL Server unique-constraint/unique-index violation error numbers — the
+// exact signal that recoverOrderFromCart's own INSERT lost the race to a
+// concurrent call for the SAME payment (see patch_19's own header comment
+// for why this replaced a plain pre-check SELECT, which could never be
+// atomic). Checks a few property paths since the exact shape varies by
+// driver wrapper (plain `mssql`, tedious-via-knex, etc.) and this has never
+// been exercised live yet.
+function isUniqueViolation(e) {
+  const num = e?.number ?? e?.originalError?.info?.number ?? e?.code;
+  return num === 2601 || num === 2627;
+}
+
 async function recoverOrderFromCart(db, entity) {
   const bigcCartId = entity.notes?.bigc_cart_id;
   if (!bigcCartId || !config.bigcommerce.enabled) return null;
 
   // Idempotency — don't recreate an order for the same payment/cart on a
-  // later backfill run just because it's still sitting unpushed.
-  const already = await db('sitara_orders').where({ source: 'recovered' }).whereRaw("notes LIKE ?", [`%${entity.id}%`]).first();
+  // later backfill run just because it's still sitting unpushed. This is
+  // now just a cheap, non-authoritative short-circuit (saves re-fetching
+  // the BigCommerce cart for the common case); the REAL guarantee against
+  // a concurrent webhook+backfill race is the UNIQUE index on
+  // recovered_from_payment_id below, enforced atomically by the database,
+  // not by this check.
+  const already = await db('sitara_orders').where({ recovered_from_payment_id: entity.id }).first();
   if (already) return already.id;
 
   let cart;
@@ -953,11 +970,23 @@ async function recoverOrderFromCart(db, entity) {
   const orderId = newId('sord');
   const orderNumber = await nextOrderNumber(db);
   const total = Number(entity.amount || 0) / 100;
-  await db('sitara_orders').insert({
-    id: orderId, order_number: orderNumber, customer_id: customerId,
-    status: 'awaiting_fulfillment', total, source: 'recovered',
-    notes: `Recovered from Razorpay payment ${entity.id} (original BigCommerce order ${entity.notes?.bigc_order_id || 'unknown'}, cart ${bigcCartId}) — BigCommerce deleted the original order after a failed checkout redirect. NOT YET pushed to BigCommerce — needs manual review.`,
-  });
+  try {
+    await db('sitara_orders').insert({
+      id: orderId, order_number: orderNumber, customer_id: customerId,
+      status: 'awaiting_fulfillment', total, source: 'recovered',
+      recovered_from_payment_id: entity.id,
+      notes: `Recovered from Razorpay payment ${entity.id} (original BigCommerce order ${entity.notes?.bigc_order_id || 'unknown'}, cart ${bigcCartId}) — BigCommerce deleted the original order after a failed checkout redirect. NOT YET pushed to BigCommerce — needs manual review.`,
+    });
+  } catch (e) {
+    if (!isUniqueViolation(e)) throw e;
+    // Lost the race — a concurrent call (webhook vs. backfill, or two
+    // overlapping backfill runs) already inserted a row for this exact
+    // payment between our pre-check SELECT above and this INSERT. That's
+    // fine: the database just did its job. Return the winner's id instead
+    // of a half-created, orphaned order with no items.
+    const winner = await db('sitara_orders').where({ recovered_from_payment_id: entity.id }).first();
+    return winner ? winner.id : null;
+  }
   for (const li of lineItems) {
     await db('sitara_order_items').insert({
       id: newId('soi'), order_id: orderId, product_id: null,
