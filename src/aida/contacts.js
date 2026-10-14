@@ -95,4 +95,33 @@ async function forgetContact(ownerId, id) {
   return deleted > 0;
 }
 
-module.exports = { getContacts, findContactByName, findContactByPhone, saveContact, forgetContact, normalizeWhatsAppNumber };
+/**
+ * Bulk upsert from the Android app's own phone contact list (AIDA roadmap:
+ * contact sync) — so "message Pooja on WhatsApp" or "email Pooja" can
+ * resolve a name AIDA was never explicitly told about mid-conversation,
+ * as long as it's in the phone's own contacts. Each entry goes through the
+ * SAME saveContact() above (so the upsert-by-name/merge behavior is
+ * identical to teaching AIDA a contact one at a time) — an entry with
+ * neither email nor a number is just skipped, not a reason to fail the
+ * whole sync (a real phonebook has plenty of contacts with neither, e.g.
+ * someone with only a note saved).
+ */
+async function syncContacts(ownerId, contactsList) {
+  let saved = 0;
+  let skipped = 0;
+  for (const c of contactsList || []) {
+    const name = (c?.name || '').trim();
+    const email = (c?.email || '').trim();
+    const whatsappNumber = (c?.phoneNumber || '').trim();
+    if (!name || (!email && !whatsappNumber)) { skipped++; continue; }
+    try {
+      await saveContact(ownerId, { name, email: email || undefined, whatsappNumber: whatsappNumber || undefined });
+      saved++;
+    } catch {
+      skipped++;
+    }
+  }
+  return { saved, skipped, total: (contactsList || []).length };
+}
+
+module.exports = { getContacts, findContactByName, findContactByPhone, saveContact, forgetContact, syncContacts, normalizeWhatsAppNumber };

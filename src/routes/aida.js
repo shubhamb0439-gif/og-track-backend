@@ -8,6 +8,8 @@ const { registerAllTools } = require('../aida/tools');
 const { listAvailableTools } = require('../aida/toolRegistry');
 const { runTurn, runTurnStream, resolveProviderAndModel } = require('../aida/engine');
 const sessionMemory = require('../aida/sessionMemory');
+const conversationStore = require('../aida/conversationStore');
+const contacts = require('../aida/contacts');
 const jobStore = require('../aida/jobs/jobStore');
 const jobRunner = require('../aida/jobs/jobRunner');
 const voiceSession = require('../aida/voice/voiceSession');
@@ -106,9 +108,36 @@ function voiceTargetFor(context) {
  * turnId }) and audio still arrives over the same socket.io events — nothing
  * downstream needs to know which path ran.
  */
-async function runConversationTurn({ req, context, userMessage, wantsVoice, pre, llmProvider, llmModel }) {
-  const history = sessionMemory.getHistory(context);
+async function runConversationTurn({ req, context, userMessage, wantsVoice, pre, llmProvider, llmModel, conversationId }) {
+  let history = sessionMemory.getHistory(context);
   const useStreaming = wantsVoice && config.aida.streamingEnabled;
+
+  // Durable, multi-thread chat history (AIDA roadmap: cross-device
+  // continuity + "see my old chats"/"start a new chat") — masteradmin only
+  // for now, same scoping as memory.js below. sessionMemory (above) is still
+  // the fast in-process cache for an active request; this is the layer that
+  // survives a restart/new device and is browsable. An explicit
+  // conversationId (the client picked an old chat, or "start new" created
+  // one) always wins; otherwise this resolves to whichever conversation was
+  // most recently active for this admin, continuing it from ANY surface —
+  // see conversationStore.js's own doc comment for why "most recent" IS
+  // "active," with no separate pointer needed.
+  let conversation = null;
+  if (context.kind === 'masteradmin') {
+    try {
+      conversation = conversationId
+        ? (await conversationStore.getConversation(context.userId, conversationId)) || (await conversationStore.getOrCreateActive(context.userId))
+        : await conversationStore.getOrCreateActive(context.userId);
+      // sessionMemory is empty on a fresh process/device — hydrate from the
+      // durable conversation instead of starting with no context at all.
+      if (!history.length) {
+        const durable = await conversationStore.getMessages(conversation.id);
+        if (durable.length) history = durable.map((m) => ({ role: m.role, content: m.content }));
+      }
+    } catch (e) {
+      console.error('[aida] conversation store lookup failed (non-fatal, falling back to session-only history):', e.message);
+    }
+  }
 
   // A bare greeting ("hi", "hello", "good morning") never needs the LLM at
   // all — answered instantly from a small pre-cached pool (greetingReplies.js),
@@ -129,8 +158,9 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
       voiceSession.speakCachedReply({ io: req.io, room: target.room, chunkEvent: target.chunkEvent, turnId, audio, mimeType });
     }
     sessionMemory.appendTurn(context, userMessage, greetingText);
+    if (conversation) conversationStore.appendTurn(conversation.id, userMessage, greetingText).catch((e) => console.error('[aida] conversation store append failed (non-fatal):', e.message));
     const resolvedForGreeting = resolveProviderAndModel(llmProvider, llmModel);
-    return { reply: greetingText, toolCalls: [], turnId, provider: resolvedForGreeting.provider, model: resolvedForGreeting.model };
+    return { reply: greetingText, toolCalls: [], turnId, conversationId: conversation?.id, provider: resolvedForGreeting.provider, model: resolvedForGreeting.model };
   }
 
   // First turn of a fresh conversation ("the user just opened/activated
@@ -258,7 +288,7 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
       // cancellation check that no longer sees the turn as cancelled.
       if (speaker) speaker.finish().catch(() => {});
       else if (wantsVoice) voiceSession.releaseTurn(turnId);
-      return { reply: '', toolCalls: [], turnId, interrupted: true, provider: resolved.provider, model: resolved.model };
+      return { reply: '', toolCalls: [], turnId, conversationId: conversation?.id, interrupted: true, provider: resolved.provider, model: resolved.model };
     }
     if (wantsVoice) voiceSession.releaseTurn(turnId);
     throw e;
@@ -280,13 +310,16 @@ async function runConversationTurn({ req, context, userMessage, wantsVoice, pre,
     timer.logSummary();
   }
 
-  if (result.reply && result.reply.trim()) sessionMemory.appendTurn(context, userMessage, result.reply);
+  if (result.reply && result.reply.trim()) {
+    sessionMemory.appendTurn(context, userMessage, result.reply);
+    if (conversation) conversationStore.appendTurn(conversation.id, userMessage, result.reply).catch((e) => console.error('[aida] conversation store append failed (non-fatal):', e.message));
+  }
 
   // AIDA roadmap item 8.5 — fire-and-forget, never delays or affects this
   // response (see the function's own try/catch — it can't throw out here).
   detectAndProposeCapabilityGap({ context, userMessage, reply: result.reply, toolCalls: result.toolCalls });
 
-  return { ...result, turnId };
+  return { ...result, turnId, conversationId: conversation?.id };
 }
 
 /**
@@ -341,7 +374,7 @@ function createAidaRouter({ requireAuth, buildContext }) {
   // attachment handling in routes/whatsapp.js.
   router.post('/chat', handleChatFileUpload, async (req, res) => {
     try {
-      const { voice, provider, model } = req.body || {};
+      const { voice, provider, model, conversationId } = req.body || {};
       let { message } = req.body || {};
       if (req.file) {
         const extractedText = await extractTextFromBuffer(req.file.buffer, req.file.originalname);
@@ -373,9 +406,9 @@ function createAidaRouter({ requireAuth, buildContext }) {
 
       const {
         reply, toolCalls, turnId, interrupted, degraded,
-        provider: usedProvider, model: usedModel,
+        provider: usedProvider, model: usedModel, conversationId: usedConversationId,
       } = await runConversationTurn({
-        req, context, userMessage: message.trim(), wantsVoice, llmProvider: provider, llmModel: model,
+        req, context, userMessage: message.trim(), wantsVoice, llmProvider: provider, llmModel: model, conversationId,
       });
 
       // Voice is entirely additive: audio is fire-and-forget over socket.io
@@ -385,7 +418,12 @@ function createAidaRouter({ requireAuth, buildContext }) {
       // provider/model are the ACTUAL ones this turn ran on (resolved server-side,
       // not just an echo of the request) — the only reliable way to confirm which
       // model answered, since the reply text itself can't be trusted for that.
+      // conversationId is the durable thread this turn landed in (masteradmin
+      // only) — a client with none yet gets one back here; pass it on every
+      // later call to keep continuing the SAME thread rather than drifting
+      // onto whichever one happens to be "most recently active."
       const responseBody = { reply, toolCalls, provider: usedProvider, model: usedModel };
+      if (usedConversationId) responseBody.conversationId = usedConversationId;
       if (wantsVoice) responseBody.turnId = turnId;
       if (interrupted) responseBody.interrupted = true;
       if (degraded) responseBody.degraded = true;
@@ -492,11 +530,12 @@ function createAidaRouter({ requireAuth, buildContext }) {
         return res.status(400).json({ error: 'Could not transcribe any speech from that recording.' });
       }
 
-      const { reply, toolCalls, turnId, interrupted, degraded } = await runConversationTurn({
-        req, context, userMessage: transcript, wantsVoice, pre,
+      const { reply, toolCalls, turnId, interrupted, degraded, conversationId: usedConversationId } = await runConversationTurn({
+        req, context, userMessage: transcript, wantsVoice, pre, conversationId: req.body?.conversationId,
       });
 
       const responseBody = { transcript, reply, turnId, toolCalls: toolCalls || null };
+      if (usedConversationId) responseBody.conversationId = usedConversationId;
       if (interrupted) responseBody.interrupted = true;
       if (degraded) responseBody.degraded = true;
       res.json(responseBody);
@@ -589,6 +628,56 @@ masterAdminAidaRouter.post('/tts', async (req, res) => {
     const { buffer, mimeType } = await voiceSession.synthesizeFullReply(text);
     res.set('Content-Type', mimeType);
     res.send(buffer);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Durable, multi-thread chat history (conversationStore.js) — the "see my
+// old chats" / "start a new chat" UI talks to these three. Masteradmin only,
+// scoped to req.admin.adminId throughout so one admin can never list/read
+// another's conversations.
+
+// GET /conversations — the chat list/sidebar's data source: id, title
+// (auto-filled from the first message), lastMessageAt (for sorting/display).
+masterAdminAidaRouter.get('/conversations', async (req, res) => {
+  try {
+    const conversations = await conversationStore.listConversations(req.admin.adminId);
+    res.json({ conversations });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /conversations — "start a new chat": creates a fresh, empty thread
+// and returns its id. The NEXT message sent with this id becomes turn one of
+// a brand new conversation instead of continuing whatever was active before.
+masterAdminAidaRouter.post('/conversations', async (req, res) => {
+  try {
+    const { title } = req.body || {};
+    const conversation = await conversationStore.createConversation(req.admin.adminId, typeof title === 'string' ? title.trim() : undefined);
+    res.json({ conversation });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /conversations/:id/messages — opening an old chat from the list.
+masterAdminAidaRouter.get('/conversations/:id/messages', async (req, res) => {
+  try {
+    const conversation = await conversationStore.getConversation(req.admin.adminId, req.params.id);
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    const messages = await conversationStore.getMessages(conversation.id);
+    res.json({ conversation, messages });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /contacts/sync — the Android app's own phone contacts (AIDA roadmap:
+// contact sync), bulk-upserted into this admin's ai_contacts so "message
+// Pooja on WhatsApp"/"email Pooja" can resolve a name AIDA was never told
+// about mid-conversation. Body: { contacts: [{ name, phoneNumber?, email? }] }
+// — an explicit, user-triggered action on the Android side (e.g. a "Sync
+// contacts" button), never read/sent silently in the background.
+masterAdminAidaRouter.post('/contacts/sync', async (req, res) => {
+  try {
+    const { contacts: contactsList } = req.body || {};
+    if (!Array.isArray(contactsList)) return res.status(400).json({ error: 'contacts (array) is required' });
+    const result = await contacts.syncContacts(req.admin.adminId, contactsList);
+    res.json(result);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
