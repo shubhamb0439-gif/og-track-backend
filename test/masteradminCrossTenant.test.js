@@ -12,9 +12,35 @@ const config = require('../src/config');
 // instead of reusing the master admin's own token — this test proves that
 // synthetic token would actually pass the real route's check.
 
+// masteradminCrossTenant.js now resolves whatever companySlug a model passes
+// against the REAL companies list (see its own resolveCompanySlug doc
+// comment — a real bug fix, GPT-4o was observed guessing a slug from a
+// company's display name instead of calling masteradmin_list_companies
+// first). That means it needs db/core — faked here via the require cache so
+// this stays a fast, isolated unit test rather than hitting a real database.
+const corePath = require.resolve('../src/db/core');
+const originalCoreDbCacheEntry = require.cache[corePath];
+
+function installFakeCoreDb(companies) {
+  const fakeCoreDb = (table) => ({ select: async () => (table === 'companies' ? companies : []) });
+  require.cache[corePath] = { id: corePath, filename: corePath, loaded: true, exports: fakeCoreDb };
+  delete require.cache[require.resolve('../src/aida/tools/masteradminCrossTenant')];
+}
+
+function restoreCoreDb() {
+  if (originalCoreDbCacheEntry) require.cache[corePath] = originalCoreDbCacheEntry;
+  else delete require.cache[corePath];
+}
+
 test('a masteradmin cross-tenant tool call sends a properly tenant-scoped Authorization token', async () => {
-  const tools = require('../src/aida/tools/masteradminCrossTenant');
-  const tool = tools.find((t) => t.name === 'masteradmin_attendance_get_late_employees');
+  installFakeCoreDb([{ slug: 'testco', name: 'Test Co' }]);
+  let tools, tool;
+  try {
+    tools = require('../src/aida/tools/masteradminCrossTenant');
+    tool = tools.find((t) => t.name === 'masteradmin_attendance_get_late_employees');
+  } finally {
+    restoreCoreDb();
+  }
   assert.ok(tool, 'expected masteradmin_attendance_get_late_employees to be registered');
 
   let capturedAuthHeader = null;

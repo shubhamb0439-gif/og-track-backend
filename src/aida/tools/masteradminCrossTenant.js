@@ -1,6 +1,46 @@
 const jwt = require('jsonwebtoken');
 const config = require('../../config');
+const coreDb = require('../../db/core');
 const { MASTERADMIN_SENTINEL_MODULE } = require('../contextBuilder');
+
+// Short-lived cache — the companies list rarely changes, and this is now
+// checked on every cross-tenant tool call (see resolveCompanySlug below),
+// not just once per session.
+let companiesCache = null;
+let companiesCacheAt = 0;
+const COMPANIES_CACHE_MS = 60_000;
+
+async function getCompaniesCached() {
+  if (companiesCache && Date.now() - companiesCacheAt < COMPANIES_CACHE_MS) return companiesCache;
+  companiesCache = await coreDb('companies').select('slug', 'name');
+  companiesCacheAt = Date.now();
+  return companiesCache;
+}
+
+function normalizeForMatch(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Resolves whatever slug-ish string the model passed against the REAL
+ * company slugs — confirmed LIVE as a real, recurring failure: a model
+ * (GPT-4o, specifically observed) guessed a slug straight from the
+ * company's display name instead of calling masteradmin_list_companies
+ * first, e.g. "Sitara Drapes" -> "sitaradrapes" instead of the real slug
+ * "sitara" — every query then 404'd with no way to self-correct. Exact
+ * match wins immediately (the common, correct case); otherwise falls back
+ * to a normalized (lowercase, no spaces/punctuation) comparison against
+ * both slug AND name, so a model's best-guess slug, or the plain company
+ * name, both still resolve — without depending on any model perfectly
+ * following the list-companies-first instruction every single turn.
+ */
+async function resolveCompanySlug(rawSlug) {
+  const companies = await getCompaniesCached();
+  if (companies.some((c) => c.slug === rawSlug)) return rawSlug;
+  const normalizedInput = normalizeForMatch(rawSlug);
+  const match = companies.find((c) => normalizeForMatch(c.slug) === normalizedInput || normalizeForMatch(c.name) === normalizedInput);
+  return match ? match.slug : null;
+}
 
 /**
  * Phase 1 of the "AIDA power tier" plan: master admin gets full READ access
@@ -62,6 +102,11 @@ function wrapForCrossTenant(tool) {
     async handler(context, args) {
       const { companySlug, ...rest } = args || {};
       if (!companySlug) return { error: 'companySlug is required.' };
+      const resolvedSlug = await resolveCompanySlug(companySlug);
+      if (!resolvedSlug) {
+        const companies = await getCompaniesCached();
+        return { error: `No company matches "${companySlug}". Valid companies: ${companies.map((c) => `${c.name} (slug: ${c.slug})`).join(', ')}` };
+      }
       // Reusing the master admin's own JWT here would NOT work against a
       // tenant-scoped route that checks req.auth.slug === req.company.slug
       // (see src/routes/attendance.js's /all endpoint) — that token has
@@ -74,14 +119,14 @@ function wrapForCrossTenant(tool) {
       // tenant route that enforces per-company token scoping, without
       // needing route-by-route special-casing for "masteradmin passthrough".
       const syntheticToken = jwt.sign(
-        { userId: context.userId, role: 'superadmin', slug: companySlug },
+        { userId: context.userId, role: 'superadmin', slug: resolvedSlug },
         config.app.jwtSecret,
         { expiresIn: '5m' }
       );
       const tenantContext = {
         ...context,
         kind: 'tenant',
-        tenantSlug: companySlug,
+        tenantSlug: resolvedSlug,
         authHeader: `Bearer ${syntheticToken}`,
       };
       return tool.handler(tenantContext, rest);
