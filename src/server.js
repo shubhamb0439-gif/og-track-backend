@@ -39,6 +39,7 @@ const tokenRoutes = require('./routes/token');
 const notesRoutes = require('./routes/notes');
 const birthdayRoutes = require('./routes/birthday');
 const sitaraRoutes = require('./routes/sitara');
+const bug_managementRoutes = require('./routes/bug_management');
 
 const app = express();
 const server = http.createServer(app);
@@ -152,6 +153,11 @@ app.use('/api/:slug/birthday', resolveTenant, requireModule('birthday'), birthda
 // Sitara Bespoke module bundle (dashboard, people, stocks, orders) — any of
 // its 4 module keys unlocks the whole route file, same pattern as acc/hr above.
 app.use('/api/:slug/sitara', resolveTenant, requireModule(['sitara_dashboard', 'sitara_people', 'sitara_stocks', 'sitara_orders']), sitaraRoutes);
+// Bug Management — Tester-only re-prioritization/developer-assignment layer
+// over the existing bugs table. requireAuth runs before the router (same
+// pattern as test-cases above) so req.auth.role is available for the
+// requireRole('tester') gate applied to every route inside bug_management.js.
+app.use('/api/:slug/bug_management', resolveTenant, requireModule('bug_management'), requireAuth, bug_managementRoutes);
 
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));

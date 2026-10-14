@@ -47,6 +47,7 @@ const MODULE_TO_SCRIPT = {
   sitara_people:    '17_module_sitara.sql',
   sitara_stocks:    '17_module_sitara.sql',
   sitara_orders:    '17_module_sitara.sql',
+  bug_management:   '18_module_bug_management.sql',
 };
 
 // Some modules' tables have foreign keys into another module's tables (e.g.
@@ -56,6 +57,11 @@ const MODULE_TO_SCRIPT = {
 const MODULE_DEPENDENCIES = {
   manufacturing: ['inventory'],
   sales: ['crm', 'inventory', 'manufacturing'],
+  // Bug Management adds columns onto the EXISTING dbo.bugs table (from the
+  // 'bugs' module) rather than creating its own parallel table — so 'bugs'
+  // (and by extension 02_module_projects.sql) must always be provisioned
+  // alongside it.
+  bug_management: ['bugs'],
 };
 
 // Scripts directory — adjust path if you move the sql folder
@@ -152,6 +158,11 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   if (scriptsNeeded.has('15_module_notes.sql')) orderedScripts.push('15_module_notes.sql');
   if (scriptsNeeded.has('16_module_birthday.sql')) orderedScripts.push('16_module_birthday.sql');
   if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('17_module_sitara.sql');
+  // bug_management's script ALTERs dbo.bugs (added by 02_module_projects.sql),
+  // so it must run after that one — the push order here guarantees it, since
+  // 02_module_projects.sql is always included first via the base array above
+  // whenever 'bugs' is in scriptsNeeded (forced by MODULE_DEPENDENCIES).
+  if (scriptsNeeded.has('18_module_bug_management.sql')) orderedScripts.push('18_module_bug_management.sql');
 
   // Patch files are additive schema changes (see ogtrack-sql-schema/tenant's
   // patch_*.sql convention) meant to be run once against an already-live
