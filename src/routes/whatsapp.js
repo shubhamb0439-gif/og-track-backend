@@ -264,6 +264,20 @@ router.post('/webhook', async (req, res) => {
     }
   } catch (e) {
     console.error('[whatsapp] webhook processing failed:', e);
+    // Real gap confirmed live (2026-10-15): this used to fail completely
+    // silently (logged server-side only) — a real "what's in this PDF"
+    // message got NO reply at all, with no way for the human to even know
+    // something broke rather than AIDA just... not answering. `from` is
+    // re-derived here (not reused from above) since it's declared inside
+    // the try block above and out of scope in this catch; best-effort and
+    // deliberately swallowed — a failure notifying about a failure should
+    // never throw a second error.
+    try {
+      const from = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
+      if (from) await sendWhatsAppMessage(from, "Sorry, I ran into a problem answering that — please try again in a bit.");
+    } catch (e2) {
+      console.error('[whatsapp] failed to even send the failure notice:', e2.message);
+    }
   }
 });
 

@@ -47,6 +47,30 @@ async function findContactByName(ownerId, name) {
 }
 
 /**
+ * Looser lookup for "do I actually know someone named roughly this"
+ * questions (find_contact, resolving a send/message target by name) — exact
+ * match wins first, then falls back to a partial (LIKE) match on either
+ * side. Real phone-synced contacts (see ContactSync.kt) routinely carry
+ * extra formatting a plain spoken name won't exactly match — "Thanishq"
+ * said out loud vs. a phone contact literally saved as "~Thanishq Pandian~"
+ * or "+919986517365 Roop Sampath" — confirmed live: 656 synced contacts,
+ * many with exactly this shape. Deliberately NOT used by saveContact's own
+ * upsert-by-name matching, which stays strict exact-match — a fuzzy hit
+ * there risks silently overwriting a DIFFERENT person's saved contact
+ * instead of creating a new one.
+ */
+async function findContactByNameLoose(ownerId, name) {
+  const needle = String(name || '').trim();
+  if (!needle) return null;
+  const exact = await findContactByName(ownerId, needle);
+  if (exact) return exact;
+  const candidates = await coreDb('ai_contacts').where({ owner_id: ownerId }).whereRaw('LOWER(name) LIKE LOWER(?)', [`%${needle}%`]);
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+  return candidates[0];
+}
+
+/**
  * Reverse lookup by WhatsApp number — deliberately NOT scoped by ownerId.
  * Used only for recognizing who just messaged AIDA on WhatsApp, where
  * there's no "current admin" context at all (the message is FROM an
@@ -124,4 +148,4 @@ async function syncContacts(ownerId, contactsList) {
   return { saved, skipped, total: (contactsList || []).length };
 }
 
-module.exports = { getContacts, findContactByName, findContactByPhone, saveContact, forgetContact, syncContacts, normalizeWhatsAppNumber };
+module.exports = { getContacts, findContactByName, findContactByNameLoose, findContactByPhone, saveContact, forgetContact, syncContacts, normalizeWhatsAppNumber };

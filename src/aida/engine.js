@@ -9,6 +9,23 @@ const PROVIDERS = {
   gemini: require('./providers/gemini'),
 };
 
+// HOTFIX (2026-10-15): OpenAI ran out of API credit mid-session. WhatsApp
+// and voice-input have no per-conversation provider picker (unlike the web
+// app's dropdown) — they always use whichever provider config.aida.provider
+// defaults to, so when that one provider is down, EVERY reply through it
+// just fails outright. Worse, confirmed live: WhatsApp's webhook swallows
+// that failure entirely (logs server-side only), so a real "what's in this
+// PDF" message got NO reply at all, not even an error. This retries the
+// SAME turn once on a different provider (Anthropic — confirmed separately
+// billed/working) whenever the primary provider's call fails for any reason,
+// rather than trying to detect/guess the exact shape a quota/billing error
+// takes (which varies by provider and SDK version — not worth the fragility
+// for what's meant to be a quick, broad safety net). Not a permanent
+// multi-provider priority system — just keeps AIDA answering through a
+// single provider's outage until the real fix (add credit, or change the
+// default) happens.
+const FALLBACK_PROVIDER = 'anthropic';
+
 /** First handful of words of the assistant's most recent reply in this conversation, or null if there isn't one. */
 function lastAssistantOpener(history) {
   if (!history || !history.length) return null;
@@ -152,8 +169,17 @@ function resolveProviderAndModel(providerName, model) {
 async function runTurn(context, userMessage, history, directive, options = {}) {
   const system = buildSystemPrompt(context, { history, directive });
   const { provider, model } = resolveProviderAndModel(options.provider, options.model);
-  const result = await getProvider(provider).runTurn({ system, history, userMessage, context, model });
-  return { ...result, provider, model };
+  const callArgs = { system, history, userMessage, context };
+  try {
+    const result = await getProvider(provider).runTurn({ ...callArgs, model });
+    return { ...result, provider, model };
+  } catch (e) {
+    if (provider === FALLBACK_PROVIDER || !config.aida.anthropicApiKey) throw e;
+    console.error(`[aida] ${provider} call failed, retrying this turn on ${FALLBACK_PROVIDER} (hotfix for a single-provider outage):`, e.message);
+    const fallbackModel = config.aida.defaultModels[FALLBACK_PROVIDER];
+    const result = await getProvider(FALLBACK_PROVIDER).runTurn({ ...callArgs, model: fallbackModel });
+    return { ...result, provider: FALLBACK_PROVIDER, model: fallbackModel };
+  }
 }
 
 /**
@@ -207,6 +233,21 @@ async function runTurnStream(context, userMessage, history, hooks = {}) {
     if (anyDelta) {
       console.error('[aida] streaming reply failed mid-stream:', e);
       return { reply: '', toolCalls: [], provider: providerName, model, streamed: true, degraded: true };
+    }
+    // Same hotfix as runTurn — if the PRIMARY provider is down (not just a
+    // transient streaming-specific blip), retrying the identical broken
+    // provider via its plain endpoint (below) would just fail the same way.
+    // Try a different provider first; only fall through to the old
+    // same-provider retry if that's not possible/doesn't help either.
+    if (providerName !== FALLBACK_PROVIDER && config.aida.anthropicApiKey) {
+      console.error(`[aida] ${providerName} streaming call failed before any output, retrying this turn on ${FALLBACK_PROVIDER} (hotfix for a single-provider outage):`, e.message);
+      try {
+        const fallbackModel = config.aida.defaultModels[FALLBACK_PROVIDER];
+        const result = await getProvider(FALLBACK_PROVIDER).runTurn({ system, history, userMessage, context, model: fallbackModel });
+        return { ...result, provider: FALLBACK_PROVIDER, model: fallbackModel, streamed: false, degraded: true };
+      } catch (e2) {
+        console.error(`[aida] fallback provider ${FALLBACK_PROVIDER} also failed:`, e2.message);
+      }
     }
     console.error('[aida] streaming reply failed before any output, falling back to non-streaming:', e);
     const fallback = await provider.runTurn({ system, history, userMessage, context, model });

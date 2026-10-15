@@ -209,7 +209,7 @@ module.exports = [
     async handler(context, { to, name, subject, body, includeAttachment, confirmed }) {
       let recipient = to;
       if (!recipient && name) {
-        const known = await contacts.findContactByName(context.userId, name);
+        const known = await contacts.findContactByNameLoose(context.userId, name);
         if (!known) return { error: `I don't have an email address saved for "${name}" yet — ask the human for it, then call this again with both "to" and "name".` };
         recipient = known.email;
       }
@@ -304,6 +304,39 @@ module.exports = [
   },
 
   {
+    name: 'find_contact',
+    description:
+      'Checks whether a specific saved contact exists by name, and what we actually have for them (email and/or ' +
+      'WhatsApp number) — use this for a plain lookup question like "do you have Pooja\'s number?" or "what\'s ' +
+      'Pooja\'s email?". This is READ-ONLY and never sends anything — for that, use send_email/message_contact instead.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    },
+    async handler(context, { name }) {
+      const found = await contacts.findContactByNameLoose(context.userId, name);
+      if (!found) return { found: false };
+      return { found: true, name: found.name, email: found.email || null, whatsappNumber: found.whatsapp_number || null };
+    },
+  },
+
+  {
+    name: 'list_contacts',
+    description: 'Lists every contact currently saved (from manual teaching, send_email/message_contact\'s save-on-first-use, or the Android app\'s phone-contact sync) — name plus whatever email/number we have for each.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: { type: 'object', properties: {} },
+    async handler(context) {
+      const rows = await contacts.getContacts(context.userId);
+      return {
+        count: rows.length,
+        contacts: rows.map((c) => ({ name: c.name, email: c.email || null, whatsappNumber: c.whatsapp_number || null })),
+      };
+    },
+  },
+
+  {
     name: 'forget_contact',
     description: 'Deletes a remembered contact by name — use when the human explicitly asks you to forget someone\'s saved email.',
     requiredModules: ['__masteradmin__'],
@@ -392,7 +425,7 @@ module.exports = [
 
       let resolvedNumber = phoneNumber ? contacts.normalizeWhatsAppNumber(phoneNumber) : null;
       if (!resolvedNumber) {
-        const existing = await contacts.findContactByName(context.userId, name);
+        const existing = await contacts.findContactByNameLoose(context.userId, name);
         if (!existing?.whatsapp_number) {
           return { error: `No saved WhatsApp number for "${name}" — give me the number (with country code) to message them.` };
         }
