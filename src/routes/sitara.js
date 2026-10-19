@@ -854,12 +854,19 @@ async function fetchRazorpayPayment(paymentId) {
   return res.json();
 }
 
-async function listAllRazorpayPayments() {
+/**
+ * `from`/`to` are optional Unix-second timestamps (Razorpay's own `from`/`to`
+ * query params on this endpoint) — omit both for the existing all-time
+ * behavior (the daily backfill scheduler's own use), or pass both to scope a
+ * call to one window (src/sitaraWeeklyReconciliation.js's trailing-week pull).
+ */
+async function listAllRazorpayPayments({ from, to } = {}) {
   const payments = [];
   let skip = 0;
   const count = 100; // Razorpay's max page size
+  const range = (from ? `&from=${from}` : '') + (to ? `&to=${to}` : '');
   for (;;) {
-    const res = await fetch(`https://api.razorpay.com/v1/payments?count=${count}&skip=${skip}`, { headers: razorpayApiHeaders() });
+    const res = await fetch(`https://api.razorpay.com/v1/payments?count=${count}&skip=${skip}${range}`, { headers: razorpayApiHeaders() });
     if (!res.ok) throw new Error(`Razorpay payment list failed (${res.status}): ${await res.text()}`);
     const page = await res.json();
     const items = page.items || [];

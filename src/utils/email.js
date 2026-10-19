@@ -23,13 +23,22 @@ function getClient() {
  * like it came from unrelated OG Track infrastructure. Both addresses must
  * be verified on the SAME underlying ACS resource — adding a second
  * verified domain there doesn't need a new connection string.
+ *
+ * `cc` is an optional array of addresses. `attachments` is an optional array
+ * of `{ name, contentType, contentInBase64 }` — ACS Email's own attachment
+ * shape, passed straight through (e.g. the weekly Sitara reconciliation
+ * workbook, src/sitaraWeeklyReconciliation.js).
  */
-async function sendEmail({ to, subject, html, text, from }) {
+async function sendEmail({ to, cc, subject, html, text, from, attachments }) {
   if (!config.email.enabled) throw new Error('Email is not configured (AZURE_ACS_EMAIL_CONNECTION_STRING / AZURE_ACS_EMAIL_SENDER missing).');
   const poller = await getClient().beginSend({
     senderAddress: from || config.email.senderAddress,
     content: { subject, html, plainText: text },
-    recipients: { to: [{ address: to }] },
+    recipients: {
+      to: [{ address: to }],
+      cc: cc && cc.length ? cc.map((address) => ({ address })) : undefined,
+    },
+    attachments: attachments && attachments.length ? attachments : undefined,
   });
   return poller.pollUntilDone();
 }

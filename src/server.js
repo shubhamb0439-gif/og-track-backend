@@ -66,6 +66,10 @@ aidaJobRunner.start(io);
 require('./aida/emailMonitor').start();
 require('./sitaraRazorpayScheduler').start();
 
+// Weekly Sitara Razorpay-vs-orders reconciliation email (thomas@ogplus.in,
+// cc pushpa@ogplus.in) — automates the manual pull-and-match done 2026-10-19.
+require('./sitaraWeeklyReconciliation').start();
+
 // ── Socket.io: per-tenant rooms ──────────────────────────────────────────────
 // Every client joins a room named after its company slug. All real-time
 // emits in the routes target io.to(slug), so OGTrack events never reach Cajo

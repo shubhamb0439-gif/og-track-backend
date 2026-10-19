@@ -573,6 +573,22 @@ module.exports = {
     // correction, just regular enough that a gap can't go unnoticed for long.
     backfillIntervalMs: parseInt(process.env.RAZORPAY_BACKFILL_INTERVAL_MS || '', 10) || 24 * 60 * 60 * 1000,
   },
+  // Weekly Sitara Razorpay-vs-orders reconciliation email (src/
+  // sitaraWeeklyReconciliation.js) — same "pull straight from Razorpay, match
+  // against sitara_orders, surface captured-but-missing orders" done manually
+  // 2026-10-19, now on a recurring weekly schedule. Recipients are real,
+  // explicitly requested addresses, kept overridable via env var rather than
+  // hardcoded so they can change without a code edit.
+  sitaraWeeklyReconciliation: {
+    recipientTo: process.env.SITARA_WEEKLY_REPORT_TO || 'thomas@ogplus.in',
+    recipientCc: (process.env.SITARA_WEEKLY_REPORT_CC || 'pushpa@ogplus.in')
+      .split(',').map((s) => s.trim()).filter(Boolean),
+    // Checked hourly; actually runs once 7 days have passed since the last
+    // run (persisted in OGCore's ai_sitara_weekly_reconciliation_state) —
+    // same "poll often, act rarely" shape as emailMonitor.js's own interval.
+    checkIntervalMs: parseInt(process.env.SITARA_WEEKLY_REPORT_CHECK_INTERVAL_MS || '', 10) || 60 * 60 * 1000,
+    periodMs: parseInt(process.env.SITARA_WEEKLY_REPORT_PERIOD_MS || '', 10) || 7 * 24 * 60 * 60 * 1000,
+  },
   // Sitara order-staleness threshold — computed at read time (src/routes/
   // sitara.js), not a background poller, so there's no extra always-on job
   // keeping OGCore/the tenant DB active (see the Azure cost investigation,
