@@ -510,6 +510,32 @@ module.exports = {
       redirectUri: process.env.ZOHO_REDIRECT_URI || null,
     };
   })(),
+  // AIDA per-user OAuth connectors (src/aida/connectors/) — "connect MY
+  // Google Drive/GitHub/Notion/Slack to AIDA", phase 1 (connect/disconnect/
+  // status only, no file browsing yet). Each provider needs its own OAuth
+  // app registered by the user; the backend's own callback route
+  // (/api/aida/connectors/:provider/callback, mounted directly in server.js,
+  // NOT under /api/:slug or /api/masteradmin — one fixed URL per provider
+  // regardless of which tenant/masteradmin initiated the connect, matching
+  // Zoho Books' own "one backend callback, not the frontend" convention)
+  // needs this exact backendBaseUrl + path registered in each provider's own
+  // OAuth app console as its redirect URI.
+  aidaConnectors: (() => {
+    const backendBaseUrl = process.env.AIDA_CONNECTORS_BASE_URL || null;
+    const redirectUriFor = (provider) => (backendBaseUrl ? `${backendBaseUrl}/api/aida/connectors/${provider}/callback` : null);
+    const provider = (envPrefix, name) => {
+      const clientId = process.env[`${envPrefix}_CLIENT_ID`] || null;
+      const clientSecret = process.env[`${envPrefix}_CLIENT_SECRET`] || null;
+      return { enabled: !!(clientId && clientSecret && backendBaseUrl), clientId, clientSecret, redirectUri: redirectUriFor(name) };
+    };
+    return {
+      backendBaseUrl,
+      google_drive: provider('GOOGLE_DRIVE_OAUTH', 'google_drive'),
+      github: provider('GITHUB_OAUTH', 'github'),
+      notion: provider('NOTION_OAUTH', 'notion'),
+      slack: provider('SLACK_OAUTH', 'slack'),
+    };
+  })(),
   // Twilio (src/aida/twilio.js) — urgent-email voice-call escalation only
   // (AIDA roadmap item 3). Not used for anything else in this phase.
   twilio: (() => {

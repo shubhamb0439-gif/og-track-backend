@@ -18,6 +18,8 @@ const { warmFillerCache } = require('../aida/voice/fillerPhrases');
 const { isGreeting, pickGreetingText, getGreetingAudio, warmGreetingCache } = require('../aida/voice/greetingReplies');
 const { createTurnTimer } = require('../aida/latency');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
+const connectorProviders = require('../aida/connectors/providers');
+const connectorStore = require('../aida/connectors/connectorStore');
 const { getCombinedStatus } = require('../aida/codingAgent/github');
 const { matchTodayCelebrations } = require('../aida/celebrations');
 const { tryResolvePreviewUrl } = require('../aida/jobs/previewResolver');
@@ -599,6 +601,86 @@ function createAidaRouter({ requireAuth, buildContext }) {
 const tenantAidaRouter = createAidaRouter({ requireAuth: requireTenantAidaAuth, buildContext: buildTenantContext });
 const masterAdminAidaRouter = createAidaRouter({ requireAuth: requireMasterAdminAidaAuth, buildContext: buildMasterAdminContext });
 
+// ── Per-user OAuth connectors (Google Drive, GitHub, Notion, Slack) ────────
+// Phase 1 only: connect/disconnect/status. Added identically onto BOTH
+// routers via one shared function — a tenant user's connectors and a
+// masteradmin's own connectors use the exact same routes/shapes, differing
+// only in how `scope` is derived from the request (see scopeFromReq below,
+// which mirrors contextBuilder.js's buildTenantContext/buildMasterAdminContext
+// companyId/userId fields exactly).
+//
+// In-memory, short-lived — same reasoning as masteradminZoho.js's own
+// pendingConnects: a connect flow is one browser round trip (redirect out,
+// redirect back seconds later), not something that needs to survive a
+// restart.
+const pendingConnectorFlows = new Map(); // state -> { scope, provider }
+
+function addConnectorRoutes(router, scopeFromReq) {
+  router.get('/connectors', async (req, res) => {
+    try {
+      res.json({ connectors: await connectorStore.listForScope(scopeFromReq(req)) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  router.post('/connectors/:provider/connect', (req, res) => {
+    const { provider: providerId } = req.params;
+    if (!connectorProviders.PROVIDER_IDS.includes(providerId)) {
+      return res.status(400).json({ error: `Unknown connector "${providerId}" — must be one of ${connectorProviders.PROVIDER_IDS.join(', ')}` });
+    }
+    const providerCfg = config.aidaConnectors[providerId];
+    if (!providerCfg.enabled) {
+      return res.status(400).json({ error: `${providerId} is not configured on this server yet (missing its OAuth client id/secret, or AIDA_CONNECTORS_BASE_URL).` });
+    }
+    const state = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    pendingConnectorFlows.set(state, { scope: scopeFromReq(req), provider: providerId });
+    res.json({ authUrl: connectorProviders.getProvider(providerId).buildAuthUrl(state) });
+  });
+
+  router.post('/connectors/:provider/disconnect', async (req, res) => {
+    const { provider: providerId } = req.params;
+    if (!connectorProviders.PROVIDER_IDS.includes(providerId)) {
+      return res.status(400).json({ error: `Unknown connector "${providerId}" — must be one of ${connectorProviders.PROVIDER_IDS.join(', ')}` });
+    }
+    try {
+      const removed = await connectorStore.disconnect(scopeFromReq(req), providerId);
+      if (!removed) return res.status(404).json({ error: `${providerId} is not currently connected.` });
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+}
+
+addConnectorRoutes(tenantAidaRouter, (req) => ({ companyId: req.company.id, userId: req.auth.userId }));
+addConnectorRoutes(masterAdminAidaRouter, (req) => ({ companyId: null, userId: req.admin.adminId }));
+
+// Shared OAuth callback — ONE fixed URL per provider regardless of which
+// tenant/masteradmin started the connect flow (see config.aidaConnectors'
+// own doc comment for why: this is the exact redirect URI registered in
+// each provider's own OAuth app console). Mounted directly in server.js at
+// /api/aida/connectors, outside both the tenant and masteradmin auth gates —
+// the `state` param (not a session/cookie) is what ties this request back to
+// who initiated it, same mechanism as masteradminZoho.js's own callback.
+const connectorCallbackRouter = express.Router();
+connectorCallbackRouter.get('/:provider/callback', async (req, res) => {
+  const { provider: providerId } = req.params;
+  const { code, state, error } = req.query;
+  if (error) return res.status(400).send(`Connection was not granted: ${error}`);
+  const pending = state && pendingConnectorFlows.get(state);
+  if (!pending || pending.provider !== providerId) {
+    return res.status(400).send('This connect link has expired or was already used — start again from where you connected it.');
+  }
+  pendingConnectorFlows.delete(state);
+
+  try {
+    const provider = connectorProviders.getProvider(providerId);
+    const tokens = await provider.exchangeCodeForTokens(code);
+    if (!tokens.email) tokens.email = await provider.fetchConnectedEmail(tokens.accessToken);
+    await connectorStore.upsertConnection(pending.scope, providerId, tokens);
+    res.send(`<html><body style="font-family:sans-serif;padding:40px"><h2>Connected${tokens.email ? ` as ${tokens.email}` : ''}</h2><p>You can close this tab and return to AIDA.</p></body></html>`);
+  } catch (e) {
+    res.status(500).send(`Connection failed: ${e.message}`);
+  }
+});
+
 // ── Tenant-facing report-a-bug/feature button (AIDA roadmap item 4b) ────────
 // The one tenant-side way to CREATE a job — everything about managing it
 // afterward (list/approve/reject) is still master-admin only, below. Added
@@ -920,4 +1002,4 @@ reportIssueApprovalRouter.post('/:id/reject', async (req, res) => {
 // it lets test/liveConversationTurn-style scripts exercise the REAL
 // streaming/filler/interruption wiring directly, without needing a full
 // HTTP+DB+socket.io harness. Not used by any other module in the app.
-module.exports = { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, runConversationTurn };
+module.exports = { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, connectorCallbackRouter, runConversationTurn };

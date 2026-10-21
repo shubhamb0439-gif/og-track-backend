@@ -31,7 +31,7 @@ const inventoryRoutes = require('./routes/inventory');
 const manufacturingRoutes = require('./routes/manufacturing');
 const salesRoutes = require('./routes/sales');
 const uploadRoutes = require('./routes/upload');
-const { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter } = require('./routes/aida');
+const { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, connectorCallbackRouter } = require('./routes/aida');
 const whatsappRoutes = require('./routes/whatsapp');
 const aidaJobRunner = require('./aida/jobs/jobRunner');
 const to_do_listRoutes = require('./routes/to_do_list');
@@ -149,6 +149,11 @@ app.use('/api/:slug/aida', resolveTenant, tenantAidaRouter);
 // auth middleware (see requireReportIssueApprover in routes/aida.js), so it
 // isn't mounted behind either router's single fixed requireAuth.
 app.use('/api/:slug/aida/report-issue-jobs', reportIssueApprovalRouter);
+// Per-user OAuth connectors' shared callback (Google Drive/GitHub/Notion/
+// Slack) — ONE fixed URL regardless of slug/masteradmin, not mounted under
+// either /api/:slug or /api/masteradmin: see connectorCallbackRouter's own
+// doc comment in routes/aida.js for why.
+app.use('/api/aida/connectors', connectorCallbackRouter);
 app.use('/api/:slug/to_do_list', resolveTenant, requireModule('to_do_list'), to_do_listRoutes);
 app.use('/api/:slug/token', resolveTenant, requireModule('token'), tokenRoutes);
 app.use('/api/:slug/notes', resolveTenant, requireModule('notes'), notesRoutes);
