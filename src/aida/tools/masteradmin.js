@@ -41,6 +41,51 @@ module.exports = [
   },
 
   {
+    name: 'masteradmin_open_company',
+    description: 'Resolve a company name/slug to its real OG Track app URL, for "open X" / "show me X" / "pull up X" requests. ALWAYS call this instead of guessing or constructing a URL yourself — the frontend auto-renders any real URL appearing in your reply text as a preview card, so when found, state the returned url field PLAINLY as visible text. If not found or ambiguous, say so in plain text instead of guessing.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'The company name or slug as the user said it, e.g. "CAJO", "Sitara Drapes"' } },
+      required: ['query'],
+    },
+    async handler(context, { query } = {}) {
+      const q = (query || '').trim().toLowerCase();
+      if (!q) return { found: false, error: 'query is required' };
+      if (!config.email.frontendBaseUrl) {
+        return { found: false, error: 'FRONTEND_BASE_URL is not configured on this server — I cannot construct a real link right now.' };
+      }
+
+      const rows = (await callPlatformApi(context, 'GET', '/masteradmin/companies')) || [];
+      // Exact match (name or slug) first — only fall back to substring
+      // matching when nothing matches exactly, so a short/common name never
+      // loses to an unrelated longer one that happens to contain it.
+      // Substring check is BIDIRECTIONAL: a stored name can be shorter than
+      // the query ("CAJO" vs. a user saying "CAJO ERP") just as easily as
+      // longer, so both c.name.includes(q) and q.includes(c.name) matter.
+      const exact = rows.filter((c) => c.name.toLowerCase() === q || c.slug.toLowerCase() === q);
+      const candidates = exact.length ? exact : rows.filter((c) => {
+        const name = c.name.toLowerCase(), slug = c.slug.toLowerCase();
+        return name.includes(q) || q.includes(name) || slug.includes(q) || q.includes(slug);
+      });
+
+      if (candidates.length === 0) return { found: false, message: `No company found matching "${query}".` };
+      if (candidates.length > 1) {
+        return {
+          found: false, ambiguous: true,
+          candidates: candidates.map((c) => ({ name: c.name, slug: c.slug })),
+          message: `Multiple companies match "${query}": ${candidates.map((c) => c.name).join(', ')}. Ask which one they mean.`,
+        };
+      }
+      const company = candidates[0];
+      return {
+        found: true, name: company.name, slug: company.slug, status: company.status,
+        url: `${config.email.frontendBaseUrl.replace(/\/+$/, '')}/${company.slug}`,
+      };
+    },
+  },
+
+  {
     name: 'masteradmin_get_pending_users',
     description: 'Users across ALL companies awaiting Super Admin approval.',
     requiredModules: ['__masteradmin__'],
