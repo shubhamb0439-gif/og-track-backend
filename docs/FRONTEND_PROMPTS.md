@@ -2453,3 +2453,66 @@ Every `POST /chat` and the voice/mic request (if the mic feature in this panel c
 instead) needs the active conversationId threaded through, and its response's conversationId
 stored back — this is what keeps every subsequent message landing in the SAME thread rather than
 occasionally drifting onto a different "most recently active" one server-side.
+
+## 41. AIDA — render charts (pie/doughnut/bar/line) instead of a raw code block
+
+**Status: backend built and unit-tested 2026-10-21 — this entry is a pure frontend build.**
+
+**Why this exists:** AIDA's reply is plain text, and the chat UI already auto-renders any real
+URL appearing in it as a preview card — that mechanism is untouched by this prompt. This is the
+same idea applied to charts: when asked to visualize data ("show me a pie chart of leads by
+status", "graph this month's sales"), AIDA now calls a new `render_chart` tool that validates real
+numbers (gathered from whatever data tool it already called earlier in the same turn — it never
+invents values) and hands back a canonical JSON block, which AIDA is instructed to copy verbatim
+into its reply as a fenced code block tagged `aida-chart`:
+
+````
+```aida-chart
+{"type":"pie","title":"Leads by status","labels":["Open","Won","Lost"],"series":[{"label":null,"values":[12,5,3]}]}
+```
+````
+
+- `type`: `"pie"`, `"doughnut"`, `"bar"`, or `"line"`.
+- `title`: short human-readable chart title.
+- `labels`: category names along the shared axis (or pie/doughnut's slices).
+- `series`: one entry per data series — `{ label: string|null, values: number[] }`, `values`
+  always the same length as `labels`, same order. `pie`/`doughnut` always have exactly one series
+  (label is `null` in that case — there's nothing to name when there's only one slice set);
+  `bar`/`line` can have one or several (e.g. "2025" vs "2026" as two bars per month).
+
+**What to build:** wherever the chat currently renders an assistant message's markdown (code
+blocks, etc. already render somehow — find that existing renderer rather than building a second
+one), detect a fenced block whose language tag is exactly `aida-chart`. Parse its contents as
+JSON and render an actual chart in its place instead of a literal code block — everything else in
+the message (the text around it) renders exactly as it does today. If the JSON fails to parse for
+any reason, fall back to rendering it as a normal code block rather than crashing or showing
+nothing — this should never be reachable given the backend's own validation, but a render crash
+from one malformed block shouldn't take down the whole message.
+
+**Chart library:** Chart.js is a good fit here — lightweight, canvas-based, no framework
+dependency, widely documented, and maps cleanly onto all four of these chart types with minimal
+config (`type: 'pie'|'doughnut'|'bar'|'line'`, `data: { labels, datasets: series.map(s => ({
+label: s.label, data: s.values })) }`). Use whatever's already a dependency if something
+equivalent is already in the project; don't add a second charting library if one already exists.
+
+**Make it actually look good, not just functional** (per the original ask — "present data in a
+better way... something like that" / "beautiful"):
+- Reuse AIDA's own brand red (`#B7252D`, the color already used in the AIDA badge/icon elsewhere
+  in this app) as the primary accent — a single-series bar/line/doughnut in that color (or a
+  tasteful gradient from it) will feel like it belongs to AIDA specifically, not a generic default
+  chart. For a pie/doughnut with several slices, a small coordinated palette built outward from
+  that same red (varying lightness/hue) reads better than Chart.js's default rainbow.
+- Real chart-level animation on first render (Chart.js's default animation is already decent —
+  don't disable it for the sake of simplicity).
+- A proper legend when there's more than one series or more than ~4 pie slices; skip the legend
+  entirely for a simple single-series chart with visible value labels instead — a legend repeating
+  what's already labeled on the chart itself is just noise.
+- Tooltips on hover showing the exact value.
+- Respect the app's existing light/dark theme if it has one (axis labels, gridlines, and legend
+  text need a color that's readable on both).
+- Give the chart a sensible fixed-ish height (e.g. 280-320px) inside the chat bubble, full width
+  of the message column, responsive on resize — a chart that's free to grow unbounded vertically
+  inside a scrolling chat looks broken.
+
+**Not in scope for this pass:** click-through/drill-down interactivity beyond hover tooltips, and
+exporting the chart as an image — both real candidates for later, not asked for now.

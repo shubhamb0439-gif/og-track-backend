@@ -9,6 +9,13 @@
 
 const MASTERADMIN_SENTINEL_MODULE = '__masteradmin__';
 
+// A tool that needs no module/data access of its own (pure formatting/
+// presentation, e.g. render_chart in tools/dataViz.js) — available in EVERY
+// context, tenant or masteradmin, unlike a module-less tenant tool (which
+// toolRegistry.js's isAvailable deliberately still hides from masteradmin,
+// see its own doc comment) or a masteradmin-only tool.
+const UNIVERSAL_SENTINEL_MODULE = '__universal__';
+
 function buildTenantContext(req) {
   const ui = req.body?.pageContext || {};
   return {
@@ -45,4 +52,4 @@ function buildMasterAdminContext(req) {
   };
 }
 
-module.exports = { buildTenantContext, buildMasterAdminContext, MASTERADMIN_SENTINEL_MODULE };
+module.exports = { buildTenantContext, buildMasterAdminContext, MASTERADMIN_SENTINEL_MODULE, UNIVERSAL_SENTINEL_MODULE };

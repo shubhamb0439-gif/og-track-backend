@@ -18,6 +18,7 @@ const MODULE_TOOL_FILES = [
   require('./masteradminCrossTenant'),
   require('./devops'),
   require('./webResearch'),
+  require('./dataViz'),
 ];
 
 let registered = false;

@@ -14,7 +14,7 @@
  *   }
  */
 
-const { MASTERADMIN_SENTINEL_MODULE } = require('./contextBuilder');
+const { MASTERADMIN_SENTINEL_MODULE, UNIVERSAL_SENTINEL_MODULE } = require('./contextBuilder');
 
 const tools = new Map();
 
@@ -34,6 +34,8 @@ function registerTools(list) {
 
 /**
  * A tool is available if:
+ * - it declares the '__universal__' sentinel — always available, tenant or masteradmin (pure
+ *   formatting/presentation tools with no data access of their own, e.g. render_chart), or
  * - it's a master-admin tool (requires the '__masteradmin__' sentinel) AND this is a master-admin context, or
  * - it's a tenant tool (anything else) AND this is a tenant context, AND it either has no module
  *   requirement or the tenant has ANY one of the listed modules enabled.
@@ -43,6 +45,7 @@ function registerTools(list) {
  */
 function isAvailable(tool, context) {
   const required = tool.requiredModules || [];
+  if (required.includes(UNIVERSAL_SENTINEL_MODULE)) return true;
   const isMasterAdminTool = required.includes(MASTERADMIN_SENTINEL_MODULE);
   if (context.kind === 'masteradmin') return isMasterAdminTool;
   if (isMasterAdminTool) return false;
