@@ -86,6 +86,54 @@ module.exports = [
   },
 
   {
+    name: 'masteradmin_open_whatsapp',
+    description:
+      'Resolves "can I pull up WhatsApp in this?" / "open WhatsApp" / "open WhatsApp with X" requests to a real, ' +
+      'clickable WhatsApp deep link — a genuine integration entry point, not a guess. With no contactName/' +
+      'phoneNumber, returns a link to WhatsApp itself (https://web.whatsapp.com) for just opening the app. With ' +
+      'a contactName (resolved against saved contacts, same loose matching as find_contact/message_contact) or an ' +
+      'explicit phoneNumber, returns a wa.me link that opens a chat with THAT specific person directly, optionally ' +
+      'pre-filled with `message` as the draft text (nothing is ever sent by this tool — opening the link is a manual, ' +
+      'human action in their own WhatsApp, same as clicking a wa.me link anywhere else). ALWAYS call this instead of ' +
+      'constructing a wa.me/web.whatsapp.com URL yourself — the frontend auto-renders any real URL appearing in your ' +
+      'reply text as a preview card, so once you have the url field, state it PLAINLY as visible text. If a ' +
+      'contactName is given but has no saved WhatsApp number, say so in plain text instead of guessing one.',
+    requiredModules: ['__masteradmin__'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contactName: { type: 'string', description: 'A saved contact\'s name to open a direct chat with — resolved the same way as message_contact.' },
+        phoneNumber: { type: 'string', description: 'Full number with country code (e.g. "919845009748") — use instead of/alongside contactName when the number is given directly rather than a saved name.' },
+        message: { type: 'string', description: 'Optional draft text to pre-fill the chat with (the human still has to hit send themselves) — only used when a specific contact/number is resolved.' },
+      },
+    },
+    async handler(context, { contactName, phoneNumber, message } = {}) {
+      let resolvedNumber = phoneNumber ? contacts.normalizeWhatsAppNumber(phoneNumber) : null;
+      let resolvedName = null;
+
+      if (!resolvedNumber && contactName) {
+        const found = await contacts.findContactByNameLoose(context.userId, contactName);
+        if (!found?.whatsapp_number) {
+          return { found: false, message: `No saved WhatsApp number for "${contactName}" — give me their number (with country code) to open a chat with them.` };
+        }
+        resolvedNumber = found.whatsapp_number;
+        resolvedName = found.name;
+      }
+
+      // No specific person named at all — "pull up WhatsApp" on its own just
+      // means "open the app/web client", not a chat with anyone in particular.
+      if (!resolvedNumber) {
+        return { found: true, name: null, phoneNumber: null, url: 'https://web.whatsapp.com' };
+      }
+
+      const url = message
+        ? `https://wa.me/${resolvedNumber}?text=${encodeURIComponent(message)}`
+        : `https://wa.me/${resolvedNumber}`;
+      return { found: true, name: resolvedName || contactName || null, phoneNumber: resolvedNumber, url };
+    },
+  },
+
+  {
     name: 'masteradmin_get_pending_users',
     description: 'Users across ALL companies awaiting Super Admin approval.',
     requiredModules: ['__masteradmin__'],
