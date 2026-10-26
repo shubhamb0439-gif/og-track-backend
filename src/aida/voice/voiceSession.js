@@ -1,6 +1,6 @@
 const config = require('../../config');
 const { splitIntoSpeechChunks, createStreamingChunker } = require('./textChunker');
-const { synthesizeChunkStream, mimeTypeForFormat } = require('./elevenLabsClient');
+const { synthesizeChunkStream, mimeTypeForFormat } = require('./openaiTtsClient');
 const { getFillerAudio, getRandomFillerAudio, canPlayFiller, markFillerPlayed } = require('./fillerPhrases');
 const { cleanForSpeech } = require('./textCleaner');
 const { adaptDirective } = require('./speechDirectiveAdapter');
