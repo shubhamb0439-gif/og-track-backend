@@ -716,7 +716,7 @@ tenantAidaRouter.post('/report-issue', async (req, res) => {
 masterAdminAidaRouter.post('/tts', async (req, res) => {
   try {
     if (!config.aida.voice.enabled) {
-      return res.status(503).json({ error: 'Voice is not configured on this server (missing OPENAI_API_KEY).' });
+      return res.status(503).json({ error: 'Voice is not configured on this server (missing ELEVENLABS_API_KEY/ELEVENLABS_VOICE_ID).' });
     }
     const { text } = req.body || {};
     if (!text || typeof text !== 'string' || !text.trim()) {

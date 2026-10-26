@@ -1,4 +1,4 @@
-const { synthesizeChunkStream, mimeTypeForFormat } = require('./openaiTtsClient');
+const { synthesizeChunkStream, mimeTypeForFormat } = require('./elevenLabsClient');
 const config = require('../../config');
 
 /**

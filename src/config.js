@@ -295,55 +295,44 @@ module.exports = {
           enabled: !!(backendRepo && frontendRepo && stagingDb.server && stagingDb.database),
         };
       })(),
-      // Voice (src/aida/voice/) — OpenAI TTS, chunked over the existing
-      // socket.io connection. Switched from ElevenLabs 2026-10-26 (see
-      // src/aida/voice/elevenLabsClient.js, left on disk but unused — a
-      // rollback just needs this block and the three require()s in
-      // voiceSession.js/fillerPhrases.js/greetingReplies.js reverted) —
-      // mainly to stop depending on a second vendor's API key when
-      // OPENAI_API_KEY already exists and works for AIDA's chat path, and
-      // because the configured ElevenLabs key had gone invalid in
-      // production. Soft-optional like the rest of this block: enabled only
-      // when an API key is set, so a POST /chat with voice:true silently
-      // stays text-only otherwise rather than erroring.
+      // Voice (src/aida/voice/) — ElevenLabs TTS, chunked over the existing
+      // socket.io connection. Soft-optional like the rest of this block:
+      // enabled only when both an API key AND a voice id are set, so a
+      // POST /chat with voice:true silently stays text-only otherwise
+      // rather than erroring.
       //
-      // KNOWN REGRESSION vs. ElevenLabs: no stability/style expressiveness
-      // control and no bracket audio tags ([sighs]/[gasps] in
-      // fillerPhrases.js) — OpenAI's TTS API has no equivalent of either.
-      // speechDirectiveAdapter.js's isExpressiveTagModel() already returns
-      // false for any non-"v3" model id (which no OpenAI model id matches),
-      // so tags are still correctly stripped before synthesis rather than
-      // read aloud literally — nothing broke, the expressive layer is just
-      // inert until/unless a future pass maps emotion onto gpt-4o-mini-tts's
-      // own `instructions` parameter instead.
+      // Briefly switched to OpenAI TTS (gpt-4o-mini-tts) 2026-10-26, reverted
+      // same day — live side-by-side testing on this exact server found
+      // OpenAI's first-byte latency (~700ms-2.2s) noticeably WORSE than
+      // ElevenLabs' realtime model (~300ms, per this file's own prior
+      // measurement below), and the voice quality itself wasn't liked
+      // either. src/aida/voice/openaiTtsClient.js is left on disk, unused,
+      // in case this is ever worth revisiting (e.g. if OpenAI's TTS models
+      // improve, or a future need to drop a second vendor outweighs the
+      // latency/quality cost measured here).
       voice: (() => {
-        const apiKey = process.env.OPENAI_API_KEY || null;
+        const apiKey = process.env.ELEVENLABS_API_KEY || null;
+        const voiceId = process.env.ELEVENLABS_VOICE_ID || null;
         return {
-          enabled: !!apiKey,
+          enabled: !!apiKey && !!voiceId,
           apiKey,
-          // OpenAI's TTS voices: alloy, ash, ballad, coral, echo, fable,
-          // onyx, nova, sage, shimmer, verse. onyx is the closest preset to
-          // AIDA's previous deeper ElevenLabs voice — pick whichever actually
-          // sounds right once you hear it, this is a one-env-var change.
-          voiceName: process.env.AIDA_TTS_VOICE || 'onyx',
-          modelId: process.env.AIDA_TTS_MODEL_ID || 'gpt-4o-mini-tts',
+          voiceId,
+          modelId: process.env.ELEVENLABS_MODEL_ID || 'eleven_flash_v2_5',
           // Fillers are pre-cached (synthesized once, at server startup or on
-          // first use — never live, on the critical path of a real reply),
-          // so unlike the live reply path, a slower/pricier model here would
-          // cost nothing in real-time latency — but OpenAI has no separate
-          // "expressive" model the way ElevenLabs' v3 was, so this just
-          // reuses the same model as the live path for now.
-          fillerModelId: process.env.AIDA_TTS_FILLER_MODEL_ID || process.env.AIDA_TTS_MODEL_ID || 'gpt-4o-mini-tts',
-          // OpenAI's response_format: mp3, opus, aac, flac, wav, or pcm.
-          // mp3 keeps the exact same audio/mpeg mimeType the frontend
-          // already expects from ElevenLabs — no frontend change needed.
-          outputFormat: process.env.AIDA_TTS_OUTPUT_FORMAT || 'mp3',
-          maxConcurrentChunks: parseInt(process.env.AIDA_TTS_MAX_CONCURRENT_CHUNKS || '2', 10),
-          maxCharsPerReply: parseInt(process.env.AIDA_TTS_MAX_CHARS_PER_REPLY || '2000', 10),
-          // Playback pace — OpenAI's valid range is 0.25-4.0; same default
-          // AIDA's ElevenLabs voice used, carried over unchanged (also reads
-          // slightly slow/natural here, not just an ElevenLabs quirk).
-          speed: parseFloat(process.env.AIDA_TTS_SPEED || process.env.ELEVENLABS_SPEED || '0.92'),
+          // first use — never live, on the critical path of a real reply), so
+          // they're the one place a slower, more expressive model costs
+          // nothing in real-time latency. Defaults to eleven_v3 (confirmed
+          // live: it accepts bracket audio tags like [sighs]/[gasps] — 1.7s
+          // vs. the realtime model's 0.3s per phrase, fine for a one-time
+          // warm-up, would be a real problem for a live reply chunk, which is
+          // why the live reply path stays on `modelId` above, untouched).
+          fillerModelId: process.env.ELEVENLABS_FILLER_MODEL_ID || 'eleven_v3',
+          outputFormat: process.env.ELEVENLABS_OUTPUT_FORMAT || 'mp3_44100_128',
+          maxConcurrentChunks: parseInt(process.env.ELEVENLABS_MAX_CONCURRENT_CHUNKS || '2', 10),
+          maxCharsPerReply: parseInt(process.env.ELEVENLABS_MAX_CHARS_PER_REPLY || '2000', 10),
+          // Playback pace — ElevenLabs defaults to 1.0 (their "natural" pace),
+          // which read as too fast in practice. Tunable without a code change.
+          speed: parseFloat(process.env.ELEVENLABS_SPEED || '0.92'),
           // How long to wait for real speech to start before playing a cached
           // "thinking" filler (src/aida/voice/fillerPhrases.js). Measured
           // live against the real OpenAI+ElevenLabs path: first-token time
@@ -361,7 +350,7 @@ module.exports = {
           // normal conversational back-and-forth still hears one occasionally,
           // long enough that two messages sent seconds apart don't both get one.
           fillerCooldownMs: parseInt(process.env.AIDA_FILLER_COOLDOWN_MS || '6000', 10),
-          // Hard ceiling on ONE chunk's TTS round trip (connect through
+          // Hard ceiling on ONE chunk's ElevenLabs round trip (connect through
           // full body read). Found live in production testing: a stalled
           // connection with no error and no data ever arriving left a turn
           // hanging forever — no audio, no error event, nothing. Real
