@@ -51,7 +51,22 @@ router.post('/login', async (req, res) => {
     const ok = await verifyPassword(password, admin.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
     const { token, refreshToken } = issueTokenPair({ adminId: admin.id, name: admin.name, email: admin.email, role: 'masteradmin' });
-    res.json({ token, refreshToken, admin: { id: admin.id, name: admin.name, email: admin.email } });
+    res.json({ token, refreshToken, admin: { id: admin.id, name: admin.name, email: admin.email, profilePictureUrl: admin.profile_picture_url || null } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/masteradmin/profile-picture — upload/replace the signed-in
+// admin's own profile photo. Same blob-storage/multer pattern as company
+// logo uploads above; stored in the same public "branding-logos" container
+// (already proven, avoids a new Azure resource) under a dedicated prefix.
+router.post('/profile-picture', requireMasterAdmin, brandingUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file is required' });
+    const ext = (req.file.mimetype.split('/')[1] || 'png').replace('svg+xml', 'svg');
+    const blobName = `profile-pictures/${req.admin.adminId}-${Date.now()}.${ext}`;
+    const url = await uploadBuffer(req.file.buffer, blobName, req.file.mimetype);
+    await coreDb('platform_admins').where({ id: req.admin.adminId }).update({ profile_picture_url: url });
+    res.json({ profilePictureUrl: url });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

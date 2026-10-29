@@ -3014,4 +3014,172 @@ this frontend already centralizes requests through), add the standard intercepto
 **Not in scope / known limitation (backend, not something to work around in the frontend):** there's
 no "log out this device remotely" yet — a refresh token can't be individually revoked before it
 naturally expires in 30 days. Not a blocker for this fix; flagged here so it's not assumed to exist.
+
+## 52. AIDA Flows — a dedicated "Compare Datasets" config modal (replaces the generic form for this one node)
+
+**Status: backend tool (`compare_datasets`) exists and is merged — not yet verified end to end,
+because the generic step-config form has been blocking real testing (see the bugs below). This
+entry is purely frontend — no backend change needed to ship it.**
+
+**Why this exists:** the generic "Value / From earlier step" step-config form (#47/#48) works fine
+for nodes whose fields are each a single literal value or a single step-output reference. It breaks
+down for `compare_datasets`, which needs two ARRAY inputs (`leftRows`/`rightRows`, each a reference
+to an earlier step's output), two plain field-NAME strings (`leftKey`/`rightKey` — never a
+reference), an optional list of filter conditions, and an optional list of output-field mappings.
+Live-tested this twice and hit two real, confusing bugs: (1) the reference fields (`leftRows`/
+`rightRows`) weren't being included in the saved config at all, while the plain fields saved fine;
+(2) a later attempt attached the reference-picker mechanism to the WRONG fields (`leftKey`/
+`rightKey`, producing stray `leftKey_picker`/`rightKey_picker` keys with an empty, unresolved path),
+while `leftRows`/`rightRows` were still missing entirely. Rather than keep patching the generic form
+for this one oddly-shaped node, build one dedicated modal specifically for it.
+
+**Trigger:** when the step-config panel opens for a step whose `toolName === 'compare_datasets'`,
+show this dedicated modal INSTEAD of the generic auto-generated form. Every other node keeps using
+the generic form unchanged — this is a one-off special case, not a rebuild of the step-config system.
+
+**Layout — four plain-language sections, no raw JSON or `{{...}}` syntax visible anywhere:**
+
+1. **"Compare..."** — two pickers, "Left side" and "Right side," each a dropdown of this node's OWN
+   upstream connected steps (the same list already shown under "Runs after" — don't offer steps this
+   node isn't actually connected to). Next to each, a small "which list" field (pre-filled with a
+   best-guess default per known tool — e.g. default to whichever key in that tool's output isn't
+   `count`; fall back to an editable text box if the tool is unrecognized) — this is the array field
+   name (e.g. `payments`, `orders`). Internally these two pickers compose into the exact same
+   `leftRows`/`rightRows` reference strings (`{{step_<id>.output.<path>}}`) the backend already
+   expects — the user never sees or types that syntax.
+
+2. **"Match them by"** — two plain labeled text boxes, "Left field" and "Right field" (these save as
+   `leftKey`/`rightKey`), each with a short inline example (e.g. "e.g. orderId") so it's unambiguous
+   these are plain field NAMES, not references. **Structurally important: these two inputs must never
+   be reference-pickable** — no "From earlier step" toggle, no picker button, nothing that could
+   attach a `{{...}}` token to them. That's exactly what went wrong last time.
+
+3. **"Only keep matches where (optional)"** — a repeatable row: `[field name] [is / is not / greater
+   than / less than] [value]`, with a "+ Add condition" link below. Builds the `rightFilters` array
+   (`[{field, op, value}]`, `op` one of `eq`/`neq`/`gt`/`lt`) under the hood. Zero rows = omit the key
+   entirely.
+
+4. **"Include in the result (optional)"** — a repeatable row: `[Pull from: left/right] [field name] →
+   [show as: label]`, with a "+ Add field" link. Builds the `projectFields` array
+   (`[{as, from, field}]`). Zero rows = omit the key entirely (the tool already falls back to
+   merging every field from both sides when this is left out).
+
+5. **A small read-only preview** at the bottom of the modal showing the exact JSON that will actually
+   be saved for this step — not editable, just a sanity-check so a mistake is visible before saving
+   instead of silently producing an empty `{}` at run time like before.
+
+**Saved payload must be exactly** `{leftRows, rightRows, leftKey, rightKey, rightFilters?,
+projectFields?}` — matching `compareDatasets.js`'s real `inputSchema` field names precisely. No
+`_picker`-suffixed or other extra keys should ever be written — those were leftover internal UI
+state leaking into the saved config last time; this dedicated modal should own its own output
+construction cleanly instead of reusing the generic form's internals.
+
+**General pattern worth keeping in mind for later:** any future node whose inputs aren't simple
+single values (another multi-array or multi-condition tool) should get its own small dedicated modal
+the same way, rather than forcing it through the generic single-value form and hitting the same
+class of bug again.
+
+## 53. BUG FIX — #52's Compare Datasets modal still saves stale `leftKey_picker`/`rightKey_picker`
+
+**Status: #52 is built and mostly working (the live preview correctly shows real
+`leftRows`/`rightRows`/`leftKey`/`rightKey` values) — but live-tested saving it twice and both times
+the actual saved config still contained `leftKey_picker`/`rightKey_picker` keys with a stale,
+unresolved reference value (`{{step_..._output.}}`, empty path) — fields that don't exist anywhere
+in #52's own UI. This is a real, blocking bug, not a one-off mistake.**
+
+**Root cause:** the save handler is building its payload by spreading/merging onto whatever config
+was previously loaded for this step (from before the modal was rebuilt, or from an earlier bad
+save), then adding the new known fields on top — so any key that was EVER saved for this step in the
+past keeps getting carried forward forever, even though the current UI has no way to produce or
+show it anymore.
+
+**Fix:** when saving a `compare_datasets` step, build the config as a **brand-new object containing
+only** `{leftRows, rightRows, leftKey, rightKey, rightFilters, projectFields}` (omitting
+`rightFilters`/`projectFields` entirely when empty, per #52) — never spread the step's previously-
+loaded config into the new payload. Same applies when the modal first opens to edit an existing
+step: only read the six known field names back out of the stored config; don't carry any
+unrecognized key into the modal's local editing state at all, so there's nothing stale left to
+re-save even by accident.
+
+## 54. URGENT BUG FIX — the generic "From earlier step" picker never writes into the real field at all (affects EVERY node, not just Compare Datasets)
+
+**Status: this is the actual root cause behind #53 and several other live-tested failures this
+session — it is NOT specific to Compare Datasets. Confirmed on two completely ordinary nodes with
+simple single-value fields (Make Pdf, Send Email), which rules out anything about #52's dedicated
+modal. This is the single highest-priority fix in this whole batch — nothing that uses "From earlier
+step" on ANY node can actually work until this is fixed.**
+
+**Confirmed live** — a `make_pdf` step's saved config came back as:
+```json
+{ "title": "pdf", "title_picker": "{{step_..._output.}}", "text_picker": "{{step_..._output.}}" }
+```
+`text` and `rows` (both set to "From earlier step") are missing entirely — `title_picker`/
+`text_picker` are present instead, and nothing anywhere reads a `*_picker` key.
+
+A `send_email` step's saved config came back as:
+```json
+{
+  "name": "shubham", "subject": "test", "body": "test",
+  "to_picker": "{{step_..._output.}}", "name_picker": "{{step_..._output.}}",
+  "subject_picker": "{{step_..._output.}}", "body_picker": "{{step_..._output.}}",
+  "attachFileUrl_picker": "{{step_..._output.}}",
+  "confirmed": true, "includeAttachment": false
+}
+```
+`name`/`subject`/`body` saved correctly (left in "Value" mode) — but `to` and `attachFileUrl` (both
+set to "From earlier step") are missing entirely, and EVERY field — even the ones that already saved
+correctly — picked up a `_picker`-suffixed sibling key nobody reads.
+
+**Root cause:** the "From earlier step" picker widget is writing its own internal selection state
+into a shadow key (`<fieldName>_picker`) instead of writing the composed `{{step_<id>.output.<path>}}`
+string into the actual field name the backend reads (`to`, `text`, `rows`, `attachFileUrl`, etc.).
+The backend only ever resolves the real field names — a `*_picker` key is invisible to it. On top of
+that, the path portion inside these shadow values is itself empty (`.output.}}`, nothing between
+`output.` and the closing braces) — a second, compounding bug in the picker's own field-path input.
+
+**Fix:** wherever the "From earlier step" picker commits a value (on selecting a step, typing the
+field path, or both), it must write the final `{{step_<id>.output.<path>}}` string directly into the
+SAME key the "Value" toggle would have used (`to`, `attachFileUrl`, `text`, `rows`, `leftRows`, etc.)
+— never a separate `<fieldName>_picker` key. If a `_picker`-style key exists anywhere as internal
+component state for the picker's own re-rendering, it must never be included in the object actually
+sent to the save endpoint — only the real, backend-recognized field names belong in that payload.
+This single fix should resolve every "From earlier step" field across every node in Flows at once —
+re-test #52/#53's Compare Datasets node after this lands too, since it may turn out to be the same
+root cause there as well, on top of #53's stale-key issue.
 behavior changes — this is purely a grouping/labeling update.
+
+## 55. Profile picture upload (masteradmin) — backend already built, needs a UI
+
+**Status: backend done — `platform_admins` gained a `profile_picture_url` column
+(`patch_19_platform_admins_profile_picture.sql`, needs running), `POST /api/masteradmin/login`'s
+`admin` object now includes `profilePictureUrl`, and a new endpoint handles the upload. The Android
+app already has this wired into a Profile popup card; this entry is the matching web-side UI.**
+
+**Why this exists:** asked directly — a profile picture that's the same person across every surface
+(the Android app and the masteradmin web panel), not something set separately per device.
+
+**New endpoint:**
+```
+POST /api/masteradmin/profile-picture
+  multipart, field name "file" — PNG/JPEG/SVG, 5MB max (same constraints as the existing company-logo
+  upload already on this same page, reuse that same file-picker/validation pattern)
+  Auth: masteradmin Bearer token (same as every other masteradmin call)
+  → 200 { profilePictureUrl: "https://....blob.core.windows.net/branding-logos/profile-pictures/..." }
+  → 400 { error: "file is required" }
+```
+The uploaded URL is stored server-side against the signed-in admin's own row — no separate "save"
+step needed, the upload itself persists it. `POST /api/masteradmin/login`'s response now also
+includes `admin.profilePictureUrl` (null until first set) — store it alongside whatever this page
+already keeps from login (name/email), the same way.
+
+**What to build:** wherever the masteradmin panel shows the admin's own identity (a profile menu,
+settings page, or wherever is the natural home here), add:
+- The current profile picture (or a plain placeholder circle if `profilePictureUrl` is null) —
+  circular, clickable.
+- Clicking it opens a file picker (image only), and on pick, immediately POSTs the file to the new
+  endpoint — on success, update whatever local state/avatar display reads this value; on failure,
+  show the error inline, same pattern as the logo-upload failure handling already on this page.
+
+**Verification:** upload a real image, confirm the returned URL loads as a real picture (not a
+broken image), and confirm a fresh login afterward shows the SAME picture without re-uploading —
+proving it's actually persisted server-side, not just held in this session's local state.
