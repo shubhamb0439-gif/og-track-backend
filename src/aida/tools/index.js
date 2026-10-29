@@ -35,6 +35,7 @@ const MODULE_TOOL_FILES = [
   { tools: require('./webResearch'), category: 'Web Research' },
   { tools: require('./dataViz'), category: 'Data Visualization' },
   { tools: require('./actions/makePdf') },
+  { tools: require('./actions/compareDatasets') },
 ];
 
 let registered = false;
