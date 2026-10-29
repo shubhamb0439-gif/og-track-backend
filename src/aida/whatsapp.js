@@ -85,9 +85,15 @@ async function sendWhatsAppDocument(to, buffer, filename, mimeType, caption) {
         document: { id: mediaId, filename, caption: caption || undefined },
       }),
     });
-    if (!res.ok) console.error('[whatsapp] document send failed:', res.status, await res.text());
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('[whatsapp] document send failed:', res.status, errText);
+      return { success: false, error: `${res.status} ${errText}` };
+    }
+    return { success: true };
   } catch (e) {
     console.error('[whatsapp] document send threw:', e.message);
+    return { success: false, error: e.message };
   }
 }
 

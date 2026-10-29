@@ -34,6 +34,7 @@ const MODULE_TOOL_FILES = [
   { tools: require('./devops'), category: 'Developer Tools' },
   { tools: require('./webResearch'), category: 'Web Research' },
   { tools: require('./dataViz'), category: 'Data Visualization' },
+  { tools: require('./actions/makePdf') },
 ];
 
 let registered = false;

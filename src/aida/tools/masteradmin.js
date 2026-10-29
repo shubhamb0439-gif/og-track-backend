@@ -482,8 +482,11 @@ module.exports = [
       "Sends a real freeform WhatsApp message to a saved contact by name (or to a number given alongside a name, which " +
       "saves that pairing for next time — same save-on-first-use pattern as send_email), optionally forwarding the " +
       "file the human most recently sent AIDA in this conversation (set includeAttachment: true — same mechanism as " +
-      "send_email's includeAttachment). text may be omitted if includeAttachment is true and the file should go with " +
-      "just a caption-less send, but at least one of text/includeAttachment is required. SAFETY — this is a real, " +
+      "send_email's includeAttachment; chat only, does NOT work from a Flow). To attach a file from an earlier " +
+      "step's result instead (e.g. make_pdf's or generate_document's fileUrl, or any other real URL), set " +
+      "attachFileUrl to that URL — the real bytes are downloaded and attached, works in both chat and Flows. text " +
+      "may be omitted if includeAttachment/attachFileUrl provides a file and it should go with just a caption-less " +
+      "send, but at least one of text/includeAttachment/attachFileUrl is required. SAFETY — this is a real, " +
       "visible action, confirmed first for anything that matters: a SHORT, casual message (roughly a sentence or " +
       "two, no attachment, nothing sensitive like payments/legal/confidential topics) sends IMMEDIATELY on the " +
       "first call — no need to preview or ask first, exactly like a human firing off a quick \"hi\" themselves. " +
@@ -501,13 +504,14 @@ module.exports = [
         name: { type: 'string', description: "The contact's name — resolved against saved contacts if phoneNumber is omitted." },
         phoneNumber: { type: 'string', description: 'Full number with country code (e.g. "919845009748") — only needed the first time, or to update a saved number.' },
         text: { type: 'string' },
-        includeAttachment: { type: 'boolean', description: 'Set true to forward the file the human most recently sent AIDA in this conversation.' },
+        includeAttachment: { type: 'boolean', description: 'Set true to forward the file the human most recently sent AIDA in this conversation. Chat only — never works from a Flow.' },
+        attachFileUrl: { type: 'string', description: "A direct URL to a real file to attach (e.g. an earlier step's fileUrl) — downloaded and attached as a real file. Works in both chat and Flows." },
         confirmed: { type: 'boolean', description: 'Only set true after the user has explicitly confirmed sending, in a later message.' },
       },
       required: ['name'],
     },
-    async handler(context, { name, phoneNumber, text, includeAttachment, confirmed }) {
-      if (!text && !includeAttachment) return { error: 'Need either text or includeAttachment: true.' };
+    async handler(context, { name, phoneNumber, text, includeAttachment, attachFileUrl, confirmed }) {
+      if (!text && !includeAttachment && !attachFileUrl) return { error: 'Need at least one of text, includeAttachment: true, or attachFileUrl.' };
 
       let resolvedNumber = phoneNumber ? contacts.normalizeWhatsAppNumber(phoneNumber) : null;
       if (!resolvedNumber) {
@@ -522,6 +526,20 @@ module.exports = [
       if (includeAttachment) {
         attachment = pendingAttachments.getPending(context);
         if (!attachment) return { error: "There's no recently-attached file in this conversation to forward — ask the human to resend it." };
+      } else if (attachFileUrl) {
+        try {
+          const res = await fetch(attachFileUrl);
+          if (!res.ok) return { error: `Could not download the file to attach (HTTP ${res.status}): ${attachFileUrl}` };
+          const buffer = Buffer.from(await res.arrayBuffer());
+          const urlFilename = decodeURIComponent(attachFileUrl.split('/').pop().split('?')[0] || '');
+          attachment = {
+            filename: urlFilename || 'attachment',
+            mimeType: res.headers.get('content-type') || 'application/octet-stream',
+            buffer,
+          };
+        } catch (e) {
+          return { error: `Failed to download attachFileUrl: ${e.message}` };
+        }
       }
 
       if (!confirmed && !isTrivialMessage({ text, hasAttachment: !!attachment })) {
@@ -544,7 +562,10 @@ module.exports = [
         }
       }
       if (attachment) {
-        await sendWhatsAppDocument(resolvedNumber, attachment.buffer, attachment.filename, attachment.mimeType, text ? undefined : 'Sent via AIDA');
+        const docResult = await sendWhatsAppDocument(resolvedNumber, attachment.buffer, attachment.filename, attachment.mimeType, text ? undefined : 'Sent via AIDA');
+        if (!docResult.success) {
+          return { error: `WhatsApp document send failed: ${docResult.error}` };
+        }
       }
       return { success: true, to: name, phoneNumber: resolvedNumber, forwardedFile: attachment?.filename || null };
     },
