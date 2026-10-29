@@ -103,6 +103,17 @@ async function createFlow({ name, description, triggerType, triggerConfig, creat
  * old step_order remains purely for the frontend's visual layout.
  */
 async function replaceSteps(flowId, steps) {
+  // Same FK-safe ordering deleteFlow() already needed, for the same reason:
+  // ai_flow_run_steps.step_id hard-references ai_flow_steps(id), so once a
+  // flow has been run even once, saving an edit (which always replaces every
+  // step with a freshly-generated id — see this function's own doc comment)
+  // would otherwise violate that FK on the DELETE below. Those old run-step
+  // rows are about a step definition that no longer exists after this edit
+  // anyway (its tool/config may have changed), so their per-step detail is
+  // discarded here; each run's own summary row (ai_flow_runs — status,
+  // triggered_by, started/finished times) is untouched and stays in history.
+  const oldStepIds = (await coreDb('ai_flow_steps').where({ flow_id: flowId }).select('id')).map((r) => r.id);
+  if (oldStepIds.length) await coreDb('ai_flow_run_steps').whereIn('step_id', oldStepIds).delete();
   await coreDb('ai_flow_steps').where({ flow_id: flowId }).delete();
   const ids = steps.map(() => newId('flowstep'));
   for (let i = 0; i < steps.length; i++) {
