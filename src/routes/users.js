@@ -1,7 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const config = require('../config');
-const { hashPassword, verifyPassword, issueToken, requireAuth } = require('../utils/auth');
+const { hashPassword, verifyPassword, issueTokenPair, verifyRefreshToken, requireAuth } = require('../utils/auth');
 const { matchTodayCelebrations } = require('../aida/celebrations');
 const { sendEmail } = require('../utils/email');
 
@@ -124,8 +124,37 @@ router.post('/login', async (req, res) => {
     if (user.status === 'pending') return res.status(403).json({ error: 'Account pending Super Admin approval.' });
     if (user.status === 'rejected') return res.status(403).json({ error: 'Account request was rejected.' });
 
-    const token = issueToken({ userId: user.id, role: user.role, slug: req.company.slug });
-    res.json({ token, user: stripPassword(user) });
+    const { token, refreshToken } = issueTokenPair({ userId: user.id, role: user.role, slug: req.company.slug });
+    res.json({ token, refreshToken, user: stripPassword(user) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/:slug/users/refresh ────────────────────────────────────────
+// Fixes the "forced to log in again once the access token expires" issue —
+// mints a fresh access token from a still-valid refresh token, no password
+// needed. Re-checks the user still exists and is active in THIS company's
+// DB (not just trusting the refresh token's own payload) — a user deleted
+// or suspended after their refresh token was issued must not be able to
+// silently re-authorize forever just because the token hasn't expired yet.
+router.post('/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (!refreshToken) return res.status(400).json({ error: 'refreshToken is required' });
+    let payload;
+    try {
+      payload = verifyRefreshToken(refreshToken);
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired refresh token — please log in again.' });
+    }
+    if (payload.slug !== req.company.slug) {
+      return res.status(403).json({ error: 'This refresh token does not belong to this company.' });
+    }
+    const user = await req.db('users').where({ id: payload.userId }).first();
+    if (!user || user.status !== 'active') {
+      return res.status(401).json({ error: 'This account is no longer active — please log in again.' });
+    }
+    const { token, refreshToken: newRefreshToken } = issueTokenPair({ userId: user.id, role: user.role, slug: req.company.slug });
+    res.json({ token, refreshToken: newRefreshToken });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

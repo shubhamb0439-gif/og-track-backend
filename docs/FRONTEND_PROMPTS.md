@@ -2516,3 +2516,502 @@ better way... something like that" / "beautiful"):
 
 **Not in scope for this pass:** click-through/drill-down interactivity beyond hover tooltips, and
 exporting the chart as an image — both real candidates for later, not asked for now.
+
+## 42. AIDA — "Skills" panel in the "+" menu (masteradmin only)
+
+**Status: backend built 2026-10-26/27 — this entry is a pure frontend build against endpoints that
+already exist and work.**
+
+**Why this exists:** mirrors Claude's own Skills UI — a masteradmin-only way to see everything AIDA
+can currently do, and to describe a brand-new capability and have AIDA build it. **Scope,
+confirmed explicitly: masteradmin only** — do not add this to the tenant-facing AIDA chat.
+
+```
+GET /api/masteradmin/aida/tools
+  → 200 { tools: [{ name: "masteradmin_sitara_get_dashboard", description: "...", category: "Sitara Drapes" }, ...] }
+  Already existed before this entry (used for an older "what can you help with?" empty state) — now
+  also carries a `category` field per tool, added specifically for this panel (e.g. "Sitara Drapes",
+  "CRM", "Coding Agent", "Zoho Books", "Documents", "Email & Contacts", "Companies", "Charts",
+  "Memory", "Messaging", "Other"). Call this to populate the browse view — read-only, no toggling.
+
+POST /api/masteradmin/aida/skills/propose
+  body: { description: string }
+  → 200 { jobId: "job_...", status: "queued" }
+  "+ New skill": a text box where the master admin describes what they want AIDA to be able to do,
+  in their own words (e.g. "let AIDA send a Slack DM when a job fails"). Submitting this creates a
+  job that goes through AIDA's existing plan-then-build pipeline: it lands in the SAME masteradmin
+  Job panel you already have built (GET /api/masteradmin/aida/jobs, POST .../jobs/:id/approve|
+  reject) — no new job-tracking UI needed, it's indistinguishable from any other job once created.
+  The job's own plan/progress/approval flow is identical to every other job kind already shown
+  there (e.g. the bug/feature report pipeline, #31-#33) — just reuse that existing rendering.
+```
+
+**What to build:**
+- A "Skills" entry in the "+" (attachment/actions) menu of the masteradmin chat, opening a panel
+  with two parts:
+  1. **Browse** (default view): call `GET /tools`, group the list by `category`, render as a
+     simple scannable list (category headers, tool name + description underneath — the raw tool
+     names are developer-ish, e.g. `masteradmin_sitara_get_dashboard`; consider a light
+     humanization pass like replacing underscores with spaces and dropping the `masteradmin_`
+     prefix for display, but that's a styling choice, not a data contract).
+  2. **"+ New skill"** (a button/tab within the same panel): a text box + submit button calling
+     `POST /skills/propose`. On success, close the panel (or show a brief confirmation) and let the
+     existing Job panel pick it up normally — don't build a second progress UI for this.
+- No live/real-time element needed in the Skills panel itself beyond the initial `GET /tools` call
+  — everything about tracking a proposed skill's progress already happens in the existing Job
+  panel, which already has its own live updates.
+
+**A second, related but separate capability also shipped alongside this** (not part of the Skills
+panel UI itself, but worth knowing about since it surfaces through the SAME Job panel): AIDA can
+now generate real PowerPoint/Excel/Word/PDF files via a new `generate_document` tool, invoked
+conversationally (e.g. "make me a pptx about X") rather than through this panel. A real one can
+take **over two minutes** — it's a background job like any other, and once complete, its result
+carries a `fileUrl` which (same as the chart/company-link work in #40/#41) will already show up as
+a real URL in AIDA's own reply text once it reports back — no special-case rendering needed for
+this specifically, beyond whatever the chat already does with a plain URL in a message.
+
+**Not in scope for this pass:** editing/disabling an existing skill from this panel (browse +
+propose-new only), and any UI for Anthropic-native custom Skill uploads (a different, not-yet-built
+mechanism — see the backend plan's own notes on this if it comes up later).
+
+## 43. AIDA model picker — correct spelling, highlight the cheapest, capability labels
+
+**Status: pure frontend — the underlying data is already correct, this is styling/copy only.**
+
+**Why this exists:** post-demo feedback. Checked against the real, live `config.aida.models` list
+before writing this (not assumed) — the model label is already exactly **"GPT-4o Mini"**, so
+nothing needs fixing in the data itself. "Correct the spelling to OpenAI" refers to wherever the
+PROVIDER name renders in the picker UI, not the model list.
+
+**What to build, all in the existing provider → model dropdown:**
+- Fix "OpenAi"/"openai"/however the provider label currently renders to read **"OpenAI"** correctly
+  capitalized, wherever it appears in the picker.
+- Highlight **GPT-4o Mini** in green (or a green accent/badge) as the cheapest option — it's
+  already in the list returned by `GET /aida/models`, just needs a visual callout.
+- Every model's description/supporting text renders in *italics*, **except** the cheapest model's
+  (GPT-4o Mini) description, which stays normal weight/style — a deliberate visual exception, not
+  an oversight.
+- Add three capability labels — **Technical**, **General conversation**, **Communication &
+  writing** — shown near the picker (e.g. as small tags/sections), with **Opus 5**
+  (`claude-opus-5`, confirmed live and currently selectable) marked as the preferred model across
+  all three. This is a styling/labeling layer on top of the existing model list — it doesn't change
+  which models are selectable or how selection is sent to the backend.
+
+**Not in scope:** changing the actual selectable model list, or how a selection is transmitted —
+`POST /chat`'s `provider`/`model` fields are unchanged.
+
+## 44. "AIDA Job" → "Job Card" — rename
+
+**Status: pure frontend copy change — nothing on the backend is named this.**
+
+**Why this exists:** post-demo feedback. Confirmed directly: job `kind` values
+(`dev_repo_fix`, `create_module`, `generate_document`, etc.) are internal slugs that were never
+user-facing text — there is nothing backend-side to rename, and no API shape changes here.
+
+**What to build:** find every place the frontend currently renders the literal words "AIDA Job" —
+menu labels, panel headings, buttons, empty states — and change the displayed text to "Job Card".
+Purely a find-and-replace of UI copy; the underlying `GET /jobs`, `POST /jobs/:id/approve|reject`
+endpoints and their data shapes are completely unchanged.
+
+## 45. App-wide icon system — minimal line icons + real connector logos
+
+**Status: pure frontend/design — a genuinely app-wide pass, bigger than a typical single-feature
+prompt. Confirmed direction with the user before writing this (not guessed):**
+- **General icon style → minimal line icons** (Lucide/Feather-style): thin, consistent stroke
+  weight, single color, no gradients/bevels/multi-color cartoon style — the look used by Linear,
+  Notion, Stripe, and most premium B2B SaaS today.
+- **OAuth connector icons (Google Drive/GitHub/Notion/Slack, #36's connectors feature) → each
+  provider's REAL official logo**, not a generic icon — these need brand recognition specifically,
+  so they're the one deliberate exception to "everything is a single-color line icon." Slack's own
+  mark is itself multi-colored even in minimal contexts — keep it as-is rather than forcing it to
+  one color, since that IS their real brand mark.
+
+**Why this exists:** post-demo feedback ("make all icons look premium not cartoonish"), confirmed
+to mean the WHOLE app's icon set, not just one screen.
+
+**What to build:**
+- Adopt **Lucide** (lucide.dev — MIT-licensed, large icon set, consistent 24×24 grid, 2px default
+  stroke, tree-shakeable) as the app's single icon library for every generic UI icon: nav items,
+  menu entries, buttons, status indicators, empty states, the Skills panel's own icons, etc. If a
+  different icon library is already a dependency and covers the same minimal-line aesthetic, reuse
+  it instead of adding a second one — the STYLE (thin, consistent, single-color) matters more than
+  the specific package, but don't end up with two icon libraries doing the same job.
+- Default icon color: neutral ink/gray (whatever the app's existing text-soft color token is);
+  active/selected state: AIDA's own brand red (`#B7252D`, already used for the AIDA badge and the
+  chart work in #41) — gives selected states a consistent, on-brand accent instead of each screen
+  picking its own.
+- For the 4 OAuth connector buttons specifically: source each provider's real, current official SVG
+  mark (Simple Icons — simpleicons.org — is a clean, practical source for all 4: Google Drive,
+  GitHub, Notion, Slack) and render those at a consistent size alongside the connect/disconnect
+  button, rather than a generic cloud/plug/lock icon standing in for "integration."
+- Since this is genuinely app-wide, rather than hand-converting every icon in one pass: inventory
+  every current icon usage first (search the frontend for whatever icon mechanism is currently in
+  use — emoji, inline SVGs, an existing icon component), then do the swap systematically through a
+  single shared icon component/wrapper if one doesn't already exist, so any NEW icon added later
+  automatically stays consistent with this system instead of drifting back to ad-hoc choices.
+
+**Not in scope for this pass:** animated/micro-interaction icon states (e.g. a spinner replacing an
+icon mid-action) beyond whatever already exists — this is about the icons' visual style/consistency,
+not adding new interaction behavior.
+
+## 46. Chat interaction polish — thinking animation + response popup
+
+**Status: pure frontend — no backend changes, endpoints already exist for everything underneath.**
+
+**Why this exists:** post-demo feedback, the two purely-cosmetic pieces of that ask (the mic-in-
+input-field part is already covered by the existing `POST /voice-input` endpoint and just needs UI
+placement, not a new prompt).
+
+**What to build:**
+- **Thinking animation:** while AIDA is generating a reply (the window between sending a message
+  and the first token/response arriving), show a clear animated "thinking" state in the chat —
+  whatever fits the app's existing motion language, as long as it unambiguously signals "working on
+  it," not just a static spinner that could read as frozen.
+- **Response popup:** once AIDA's reply is ready, optionally surface it in a dismissible popup
+  originating from the AIDA interface (distinct from the existing inline URL/chart-preview-card
+  mechanism, which stays as-is for links/charts embedded within a normal reply) — the user can close
+  it manually, and there's a setting to turn this popup behavior on/off entirely (defaulting to
+  whichever the frontend judges least disruptive, e.g. off, showing replies inline as today, unless
+  there's an existing settings panel convention to follow instead).
+
+**Not in scope for this pass:** the long-running-response notice card + email-when-ready (that
+needs a scoping decision on which turns qualify before it's buildable — separate, larger piece, not
+bundled into this purely-cosmetic prompt).
+
+## 47. AIDA Flows — masteradmin-only workflow automation builder (n8n-style)
+
+**Status: backend built 2026-10-27 — linear step-chain execution engine, three trigger types,
+full CRUD, all wired and loading cleanly. This entry is the (substantial) frontend build.**
+
+**Why this exists:** a direct follow-up to the Skills panel (#42) — "something like n8n, with the
+ability to build custom nodes if one isn't available." **Masteradmin only**, same as #42 — add a
+third tab, **Flows**, alongside Browse / + New skill in that same panel, not a separate menu entry.
+
+**What a "flow" actually is:** one trigger + an ordered, LINEAR chain of steps (no branching in v1
+— confirmed scope). Each step calls one of AIDA's own existing tools (the "node library" — the
+SAME tools already available in masteradmin chat, ~65 of them, each with a real JSON Schema for its
+inputs). A step's config can reference an earlier step's actual output with
+`{{step0.output.someField}}` syntax, resolved by the backend at run time — there is no
+expression/scripting language beyond that simple field lookup.
+
+```
+GET /api/masteradmin/aida/flows/available-nodes
+  → 200 { nodes: [{ name: "masteradmin_list_companies", description: "...", inputSchema: {...} }, ...] }
+  The node palette. Approval-gated/destructive tools (anything with a `confirmed` field in its
+  schema — e.g. dev_approve_job) are already excluded server-side; whatever comes back here is
+  safe to drop into a flow.
+
+GET /api/masteradmin/aida/flows
+  → 200 { flows: [{ id, name, description, triggerType, triggerConfig, status, createdAt, ... }] }
+  List view — note NO `steps` here (keep the list light); fetch one flow's full detail separately.
+
+POST /api/masteradmin/aida/flows
+  body: { name, description?, triggerType: "manual"|"schedule"|"webhook",
+          triggerConfig?: { everyMinutes?: number } | { dailyAt?: "HH:MM" },  // omit entirely for manual; omit for webhook too — the secret is minted server-side
+          steps: [{ toolName: string, config: object }, ...] }
+  → 200 { flow: {..., steps: [...] } }
+  → 400 if any toolName isn't in available-nodes, or steps is empty.
+  Creating a "webhook" flow — do NOT send a trigger config; the server mints a real random secret
+  and the created flow's `triggerConfig.webhookSecret` comes back in the response — show the full
+  callable URL once, right after creation: POST https://<backend-host>/api/aida/flows-webhook/<flowId>/<webhookSecret>
+
+GET /api/masteradmin/aida/flows/:id          → 200 { flow: {..., steps: [...] } }
+PUT /api/masteradmin/aida/flows/:id          body: any of { name, description, triggerConfig, status: "active"|"paused", steps }
+DELETE /api/masteradmin/aida/flows/:id       → 200 { ok: true }
+
+POST /api/masteradmin/aida/flows/:id/run
+  body: { testTriggerPayload?: object }
+  → 200 { runId, status: "running" }
+  "Test now" button — show this on EVERY flow regardless of its configured triggerType (schedule/
+  webhook/whatsapp/email all run through this exact endpoint too, not just manual-trigger flows).
+  Returns immediately, does NOT wait for the flow to finish (a step can genuinely take minutes, e.g.
+  generate_document) — poll run status separately. For a whatsapp/email-trigger flow specifically:
+  if any step references {{trigger.output.x}}, prompt for mock test data first (e.g. a small form —
+  "from" + "body" for whatsapp, "from" + "subject" + "body" for email) and send it as
+  `testTriggerPayload` so the test run exercises those steps with realistic values instead of
+  nothing — a flow with no {{trigger...}} references doesn't need this prompt at all, just run it.
+
+GET /api/masteradmin/aida/flows/:id/runs     → 200 { runs: [{ id, status, triggeredBy, startedAt, finishedAt, errorMessage }] }
+GET /api/masteradmin/aida/flows/runs/:runId  → 200 { run: {...}, steps: [{ stepId, status, input, output, errorMessage, startedAt, finishedAt }] }
+  Run history + a real per-step trace for debugging ("step 2 got THIS input, returned THIS, step 3
+  never ran because step 2 failed").
+```
+
+**What to build:**
+1. **Flows tab** (in the existing Skills panel): a list of existing flows (name, trigger type badge,
+   active/paused toggle, last-run status) with a "+ New flow" button.
+2. **Flow builder**: a visual canvas or a simple ordered list (your call on visual sophistication —
+   a vertical list of step cards with drag-to-reorder is a perfectly reasonable v1, doesn't have to
+   be a full node-graph canvas) where each step is: pick a tool from `available-nodes` (searchable by
+   name/description/category — same categories as #42's Skills browse), then a config form generated
+   FROM that tool's real `inputSchema` (same JSON-Schema-driven form-generation concept needed for
+   Skills' own node config). For any field, allow typing a literal value OR picking "use output from
+   step N" (a dropdown of earlier steps + a field-path input) — that's what becomes the
+   `{{stepN.output.x}}` string sent to the backend. **A text field can mix literal text with ONE OR
+   MORE `{{...}}` references** — e.g. `"Today: {{step0.output.presentCount}} present, {{step0.output.absentCount}} absent"`
+   resolves to a real composed sentence, not just a bare value (confirmed working 2026-10-28). Only
+   a field whose ENTIRE value is a single `{{...}}` reference, with nothing else around it, gets the
+   raw typed value back (number/array/object) instead of a string — relevant if a step needs to pass
+   a whole object/array from an earlier step into another tool's argument, not just build a message.
+   **Skip rendering a `confirmed` field if a tool's schema has one** (`message_contact`/`send_email`/
+   `reply_to_email` all do) — the backend always forces this to `true` for these specific tools when
+   called from a flow (your own step config IS the confirmation), so a visible checkbox for it would
+   be confusing and do nothing either way. **Also skip `includeAttachment` on `message_contact`/
+   `send_email`** specifically — it means "attach whatever file a human just sent AIDA in this live
+   chat," which can never apply to an unattended flow; the backend force-clears it to `false`
+   regardless of what's sent, so don't offer it as a step option for these two tools at all.
+   Also expose `{{trigger.output.path}}` as a third config option (alongside literal value / step
+   output) for flows with a `whatsapp`/`email` trigger — e.g. a field-path input for
+   `trigger.output.from` or `trigger.output.body` so a step can act on what actually arrived.
+3. **Trigger picker** when creating a flow: Manual / Schedule (every N minutes, or daily at a
+   specific time) / Webhook (shows the generated secret URL once, with a copy button — it is NOT
+   retrievable again after creation unless you also expose `triggerConfig` on the detail GET, which
+   you should, but still only show the full callable URL prominently once, since it's a bearer
+   secret).
+4. **Run history view**: per flow, a list of past runs (status, when, how triggered) — clicking one
+   shows the real step-by-step trace (what each step received, what it returned, which step failed
+   if any) — this is the main debugging surface for "why didn't my flow do what I expected."
+5. **"Build a custom node" entry point**: when building a step, if the desired action isn't in
+   `available-nodes`, a link/button to the SAME "+ New skill" flow already built in #42
+   (`POST /skills/propose`) — describe it, it goes through AIDA's existing plan-then-build pipeline.
+   Once that's approved and deployed (a real build-and-deploy cycle, not instant), the new tool
+   appears in `available-nodes` automatically and can be added to the flow as a normal step — no
+   special "pending node" UI needed for this gap.
+
+**Not in scope for this pass:** branching/conditional steps, loops, and any visual node-graph/canvas
+sophistication beyond what's needed to configure a straight linear chain — all deferred, confirmed
+as v1 scope on the backend side already.
+
+## 48. AIDA Flows step config — two real fixes from live testing (2026-10-28)
+
+**Status: backend fixed and verified live (a real attendance-summary-by-email flow was built and
+run end to end). This entry is the small frontend follow-up — one field to hide, one optional UX
+improvement, nothing else in #47 changes.**
+
+**Why this exists:** the Flows step-config form (#47) is already built and in use — live-tested it
+by building a real flow (Manual trigger → `masteradmin_attendance_get_daily_summary` →
+`send_email`) and hit two real bugs, both now fixed backend-side. One of them needs a small form
+change; the other is optional.
+
+1. **Hide `includeAttachment` entirely for `message_contact` and `send_email` steps** (required —
+   the current form shows it, per screenshot, and it should never have been offered for these two
+   tools in a flow). This field means "attach the file a human just sent AIDA in this live chat" —
+   there is no live chat session in an unattended flow run, so it can never do anything. The backend
+   now force-clears it to `false` regardless of what's sent, so leaving the checkbox visible is
+   actively misleading (it looks like a real option; it silently does nothing). `reply_to_email`
+   doesn't have this field at all, nothing to change there.
+
+2. **Optional UX improvement — insert a reference INTO a text field, not just replace it.** Backend
+   now supports mixing literal text with one or more `{{stepN.output.x}}` / `{{trigger.output.x}}`
+   references in the SAME field — e.g. `"Today: {{step0.output.presentCount}} present, {{step0.output.absentCount}} absent"`
+   resolves to a real composed sentence (confirmed live). Today's "Value / From earlier step" toggle
+   looks like an either/or choice (type a literal value, OR pick one whole step-output reference) —
+   if that's genuinely how it works, a user can still get a composed message today by just typing
+   the `{{...}}` syntax directly into the "Value" text box by hand (no frontend change strictly
+   required for this to work). But a better experience would let the "From earlier step" picker
+   INSERT a `{{stepN.output.x}}` token at the cursor position inside an existing text value, so
+   building a message like the one above doesn't require hand-typing the exact reference syntax.
+   Purely a nice-to-have — skip it if it's not a quick addition.
+
+**One more thing, still an open question from earlier, not yet decided — not a required change:**
+the `confirmed` field for `message_contact`/`send_email`/`reply_to_email` is currently shown with a
+custom "⚠️ confirmed" warning explaining it should be left on. It's functionally harmless (the
+backend always forces it to `true` regardless of this toggle's state), but per #47's original spec
+it could just be hidden entirely instead, same as `includeAttachment` above. Your call whether
+that's worth doing — not blocking anything either way.
+
+## 49. AIDA Flows v2 — friendly company picker + real DAG/branching canvas (NEW, 2026-10-28)
+
+**Status: backend built. One SQL patch (`patch_18_ai_flows_dag.sql`) is written but NOT YET applied
+to the live database — the DAG-specific parts of this (saving/loading `dependsOn`, the `skipped` run
+status) won't work correctly until that's run. The rest (Part 1, the company picker) has no backend
+dependency and can ship independently/first.**
+
+**Why this exists:** a follow-up to #47 — three real asks: stop typing a raw company slug by hand
+when configuring a cross-tenant step, make a real branching flow possible (not just a straight
+line), and let AIDA build brand-new actions it doesn't have yet with less ceremony (that third part
+is backend-only — the existing "+ New skill" flow from #47/#42 already covers it from the frontend's
+side, nothing new to build there).
+
+### Part 1 — Friendly company picker (small, no new endpoint)
+
+Every `masteradmin_*` cross-tenant tool's `inputSchema` has a property literally named
+`companySlug` (confirmed: this is injected identically by one shared wrapper for all ~27 of these
+tools — the property name never varies). Today the step-config form renders this as a free-text
+box, forcing you to know/type the exact slug (e.g. "sitara-drapes") by hand.
+
+**Fix:** whenever the step-config form generator sees a property named exactly `companySlug` in
+ANY tool's schema (check the property name, not the tool name — this works for every cross-tenant
+tool automatically, present and future), render a real dropdown of company names instead of a text
+box. Fetch the list from the already-existing `GET /api/masteradmin/companies` (same data the
+Skills panel/company-switcher already use) — show each company's name, submit its `slug` as the
+field's value. No other `inputSchema` property needs this special-case treatment; only the exact
+name `companySlug`.
+
+### Part 2 — "Build a custom action" — no frontend change needed
+
+Confirmed: this is entirely a backend convention (new AI-built tools now land in
+`src/aida/tools/actions/` and can auto-merge without a human approval step when their own tests pass
+and the change stays narrowly scoped to that folder). The existing "+ New skill" entry point (#47,
+item 5 / #42) already covers the frontend side completely as-is — nothing to add here. The only
+visible difference: some newly-built actions will now show up in `available-nodes` noticeably
+faster (no approval wait), which needs no UI change to work.
+
+### Part 3 — Real branching (DAG), not just a straight line
+
+The backend now supports a step depending on ANY number of earlier steps (not just "the one right
+before it"), and multiple steps can share zero dependencies, meaning they run in PARALLEL
+automatically (e.g. a "Sitara orders" step and a "Razorpay payments" step, both independent root
+steps, both start at the same time) — then a later step (e.g. "Compare orders vs payments") can
+depend on BOTH of them finishing, reading both of their outputs. This needs a real graph UI now, not
+the vertical reorderable list #47 described as sufficient for a strictly linear v1.
+
+**Recommended:** adopt a node-graph canvas library — **React Flow** is purpose-built for exactly
+this (draggable nodes, connectable edges, pan/zoom, multiple connections in and out of a node,
+natively) — rather than hand-rolling connection-drawing logic.
+
+**How a connection maps to the data model:** dragging a connection FROM one step's output handle TO
+another step's input handle is literally how that second step's dependency gets set — there's no
+separate "pick your dependencies" dropdown to build. When you submit the flow, each step is just its
+position in the `steps` array plus a `dependsOn` array of OTHER steps' ARRAY INDICES (not real ids —
+real ids don't exist yet for steps you haven't saved), e.g.:
+
+```
+POST /api/masteradmin/aida/flows
+body: {
+  name: "...", triggerType: "schedule", triggerConfig: {...},
+  steps: [
+    { toolName: "masteradmin_sitara_get_orders", config: {...} },        // index 0 — no dependsOn = root, runs immediately
+    { toolName: "masteradmin_get_razorpay_payments", config: {...} },    // index 1 — no dependsOn = ALSO a root, runs in parallel with 0
+    { toolName: "compare_orders_vs_payments", config: {...}, dependsOn: [0, 1] },  // index 2 — waits for BOTH 0 and 1
+    { toolName: "generate_document", config: {...}, dependsOn: [2] },
+    { toolName: "send_email", config: {...}, dependsOn: [3] },
+  ]
+}
+```
+
+Omitting `dependsOn` entirely on a step (vs. sending an explicit empty array) matters: a step with
+NO `dependsOn` field at all defaults to the OLD behavior (depends on whatever step comes right
+before it in the array — this is what keeps every existing, already-saved flow working exactly as
+before without needing to be rebuilt). Once you're building with the new graph canvas, **always
+send an explicit `dependsOn` array for every step** (use `[]` for a deliberate parallel root) rather
+than omitting it, so there's no ambiguity about what the canvas actually drew.
+
+**Reading a flow back** (`GET /flows/:id`): each step in the response now includes
+`dependsOnStepIds` — an array of other steps' REAL ids (not indices) once persisted. Use these real
+ids to redraw the saved connections on the canvas (map each id back to that step's position/node).
+
+**Referencing another step's output** — two forms both work, use the real step id form going
+forward: the OLD `{{step0.output.fieldPath}}` (positional — still works for simple linear chains,
+where "step 0" is unambiguous) and the NEW `{{step_<realStepId>.output.fieldPath}}` (stable,
+branching-safe — always refers to the exact same step no matter how the graph is arranged). When a
+config form lets you pick "use output from an earlier step," show the step's real node LABEL (e.g.
+the tool's friendly name, "Sitara Orders," "Razorpay Payments") rather than "Step 2" — a position
+stops being a meaningful human-facing concept once a flow branches — and insert the `{{step_<id>...}}`
+form under the hood. Only an upstream step (one actually connected via an edge leading into this
+step, directly or transitively) should be offered as a reference source — don't offer every step in
+the whole flow regardless of connection.
+
+**Run trace view** (`GET /flows/runs/:runId`): each step's status can now also be `"skipped"`
+(new, alongside the existing `"completed"`/`"failed"`) — shown when an upstream dependency failed or
+was itself skipped, so that step never ran at all. Render it visibly distinct from both success and
+failure (e.g. a greyed-out/dashed state) — a run can be a genuine mix of completed, failed, AND
+skipped steps in the same run (independent branches that don't depend on a failure keep completing
+normally), so the trace view needs to show all three states clearly, not just a binary pass/fail per
+step.
+
+**Not in scope for this pass:** conditional/branching logic based on a step's OUTPUT value (e.g.
+"only run this step if X > 10") — today's branching is purely about WHICH steps feed INTO which
+others, not conditional execution paths.
+
+## 50. Real tool category/subcategory (replaces #42's guessed categories) — SUPERSEDES PART OF #42
+
+**Status: backend done, 2026-10-28.** The flat ~66-tool list (Skills browse panel + Flows node
+palette, both backed by the same tool registry) was genuinely confusing to scan. `category` used
+to be guessed from each tool's NAME (a `categorizeToolName()` heuristic in the backend) — that
+heuristic is now gone entirely, replaced with real metadata declared directly on every tool
+(`category`, and now also `subcategory` for groups big enough to need it). **If you already built
+#42's browse view against the old category names, the exact label strings have changed** (see the
+mapping below) — re-point the grouping logic at the new ones; nothing else about the endpoint's
+shape changed.
+
+```
+GET /api/masteradmin/aida/tools
+  → 200 { tools: [{ name, description, category, subcategory }, ...] }
+  subcategory is null for most tools — only present where a category has enough tools to need a
+  second level (see below). Group by category first, then by subcategory within it when present
+  (render tools with no subcategory directly under the category, not in an "Other" bucket).
+
+GET /api/masteradmin/aida/flows/available-nodes
+  → 200 { nodes: [{ name, description, inputSchema, category, subcategory }, ...] }
+  Same two new fields, for the Flows node palette (#47/#49) — group the node picker the same way.
+```
+
+**The real category list now** (was 10 guessed, loosely-named ones before — now 16, with 5 of them
+subcategorized):
+
+| Category | Subcategories | Was called (old, now gone) |
+|---|---|---|
+| Attendance, Projects, CRM, Inventory, Finance, HR | — | same names, unchanged |
+| Sitara Drapes | Dashboard, Orders, Customers, Products, Weavers & Vendors, Purchase Orders, Finance | "Sitara Drapes" (flat, no subgroups) |
+| Company Management | — | "Companies" |
+| Communication | Email, WhatsApp, Contacts, In-App Messages | "Email & Contacts" / "Messaging" (now one category, properly split) |
+| Memory | — | "Memory" (unchanged) |
+| Accounting | — | "Zoho Books" |
+| Developer Tools | — | "Coding Agent" |
+| Documents | — | "Documents" (unchanged) |
+| Web Research | — | "Web Research" (unchanged) |
+| Data Visualization | — | "Charts" |
+| Custom Actions | — | didn't exist before — where a brand-new, AI-built action (#16 part 2) lands by default |
+
+**What to build/update:** a two-level grouped list (category header, subcategory sub-header where
+present, tools underneath) instead of a flat category list — collapsible per category is a
+reasonable default given how many there now are (16). This applies to BOTH the Skills browse panel
+(#42) and the Flows node palette (#47/#49) since they share the same data shape now. No other
+behavior changes — this is purely a grouping/labeling update.
+
+## 51. Fix the "logged out after ~12-24 hours" issue — refresh tokens (both tenant and master admin)
+
+**Status: backend done, 2026-10-29. This is the actual fix — nothing changes until the frontend
+calls the new endpoints.** Root cause, confirmed directly in the code: access tokens (both tenant
+and master-admin logins) have always expired after a fixed **12 hours**, and there was no refresh
+mechanism at all — once expired, every API call just started failing with 401 until the person
+logged in again by hand. That's now fixed with a standard refresh-token pair.
+
+```
+POST /api/:slug/users/login          (tenant — existing route, response shape changed)
+POST /api/masteradmin/login          (master admin — existing route, response shape changed)
+  → 200 { token, refreshToken, user/admin: {...} }
+  Both now return a SECOND field, refreshToken, alongside the existing token. Store BOTH —
+  refreshToken lasts 30 days, token (the one sent as `Authorization: Bearer <token>` on every
+  normal API call, completely unchanged) still lasts 12 hours as before.
+
+POST /api/:slug/users/refresh        (tenant — NEW)
+POST /api/masteradmin/refresh        (master admin — NEW)
+  body: { refreshToken }
+  → 200 { token, refreshToken }                       (a FRESH pair — rotate your stored refreshToken too)
+  → 401 { error: "..." }  — refresh token itself expired/invalid, or the account is no longer
+                             active — this is the one case that genuinely needs a real re-login,
+                             clear any stored tokens and send them to the login screen.
+```
+
+**What to build:** wherever API calls are made from (an axios instance, a fetch wrapper — whatever
+this frontend already centralizes requests through), add the standard interceptor pattern:
+1. On login, store both `token` and `refreshToken` (e.g. alongside each other in whatever storage
+   already holds the session — localStorage/sessionStorage, same place `token` already lives).
+2. On every 401 response from a normal API call (not from `/login` or `/refresh` themselves — don't
+   loop), before giving up: call the matching `/refresh` endpoint with the stored `refreshToken`.
+   - If it succeeds: store the new `token`/`refreshToken` pair, retry the ORIGINAL request once with
+     the new token, and the user never sees anything — no redirect, no flash of a login screen.
+   - If it fails (401 from `/refresh` itself): clear stored tokens and redirect to login — this is
+     the only case where a real re-login is unavoidable (the refresh token itself is more than 30
+     days old, or the account was deactivated).
+3. Guard against a refresh stampede: if several API calls 401 around the same moment (common right
+   when a token expires), don't fire multiple simultaneous `/refresh` calls — queue the other
+   requests behind the first refresh in flight and retry them all once it resolves, a standard
+   single-flight pattern for this exact scenario.
+
+**Not in scope / known limitation (backend, not something to work around in the frontend):** there's
+no "log out this device remotely" yet — a refresh token can't be individually revoked before it
+naturally expires in 30 days. Not a blocker for this fix; flagged here so it's not assumed to exist.
+behavior changes — this is purely a grouping/labeling update.

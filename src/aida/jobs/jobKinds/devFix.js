@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const config = require('../../../config');
 const { createSandbox } = require('../../codingAgent/sandbox');
-const { runCommand } = require('../../codingAgent/tools');
+const { runCommand, fileExists } = require('../../codingAgent/tools');
 // Provider is selectable via AIDA_CODING_AGENT_PROVIDER — env var only, no
 // code change, per docs/AIDA_PHASE1_SELF_FIX_PLAN.md's original design.
 const { runCodingAgent } = config.aida.codingAgent.provider === 'anthropic'
@@ -35,6 +35,55 @@ const { notifyPreviewReady } = require('../previewResolver');
 
 function isAuthorized(repo) {
   return config.aida.authorizedRepos.includes(repo);
+}
+
+// AIDA roadmap item 16, Part 2 — the bounded actions auto-merge fast-lane.
+// Real finding this is built around: there was NO enforced test gate in
+// this pipeline at all before — the agent was only PROMPTED to run tests,
+// nothing checked the result. Confirmed explicitly with the user before
+// building any fast-lane at all: skipping approval with zero real
+// verification would be a materially different, much riskier thing than
+// what's built here.
+const ACTIONS_DIR_PREFIX = 'src/aida/tools/actions/';
+const ACTIONS_REGISTRY_FILE = 'src/aida/tools/index.js';
+
+/** True only if every line in the ORIGINAL file is still present, unchanged, in the new one, in the same order — i.e. the diff is purely additive (new require lines), nothing existing removed or edited. A dependency-free subsequence check, not a full diff. */
+function isAdditiveOnlyChange(originalBuf, newBuf) {
+  if (!originalBuf || !newBuf) return false;
+  const originalLines = originalBuf.toString('utf8').split('\n');
+  const newLines = newBuf.toString('utf8').split('\n');
+  let i = 0;
+  for (const line of newLines) {
+    if (i < originalLines.length && line === originalLines[i]) i++;
+  }
+  return i === originalLines.length;
+}
+
+/**
+ * The diff-shape half of the fast-lane gate: every changed path must be
+ * either a NEW file under src/aida/tools/actions/ (nothing to compare — it
+ * didn't exist before) or the registry file, and if the registry file is
+ * touched, the change there must be additive-only. At least one real
+ * actions/ file must actually be touched — a commit that only edits the
+ * registry (or touches nothing recognizable) doesn't qualify.
+ */
+function isScopedToActionsFolder(sandbox, changedPaths) {
+  if (!changedPaths || !changedPaths.length) return false;
+  let touchesActionsFile = false;
+  for (const relPath of changedPaths) {
+    const normalized = relPath.replace(/\\/g, '/');
+    if (normalized.startsWith(ACTIONS_DIR_PREFIX)) { touchesActionsFile = true; continue; }
+    if (normalized === ACTIONS_REGISTRY_FILE) {
+      const original = sandbox.originalFiles.get(relPath) || sandbox.originalFiles.get(normalized);
+      const currentPath = path.join(fs.realpathSync(sandbox.dir), relPath);
+      if (!fs.existsSync(currentPath)) return false; // registry file was deleted — never scoped
+      const current = fs.readFileSync(currentPath);
+      if (!isAdditiveOnlyChange(original, current)) return false;
+      continue;
+    }
+    return false; // anything else at all disqualifies the fast lane
+  }
+  return touchesActionsFile;
 }
 
 const DEFAULT_TASK = `Run the test suite ("npm test"). If any tests are failing, investigate the root cause
@@ -70,15 +119,26 @@ module.exports = {
 
     let sandbox;
     try {
-      sandbox = await createSandbox(owner, repoName, ca.githubToken);
-      await appendEvent(job.id, 'cloned', { repo });
+      // AIDA roadmap item 17 — VPS-backed execution, dev_repo_fix only, as a
+      // proof of concept. Deliberately excludes actionFastLane jobs (the
+      // ones capabilityGapProposal.js's resume() creates for new-action
+      // builds): isScopedToActionsFolder() below reads sandbox.originalFiles
+      // and local fs directly, which only exist for a local-backend sandbox
+      // — keeping fast-lane jobs local keeps this POC's blast radius to
+      // ordinary dev_repo_fix calls only, not an oversight.
+      const useVps = config.aida.vpsBridge.enabled && job.payload?.actionFastLane !== true;
+      sandbox = await createSandbox(owner, repoName, ca.githubToken, 'main', { backend: useVps ? 'vps' : 'local' });
+      await appendEvent(job.id, 'cloned', { repo, backend: sandbox.backend });
 
       await appendEvent(job.id, 'installing');
       // Not every authorized repo is an npm project — the frontend repo in
       // particular is plain static files with no package.json at all
       // (confirmed live). Running npm install against a directory with no
       // package.json fails hard (ENOENT), so check first rather than assume.
-      const hasPackageJson = fs.existsSync(path.join(fs.realpathSync(sandbox.dir), 'package.json'));
+      // Goes through tools.js's fileExists (not a raw fs call) specifically
+      // so this works for a VPS-backed sandbox.dir too (a "vps://<id>"
+      // marker, not a real local path fs.realpathSync could resolve).
+      const hasPackageJson = await fileExists(sandbox.dir, 'package.json');
       const install = hasPackageJson
         ? await runCommand(sandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 })
         : { exitCode: 0, skipped: true };
@@ -125,16 +185,62 @@ module.exports = {
         return;
       }
 
+      // Real, enforced test gate (item 16 part 2) — previously the agent was
+      // only PROMPTED to run tests as part of its own task text; nothing
+      // programmatically checked the result before a PR opened. Runs
+      // regardless of fast-lane eligibility — every dev_repo_fix/
+      // create_module job benefits from a real pass/fail signal on its PR,
+      // not just actions.
+      let testGate = { ran: false, passed: null };
+      if (hasPackageJson) {
+        const testRun = await runCommand(sandbox.dir, 'npm', ['test'], { timeoutMs: 180_000 });
+        testGate = { ran: true, passed: testRun.exitCode === 0, exitCode: testRun.exitCode };
+        await appendEvent(job.id, 'tests_run', testGate);
+      }
+
       await pushBranch(sandbox);
       await appendEvent(job.id, 'pushed', { branch: branchName });
+
+      const testSummaryLine = testGate.ran
+        ? (testGate.passed ? '✅ `npm test` passed.' : `⚠️ **\`npm test\` FAILED (exit code ${testGate.exitCode})** — review carefully before merging.`)
+        : '_No package.json in this repo — tests were not run._';
 
       const pr = await openPullRequest({
         owner, repo: repoName, token: ca.githubToken,
         head: branchName, base: 'main',
         title: `AIDA fix: ${effectiveTask.slice(0, 60).replace(/\s+/g, ' ')}`,
-        body: `${agentResult.summary}\n\n---\n_Opened automatically by AIDA's phase-1 self-fix job (${job.id}). Review the diff and CI status, then Approve or Reject from the AIDA Job panel._`,
+        body: `${agentResult.summary}\n\n${testSummaryLine}\n\n---\n_Opened automatically by AIDA's phase-1 self-fix job (${job.id}). Review the diff and CI status, then Approve or Reject from the AIDA Job panel._`,
       });
       await appendEvent(job.id, 'pr_opened', { prNumber: pr.number, prUrl: pr.html_url });
+
+      // The bounded actions auto-merge fast-lane (item 16 part 2) — only
+      // ever eligible when capabilityGapProposal.js's resume() explicitly
+      // set this flag for a new-action build. Every other dev_repo_fix
+      // caller (chat fixes, bug reports, website replicas) never sets it, so
+      // they're completely unaffected and always land at awaiting_approval
+      // below, exactly as before.
+      if (job.payload?.actionFastLane === true) {
+        const diffScoped = isScopedToActionsFolder(sandbox, commitResult.changedPaths);
+        if (testGate.ran && testGate.passed && diffScoped) {
+          try {
+            await mergePullRequest({ owner, repo: repoName, token: ca.githubToken, pullNumber: pr.number });
+            await appendEvent(job.id, 'auto_merged', { prNumber: pr.number, reason: 'action fast-lane: tests passed, diff scoped to src/aida/tools/actions/' });
+            await updateStatus(job.id, 'completed', {
+              result: {
+                repo, task: effectiveTask, agentSummary: agentResult.summary, changed: true,
+                branch: branchName, prNumber: pr.number, prUrl: pr.html_url, toolLog: agentResult.toolLog,
+                merged: true, autoMerged: true, testGate,
+              },
+            });
+            return;
+          } catch (e) {
+            await appendEvent(job.id, 'auto_merge_failed', { error: e.message });
+            // fall through to the normal awaiting_approval path below
+          }
+        } else {
+          await appendEvent(job.id, 'fast_lane_declined', { testsRan: testGate.ran, testsPassed: testGate.passed, diffScoped });
+        }
+      }
 
       // The backend repo's preview URL is a FIXED, always-known value (the
       // "preview" deployment slot auto-deploys any non-main branch push —
@@ -151,6 +257,7 @@ module.exports = {
         result: {
           repo, task: effectiveTask, agentSummary: agentResult.summary, changed: true,
           branch: branchName, prNumber: pr.number, prUrl: pr.html_url, previewUrl, toolLog: agentResult.toolLog,
+          testGate,
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { prUrl: pr.html_url });
@@ -165,7 +272,10 @@ module.exports = {
       await updateStatus(job.id, 'failed', { errorMessage: safeMessage });
       await appendEvent(job.id, 'failed', { error: safeMessage });
     } finally {
-      sandbox?.cleanup();
+      // Awaited now that cleanup() can be a real network call (VPS mode —
+      // see sandbox.js), and failure-tolerant: a cleanup failure must never
+      // mask the job's already-recorded completed/failed status above.
+      await sandbox?.cleanup().catch((e) => console.error(`[aida] job ${job.id}: sandbox cleanup failed:`, e.message));
     }
   },
 

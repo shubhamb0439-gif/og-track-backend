@@ -20,6 +20,9 @@ const { createTurnTimer } = require('../aida/latency');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
 const connectorProviders = require('../aida/connectors/providers');
 const connectorStore = require('../aida/connectors/connectorStore');
+const flowStore = require('../aida/flows/flowStore');
+const flowRunner = require('../aida/flows/flowRunner');
+const crypto = require('crypto');
 const { getCombinedStatus } = require('../aida/codingAgent/github');
 const { matchTodayCelebrations } = require('../aida/celebrations');
 const { tryResolvePreviewUrl } = require('../aida/jobs/previewResolver');
@@ -586,11 +589,16 @@ function createAidaRouter({ requireAuth, buildContext }) {
 
   // GET /tools — what AIDA can currently do in this context. Useful for a
   // "what can you help me with?" empty state in the UI, and for debugging
-  // which modules are wired up.
+  // which modules are wired up. Also the data source for the masteradmin
+  // Skills panel's browse view (AIDA roadmap item 14) — `category`/
+  // `subcategory` are real metadata declared directly on each tool
+  // (toolRegistry.js's registerTool/registerTools — see tools/index.js's own
+  // per-file defaults and each tool file's per-tool overrides), not guessed
+  // from the tool's name.
   router.get('/tools', (req, res) => {
     try {
       const context = buildContext(req);
-      const tools = listAvailableTools(context).map((t) => ({ name: t.name, description: t.description }));
+      const tools = listAvailableTools(context).map((t) => ({ name: t.name, description: t.description, category: t.category, subcategory: t.subcategory }));
       res.json({ tools });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -652,6 +660,125 @@ function addConnectorRoutes(router, scopeFromReq) {
 addConnectorRoutes(tenantAidaRouter, (req) => ({ companyId: req.company.id, userId: req.auth.userId }));
 addConnectorRoutes(masterAdminAidaRouter, (req) => ({ companyId: null, userId: req.admin.adminId }));
 
+// POST /skills/propose — AIDA roadmap item 14's Component B: masteradmin
+// describes a new capability they want AIDA to have, and it goes straight
+// into the EXACT SAME plan-then-build pipeline capabilityGapDetector.js
+// already auto-triggers when AIDA refuses something (jobKinds/
+// capabilityGapProposal.js's run()/resume()/onReject()) — this is just a
+// second, explicit entry point into that pipeline, not a new one. Lands as
+// a normal job in the existing masteradmin Job panel (GET /jobs, POST
+// /jobs/:id/approve|reject), identical to every other job kind.
+masterAdminAidaRouter.post('/skills/propose', async (req, res) => {
+  try {
+    const { description } = req.body || {};
+    if (!description || typeof description !== 'string' || !description.trim()) {
+      return res.status(400).json({ error: 'description is required' });
+    }
+    const job = await jobStore.createJob({
+      kind: 'capability_gap_proposal',
+      companySlug: null,
+      createdByUserId: req.admin.adminId,
+      payload: { whatToBuild: description.trim(), originalUserMessage: description.trim() },
+    });
+    res.json({ jobId: job.id, status: job.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── AIDA Flows (roadmap item 15) — masteradmin-only workflow automation ────
+// A "Flows" tab alongside the Skills panel's Browse/+New skill (item 14) —
+// see flowStore.js/flowRunner.js for the real engine; these routes are thin.
+
+masterAdminAidaRouter.get('/flows/available-nodes', (req, res) => {
+  try { res.json({ nodes: flowRunner.listAvailableNodes() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+masterAdminAidaRouter.get('/flows', async (req, res) => {
+  try { res.json({ flows: await flowStore.listFlows() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+masterAdminAidaRouter.post('/flows', async (req, res) => {
+  try {
+    const { name, description, triggerType, triggerConfig, steps } = req.body || {};
+    if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name is required' });
+    if (!['manual', 'schedule', 'webhook', 'whatsapp', 'email'].includes(triggerType)) return res.status(400).json({ error: 'triggerType must be manual, schedule, webhook, whatsapp, or email' });
+    if (!Array.isArray(steps) || !steps.length) return res.status(400).json({ error: 'steps must be a non-empty array' });
+    const availableNames = new Set(flowRunner.listAvailableNodes().map((n) => n.name));
+    for (const step of steps) {
+      if (!availableNames.has(step.toolName)) return res.status(400).json({ error: `"${step.toolName}" is not an available Flows node (unknown, or excluded as an approval-gated action).` });
+    }
+    // A webhook flow gets a real random secret minted server-side — never trust a client-supplied value for this.
+    const resolvedTriggerConfig = triggerType === 'webhook' ? { webhookSecret: crypto.randomBytes(24).toString('hex') } : (triggerConfig || null);
+    const flow = await flowStore.createFlow({ name: name.trim(), description, triggerType, triggerConfig: resolvedTriggerConfig, createdByUserId: req.admin.adminId, steps });
+    res.json({ flow });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+masterAdminAidaRouter.get('/flows/runs/:runId', async (req, res) => {
+  try {
+    const run = await flowStore.getRun(req.params.runId);
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    res.json({ run, steps: await flowStore.listStepsForRun(run.id) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+masterAdminAidaRouter.get('/flows/:id', async (req, res) => {
+  try {
+    const flow = await flowStore.getFlow(req.params.id);
+    if (!flow) return res.status(404).json({ error: 'Flow not found' });
+    res.json({ flow });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+masterAdminAidaRouter.put('/flows/:id', async (req, res) => {
+  try {
+    const existing = await flowStore.getFlow(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Flow not found' });
+    const { name, description, triggerConfig, status, steps } = req.body || {};
+    if (steps !== undefined) {
+      const availableNames = new Set(flowRunner.listAvailableNodes().map((n) => n.name));
+      for (const step of steps) {
+        if (!availableNames.has(step.toolName)) return res.status(400).json({ error: `"${step.toolName}" is not an available Flows node.` });
+      }
+    }
+    const flow = await flowStore.updateFlow(req.params.id, { name, description, triggerConfig, status, steps });
+    res.json({ flow });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+masterAdminAidaRouter.delete('/flows/:id', async (req, res) => {
+  try {
+    const existing = await flowStore.getFlow(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Flow not found' });
+    await flowStore.deleteFlow(req.params.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// "Test now" — runs ANY flow immediately, regardless of its configured
+// triggerType (schedule/webhook/whatsapp/email all run through this exact
+// same endpoint, not just manual-trigger flows). For a whatsapp/email flow,
+// there's no real inbound message behind a test run, so any
+// {{trigger.output.x}} reference in its steps would otherwise resolve to
+// nothing — `testTriggerPayload` lets the caller supply mock data (e.g.
+// { from: "+911234567890", body: "test message" }) so a test run exercises
+// those steps realistically instead of silently passing undefined through.
+masterAdminAidaRouter.post('/flows/:id/run', async (req, res) => {
+  try {
+    const flow = await flowStore.getFlow(req.params.id);
+    if (!flow) return res.status(404).json({ error: 'Flow not found' });
+    const { testTriggerPayload } = req.body || {};
+    const run = await flowRunner.startRun(flow, { triggeredBy: 'manual', triggerPayload: testTriggerPayload });
+    res.json({ runId: run.id, status: run.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+masterAdminAidaRouter.get('/flows/:id/runs', async (req, res) => {
+  try { res.json({ runs: await flowStore.listRunsForFlow(req.params.id) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Shared OAuth callback — ONE fixed URL per provider regardless of which
 // tenant/masteradmin started the connect flow (see config.aidaConnectors'
 // own doc comment for why: this is the exact redirect URI registered in
@@ -679,6 +806,23 @@ connectorCallbackRouter.get('/:provider/callback', async (req, res) => {
   } catch (e) {
     res.status(500).send(`Connection failed: ${e.message}`);
   }
+});
+
+// Flows webhook trigger (roadmap item 15) — deliberately NOT behind
+// requireMasterAdminAidaAuth: an external caller authenticates with the
+// flow-specific secret minted at creation time (POST /flows, triggerType:
+// 'webhook'), not a JWT — same "shared secret, not a login" shape as
+// deploy-notify. Mounted directly in server.js at /api/aida/flows-webhook.
+const flowWebhookRouter = express.Router();
+flowWebhookRouter.post('/:flowId/:secret', async (req, res) => {
+  try {
+    const flow = await flowStore.getFlow(req.params.flowId);
+    if (!flow || flow.triggerType !== 'webhook' || flow.status !== 'active') return res.status(404).json({ error: 'Not found' });
+    const expected = flow.triggerConfig?.webhookSecret;
+    if (!expected || req.params.secret !== expected) return res.status(401).json({ error: 'Invalid secret' });
+    const run = await flowRunner.startRun(flow, { triggeredBy: 'webhook' });
+    res.json({ runId: run.id, status: run.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Tenant-facing report-a-bug/feature button (AIDA roadmap item 4b) ────────
@@ -1002,4 +1146,4 @@ reportIssueApprovalRouter.post('/:id/reject', async (req, res) => {
 // it lets test/liveConversationTurn-style scripts exercise the REAL
 // streaming/filler/interruption wiring directly, without needing a full
 // HTTP+DB+socket.io harness. Not used by any other module in the app.
-module.exports = { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, connectorCallbackRouter, runConversationTurn };
+module.exports = { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, connectorCallbackRouter, flowWebhookRouter, runConversationTurn };

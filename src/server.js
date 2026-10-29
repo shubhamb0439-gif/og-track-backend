@@ -31,7 +31,7 @@ const inventoryRoutes = require('./routes/inventory');
 const manufacturingRoutes = require('./routes/manufacturing');
 const salesRoutes = require('./routes/sales');
 const uploadRoutes = require('./routes/upload');
-const { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, connectorCallbackRouter } = require('./routes/aida');
+const { tenantAidaRouter, masterAdminAidaRouter, reportIssueApprovalRouter, connectorCallbackRouter, flowWebhookRouter } = require('./routes/aida');
 const whatsappRoutes = require('./routes/whatsapp');
 const aidaJobRunner = require('./aida/jobs/jobRunner');
 const to_do_listRoutes = require('./routes/to_do_list');
@@ -69,6 +69,7 @@ require('./sitaraRazorpayScheduler').start();
 // Weekly Sitara Razorpay-vs-orders reconciliation email (thomas@ogplus.in,
 // cc pushpa@ogplus.in) — automates the manual pull-and-match done 2026-10-19.
 require('./sitaraWeeklyReconciliation').start();
+require('./aida/flows/flowRunner').start();
 
 // ── Socket.io: per-tenant rooms ──────────────────────────────────────────────
 // Every client joins a room named after its company slug. All real-time
@@ -154,6 +155,10 @@ app.use('/api/:slug/aida/report-issue-jobs', reportIssueApprovalRouter);
 // either /api/:slug or /api/masteradmin: see connectorCallbackRouter's own
 // doc comment in routes/aida.js for why.
 app.use('/api/aida/connectors', connectorCallbackRouter);
+// AIDA Flows' webhook trigger — one flow-specific secret URL per webhook-
+// type flow, not behind masteradmin auth (see flowWebhookRouter's own doc
+// comment in routes/aida.js).
+app.use('/api/aida/flows-webhook', flowWebhookRouter);
 app.use('/api/:slug/to_do_list', resolveTenant, requireModule('to_do_list'), to_do_listRoutes);
 app.use('/api/:slug/token', resolveTenant, requireModule('token'), tokenRoutes);
 app.use('/api/:slug/notes', resolveTenant, requireModule('notes'), notesRoutes);

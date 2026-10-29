@@ -195,13 +195,27 @@ function matchedRecipient(message) {
 
 async function processMessage(token, message) {
   if (message['@removed'] || !message.toRecipients) return; // a deletion/removal marker, not a real message
+
+  // AIDA Flows (roadmap item 15) — checked BEFORE the matchedRecipient() gate
+  // below, deliberately: that gate decides which HUMAN gets a WhatsApp
+  // summary, it's not a security boundary, and a flow may want to react to
+  // mail in this mailbox that isn't routed to any specific person. Cheap
+  // (no extra Graph call — from/subject/body are already on the message
+  // object) and fire-and-forget — a Flows bug must never break the existing
+  // summarize/notify pipeline below. Lazy-required, same precedent as
+  // previewResolver.js's own lazy require('./jobRunner').
+  const earlyBodyText = (message.body?.content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const earlyFrom = message.from?.emailAddress?.address || '';
+  require('./flows/flowRunner').checkEmailTriggers({ from: earlyFrom, subject: message.subject || '', body: earlyBodyText })
+    .catch((e) => console.error('[email-monitor] Flows trigger check failed:', e.message));
+
   const match = matchedRecipient(message);
   if (!match) return; // not addressed to a watched recipient
 
   const attachments = message.hasAttachments ? await fetchAttachments(token, message.id) : [];
   const attachmentsText = attachments.map((a) => (a.text ? `--- ${a.name} ---\n${a.text}` : null)).filter(Boolean).join('\n\n');
-  const bodyText = (message.body?.content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  const from = message.from?.emailAddress?.address || 'unknown sender';
+  const bodyText = earlyBodyText;
+  const from = earlyFrom || 'unknown sender';
   const subject = message.subject || '(no subject)';
 
   const { summary, isUrgent, needsPlan } = await summarizeEmail({ subject, from, bodyText, attachmentsText });

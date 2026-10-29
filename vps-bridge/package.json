@@ -1,0 +1,16 @@
+{
+  "name": "aida-vps-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AIDA roadmap item 17 — remote execution bridge for the coding agent's dev_repo_fix sandbox. Standalone service, deployed as its own Docker container on the VPS, NOT part of ogtrack-backend's own npm install/Azure deploy.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^4.21.1"
+  }
+}

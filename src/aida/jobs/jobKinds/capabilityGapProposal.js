@@ -103,14 +103,16 @@ module.exports = {
       'Action items:',
       ...plan.actionItems.map((item) => `- ${item}`),
       '',
-      'Implement this as a real capability inside this backend (a new tool, integration, or job kind as appropriate) — follow the existing patterns already used elsewhere in src/aida/ for tool registration, config, and job kinds.',
+      'STRONGLY PREFERRED approach — a new "action": if this capability can be implemented as a single new tool (one new file exporting `module.exports = [{ name, description, requiredModules, inputSchema, handler }]`, following the EXACT shape already used by every existing file in src/aida/tools/), create it as EXACTLY ONE new file at src/aida/tools/actions/<actionName>.js, and add EXACTLY ONE new require(...) line registering it in src/aida/tools/index.js\'s MODULE_TOOL_FILES array — do not touch any other existing file. This narrow, mechanically-verifiable shape is what lets this change skip the human-approval wait and ship immediately once tests pass.',
+      '',
+      'If (and only if) the capability genuinely cannot be expressed as a single new tool file this way (e.g. it needs a new config block, a new database table/migration, or changes to existing shared code), implement it properly using whatever existing patterns fit best elsewhere in src/aida/ — that is completely fine, it will simply go through the normal human-approval review instead of the fast lane, which is expected and safe.',
     ].join('\n');
 
     const buildJob = await jobStore.createJob({
       kind: 'dev_repo_fix',
       companySlug: job.companySlug,
       createdByUserId: job.createdByUserId,
-      payload: { repo: config.aida.moduleBuilder.backendRepo, task },
+      payload: { repo: config.aida.moduleBuilder.backendRepo, task, actionFastLane: true },
     });
     await appendEvent(job.id, 'handed_off', { buildJobId: buildJob.id });
     await updateStatus(job.id, 'completed', { result: { ...job.result, buildJobId: buildJob.id } });

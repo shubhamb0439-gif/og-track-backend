@@ -126,6 +126,15 @@ async function inspectWebsite(sandboxDir, startUrl, { maxPages = 15 } = {}) {
   if (!config.aida.browserless.enabled) {
     throw new Error('Website inspection is not configured on this server yet (missing BROWSERLESS_API_KEY).');
   }
+  // AIDA roadmap item 17 — a VPS-backed sandbox (sandboxDir is a
+  // "vps://<id>" marker, not a real local path — see tools.js) would crash
+  // here on fs.mkdirSync/writeFileSync below. Nothing restricts which tools
+  // a dev_repo_fix task's agent loop can call, so this is a real reachable
+  // path, not just theoretical. Fail soft with the same tool-error shape
+  // the agent already knows how to work around, rather than throwing.
+  if (typeof sandboxDir === 'string' && sandboxDir.startsWith('vps://')) {
+    throw new Error('inspect_website is not yet supported for VPS-backed sandboxes.');
+  }
 
   const startOrigin = new URL(startUrl).origin;
   const visited = new Set();

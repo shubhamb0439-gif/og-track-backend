@@ -188,11 +188,21 @@ async function runCodingAgent({ sandboxDir, task, maxIterations = 25, onEvent })
   return { success: false, summary: `Stopped after ${maxIterations} iterations without calling finish — likely stuck in a loop.`, toolLog };
 }
 
-function executeTool(sandboxDir, name, args) {
+// AIDA roadmap item 17 — async, not sync-with-a-Promise-check, because a
+// VPS-backed sandboxDir (a "vps://<id>" marker — see tools.js) makes
+// readFile/listFiles return Promises instead of plain values. Wrapping their
+// result inline (`{ content: tools.readFile(...) }`) would otherwise hand
+// back `{ content: <unresolved Promise> }` to the caller's own
+// `result instanceof Promise` check, which only looks at executeTool's OWN
+// return value, not values nested inside it — a real bug that would have
+// silently shipped broken read_file/list_files results for every VPS job.
+// `await`ing a non-Promise value is a no-op, so this stays correct for local
+// (sync) sandboxes too.
+async function executeTool(sandboxDir, name, args) {
   try {
     switch (name) {
       case 'read_file':
-        return { content: tools.readFile(sandboxDir, args.path) };
+        return { content: await tools.readFile(sandboxDir, args.path) };
       case 'write_file':
         // A missing `content` key (not an explicit "") means this tool_use
         // block's JSON got cut off before the content string was written —
@@ -205,19 +215,19 @@ function executeTool(sandboxDir, name, args) {
         if (args.content === undefined) {
           return { error: 'write_file call had no content — it was likely cut off because the file content was too long for one response. Try writing it again (now that max_tokens is 64000, this should fit); if it still fails, the file may genuinely be too large for one write_file call.' };
         }
-        return tools.writeFile(sandboxDir, args.path, args.content);
+        return await tools.writeFile(sandboxDir, args.path, args.content);
       case 'list_files':
-        return { files: tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
+        return { files: await tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
       case 'run_command':
-        return tools.runCommand(sandboxDir, args.command, args.args || []);
+        return await tools.runCommand(sandboxDir, args.command, args.args || []);
       case 'inspect_website':
         // Never rejects (same reasoning as tools.js's runCommand comment) —
         // a Browserless failure should be a recoverable tool-error result
         // the agent can see and retry/adapt from, not something that
         // crashes the whole job via an unawaited/uncaught rejection.
-        return browserless.inspectWebsite(sandboxDir, args.url, { maxPages: args.maxPages || 15 }).catch((e) => ({ error: e.message }));
+        return await browserless.inspectWebsite(sandboxDir, args.url, { maxPages: args.maxPages || 15 }).catch((e) => ({ error: e.message }));
       case 'download_file':
-        return tools.downloadFile(sandboxDir, args.path, args.url).catch((e) => ({ error: e.message }));
+        return await tools.downloadFile(sandboxDir, args.path, args.url).catch((e) => ({ error: e.message }));
       default:
         return { error: `Unknown tool "${name}".` };
     }

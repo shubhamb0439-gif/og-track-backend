@@ -17,6 +17,7 @@ const { callTenantApi } = require('../apiClient');
 module.exports = [
   {
     name: 'sitara_get_dashboard',
+    subcategory: 'Dashboard',
     description:
       'Sitara Drapes business overview: total sales, this month\'s sales, order count, pending order count, ' +
       'stock on hand, the 10 most recent orders, best-selling products, and top regions by revenue. Start here ' +
@@ -32,6 +33,7 @@ module.exports = [
 
   {
     name: 'sitara_list_orders',
+    subcategory: 'Orders',
     description:
       'List Sitara Drapes orders (from BigCommerce, Razorpay, or manually entered), newest first. Filter by ' +
       'status (e.g. completed, awaiting_fulfillment, cancelled, refunded), source (bigcommerce|manual|recovered), ' +
@@ -59,6 +61,7 @@ module.exports = [
 
   {
     name: 'sitara_get_order',
+    subcategory: 'Orders',
     description: 'Full detail for one Sitara Drapes order, including its line items — customer, address, status, totals, and notes.',
     requiredModules: ['sitara_orders'],
     inputSchema: {
@@ -73,6 +76,7 @@ module.exports = [
 
   {
     name: 'sitara_list_customers',
+    subcategory: 'Customers',
     description: 'List Sitara Drapes customers. Filter by source (bigcommerce|whatsapp|instagram|manual) or search (matches name, email, or phone).',
     requiredModules: ['sitara_orders'],
     inputSchema: {
@@ -87,6 +91,7 @@ module.exports = [
 
   {
     name: 'sitara_get_customer',
+    subcategory: 'Customers',
     description: 'Full detail for one Sitara Drapes customer, including their full address.',
     requiredModules: ['sitara_orders'],
     inputSchema: {
@@ -101,6 +106,7 @@ module.exports = [
 
   {
     name: 'sitara_list_products',
+    subcategory: 'Products',
     description: 'List Sitara Drapes catalog products (name, SKU, price, stock on hand). Search matches name or SKU.',
     requiredModules: ['sitara_stocks'],
     inputSchema: {
@@ -115,6 +121,7 @@ module.exports = [
 
   {
     name: 'sitara_list_weavers',
+    subcategory: 'Weavers & Vendors',
     description: 'List Sitara Drapes weavers (the raw-material suppliers purchase orders are placed against). Search matches name, email, or phone.',
     requiredModules: ['sitara_stocks'],
     inputSchema: {
@@ -129,6 +136,7 @@ module.exports = [
 
   {
     name: 'sitara_list_vendors',
+    subcategory: 'Weavers & Vendors',
     description: 'List Sitara Drapes vendors (who business expenses are logged against). Search matches name, email, or phone.',
     requiredModules: ['sitara_stocks'],
     inputSchema: {
@@ -143,6 +151,7 @@ module.exports = [
 
   {
     name: 'sitara_list_purchase_orders',
+    subcategory: 'Purchase Orders',
     description: 'List purchase orders placed with weavers. Filter by status, weaverId, or search (matches PO number).',
     requiredModules: ['sitara_stocks'],
     inputSchema: {
@@ -161,6 +170,7 @@ module.exports = [
 
   {
     name: 'sitara_get_purchase_order',
+    subcategory: 'Purchase Orders',
     description: 'Full detail for one purchase order, including its line items.',
     requiredModules: ['sitara_stocks'],
     inputSchema: {
@@ -175,6 +185,7 @@ module.exports = [
 
   {
     name: 'sitara_list_expenses',
+    subcategory: 'Finance',
     description: 'List business expenses (electricity, rent, etc.), logged against a vendor. Filter by category, vendorId, or search (matches category/description).',
     requiredModules: ['sitara_stocks'],
     inputSchema: {
@@ -193,6 +204,7 @@ module.exports = [
 
   {
     name: 'sitara_list_razorpay_payments',
+    subcategory: 'Finance',
     description:
       'List Razorpay payments captured for Sitara Drapes, each flagged with whether it was successfully matched to ' +
       'a local order. Set matchedOnly:false to see UNMATCHED payments specifically (a real payment that never got ' +

@@ -18,18 +18,32 @@ const { MASTERADMIN_SENTINEL_MODULE, UNIVERSAL_SENTINEL_MODULE } = require('./co
 
 const tools = new Map();
 
-function registerTool(tool) {
+/**
+ * `defaults.category`/`defaults.subcategory` (from registerTools' second
+ * arg) are the FILE-LEVEL grouping for the browse/Flows node-palette UI
+ * (AIDA roadmap follow-up, 2026-10-28 — the flat ~100-tool list was
+ * confusing). A tool that sets its own `category`/`subcategory` directly on
+ * its own object wins over the file-level default (the `...tool` spread
+ * runs last) — used where one file's tools span more than one real
+ * domain (e.g. masteradmin.js, or devops.js's generate_document).
+ */
+function registerTool(tool, defaults = {}) {
   if (!tool || !tool.name) throw new Error('Tool must have a name');
   if (tools.has(tool.name)) throw new Error(`Tool "${tool.name}" is already registered`);
   tools.set(tool.name, {
     requiredModules: [],
     inputSchema: { type: 'object', properties: {} },
+    // "Custom Actions" (not a generic "Other") because in practice the only
+    // caller that ever omits `category` entirely is a new src/aida/tools/
+    // actions/*.js file registered without one — see that folder's README.
+    category: defaults.category || 'Custom Actions',
+    subcategory: defaults.subcategory || null,
     ...tool,
   });
 }
 
-function registerTools(list) {
-  list.forEach(registerTool);
+function registerTools(list, defaults = {}) {
+  list.forEach((tool) => registerTool(tool, defaults));
 }
 
 /**

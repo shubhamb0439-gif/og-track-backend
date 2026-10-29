@@ -27,6 +27,7 @@ async function currentAdminEmail(context) {
 module.exports = [
   {
     name: 'masteradmin_list_companies',
+    category: 'Company Management',
     description: 'List every OG Track company/tenant, with status and enabled modules.',
     requiredModules: ['__masteradmin__'],
     inputSchema: {
@@ -42,6 +43,7 @@ module.exports = [
 
   {
     name: 'masteradmin_open_company',
+    category: 'Company Management',
     description: 'Resolve a company name/slug to its real OG Track app URL, for "open X" / "show me X" / "pull up X" requests. ALWAYS call this instead of guessing or constructing a URL yourself — the frontend auto-renders any real URL appearing in your reply text as a preview card, so when found, state the returned url field PLAINLY as visible text. If not found or ambiguous, say so in plain text instead of guessing.',
     requiredModules: ['__masteradmin__'],
     inputSchema: {
@@ -87,6 +89,7 @@ module.exports = [
 
   {
     name: 'masteradmin_get_pending_users',
+    category: 'Company Management',
     description: 'Users across ALL companies awaiting Super Admin approval.',
     requiredModules: ['__masteradmin__'],
     inputSchema: { type: 'object', properties: {} },
@@ -98,6 +101,7 @@ module.exports = [
 
   {
     name: 'masteradmin_get_provisioning_log',
+    category: 'Company Management',
     description: "A company's provisioning history (module setup steps and their status).",
     requiredModules: ['__masteradmin__'],
     inputSchema: {
@@ -113,6 +117,8 @@ module.exports = [
 
   {
     name: 'send_message_to_user',
+    category: 'Communication',
+    subcategory: 'In-App Messages',
     description:
       "Sends a direct message to a specific user in a specific company's internal messaging (only works if " +
       "that company has the 'messages' module enabled). SAFETY — this is a real, visible action: call this tool " +
@@ -181,6 +187,7 @@ module.exports = [
 
   {
     name: 'save_memory',
+    category: 'Memory',
     description:
       "Saves a durable fact to your long-term memory — persists across every future conversation with this " +
       "master admin, not just this one. Only for things worth remembering long-term: a standing preference " +
@@ -209,6 +216,7 @@ module.exports = [
 
   {
     name: 'forget_memory',
+    category: 'Memory',
     description: 'Deletes a saved memory by its id (shown alongside every memory in your system context) — use when the master admin explicitly asks you to forget something.',
     requiredModules: ['__masteradmin__'],
     inputSchema: {
@@ -224,13 +232,18 @@ module.exports = [
 
   {
     name: 'send_email',
+    category: 'Communication',
+    subcategory: 'Email',
     description:
       "Sends a real email, from aida@sanj.co, to anyone — a known contact by name, or a fresh address. If both " +
       "`to` and `name` are given, that pairing is remembered so just `name` works next time (e.g. after once " +
       "being told \"email pooja, her address is pooja@ogplus.in\", a later \"mail pooja\" resolves automatically). " +
       "If only `name` is given and it's not a known contact yet, this returns an error — ask the human for the " +
       "address rather than guessing one. Set includeAttachment: true ONLY when the human attached a file/photo " +
-      "earlier in this same conversation and asked you to send/forward THAT specific file. SAFETY — a real, " +
+      "earlier in this same conversation and asked you to send/forward THAT specific file — this does NOT work " +
+      "when called from a Flow (no live conversation exists there). To attach a file from an earlier step's " +
+      "result instead (e.g. generate_document's fileUrl, or any other real URL), set attachFileUrl to that URL — " +
+      "the real bytes are downloaded and attached, works in both chat and Flows. SAFETY — a real, " +
       "irreversible action, confirmed first for anything that matters: a SHORT, casual message (roughly a " +
       "sentence or two, no attachment, nothing sensitive like payments/legal/confidential topics) sends " +
       "IMMEDIATELY on the first call — no need to preview or ask first, exactly like a human firing off a quick " +
@@ -246,12 +259,13 @@ module.exports = [
         name: { type: 'string', description: "The recipient's name — used to remember/look up their address." },
         subject: { type: 'string' },
         body: { type: 'string' },
-        includeAttachment: { type: 'boolean', description: 'Set true to attach the file the human most recently sent AIDA in this conversation.' },
+        includeAttachment: { type: 'boolean', description: 'Set true to attach the file the human most recently sent AIDA in this conversation. Chat only — never works from a Flow.' },
+        attachFileUrl: { type: 'string', description: "A direct URL to a real file to attach (e.g. an earlier step's fileUrl) — downloaded and attached as a real file. Works in both chat and Flows." },
         confirmed: { type: 'boolean', description: 'Only set true after the human has explicitly confirmed sending, in a later message.' },
       },
       required: ['subject', 'body'],
     },
-    async handler(context, { to, name, subject, body, includeAttachment, confirmed }) {
+    async handler(context, { to, name, subject, body, includeAttachment, attachFileUrl, confirmed }) {
       let recipient = to;
       if (!recipient && name) {
         const known = await contacts.findContactByNameLoose(context.userId, name);
@@ -265,6 +279,20 @@ module.exports = [
         const pending = pendingAttachments.getPending(context);
         if (!pending) return { error: "There's no recently-attached file in this conversation to include — ask the human to resend it." };
         attachment = pending;
+      } else if (attachFileUrl) {
+        try {
+          const res = await fetch(attachFileUrl);
+          if (!res.ok) return { error: `Could not download the file to attach (HTTP ${res.status}): ${attachFileUrl}` };
+          const buffer = Buffer.from(await res.arrayBuffer());
+          const urlFilename = decodeURIComponent(attachFileUrl.split('/').pop().split('?')[0] || '');
+          attachment = {
+            filename: urlFilename || 'attachment',
+            mimeType: res.headers.get('content-type') || 'application/octet-stream',
+            buffer,
+          };
+        } catch (e) {
+          return { error: `Failed to download attachFileUrl: ${e.message}` };
+        }
       }
 
       if (!confirmed && !isTrivialMessage({ text: body, hasAttachment: !!attachment })) {
@@ -291,6 +319,8 @@ module.exports = [
 
   {
     name: 'reply_to_email',
+    category: 'Communication',
+    subcategory: 'Email',
     description:
       "Replies to a real email AIDA previously surfaced over WhatsApp (one of the emails it summarized from the " +
       "watched inbox) — sends a genuine threaded reply to the original sender, with the master admin's own email " +
@@ -335,6 +365,8 @@ module.exports = [
 
   {
     name: 'remember_contact',
+    category: 'Communication',
+    subcategory: 'Contacts',
     description: 'Saves or updates a name -> email address pairing for later use with send_email, without sending anything right now.',
     requiredModules: ['__masteradmin__'],
     inputSchema: {
@@ -350,6 +382,8 @@ module.exports = [
 
   {
     name: 'find_contact',
+    category: 'Communication',
+    subcategory: 'Contacts',
     description:
       'Checks whether a specific saved contact exists by name, and what we actually have for them (email and/or ' +
       'WhatsApp number) — use this for a plain lookup question like "do you have Pooja\'s number?" or "what\'s ' +
@@ -369,6 +403,8 @@ module.exports = [
 
   {
     name: 'list_contacts',
+    category: 'Communication',
+    subcategory: 'Contacts',
     description: 'Lists every contact currently saved (from manual teaching, send_email/message_contact\'s save-on-first-use, or the Android app\'s phone-contact sync) — name plus whatever email/number we have for each.',
     requiredModules: ['__masteradmin__'],
     inputSchema: { type: 'object', properties: {} },
@@ -383,6 +419,8 @@ module.exports = [
 
   {
     name: 'forget_contact',
+    category: 'Communication',
+    subcategory: 'Contacts',
     description: 'Deletes a remembered contact by name — use when the human explicitly asks you to forget someone\'s saved email.',
     requiredModules: ['__masteradmin__'],
     inputSchema: {
@@ -400,6 +438,7 @@ module.exports = [
 
   {
     name: 'query_zoho_books',
+    category: 'Accounting',
     description: 'Fetches real Zoho Books data (invoices, bills, expenses, contacts, bank accounts, or P&L/balance-sheet reports) for ANY connected company, by slug — cross-company, master-admin only. Returns an error naming the company if it has no Zoho connection linked yet.',
     requiredModules: ['__masteradmin__'],
     inputSchema: {
@@ -437,6 +476,8 @@ module.exports = [
 
   {
     name: 'message_contact',
+    category: 'Communication',
+    subcategory: 'WhatsApp',
     description:
       "Sends a real freeform WhatsApp message to a saved contact by name (or to a number given alongside a name, which " +
       "saves that pairing for next time — same save-on-first-use pattern as send_email), optionally forwarding the " +

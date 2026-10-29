@@ -64,22 +64,32 @@ async function resolveCompanySlug(rawSlug) {
  * built) rather than firing synchronously from a chat turn. Every tool
  * wrapped below is read-only (GET-backed) in its original module file.
  */
+// Paired with a category (AIDA roadmap follow-up, 2026-10-28 — organizing
+// the browse/Flows node list) so every masteradmin_* cross-tenant tool
+// groups under the SAME category as its underlying tenant tool, e.g. every
+// masteradmin_sitara_* tool shows up under "Sitara Drapes," not a generic
+// bucket — this file isn't one business domain itself, it wraps all 7.
 const READABLE_TENANT_TOOL_MODULES = [
-  require('./attendance'),
-  require('./projects'),
-  require('./crm'),
-  require('./inventory'),
-  require('./finance'),
-  require('./hr'),
-  require('./sitara'),
+  { tools: require('./attendance'), category: 'Attendance' },
+  { tools: require('./projects'), category: 'Projects' },
+  { tools: require('./crm'), category: 'CRM' },
+  { tools: require('./inventory'), category: 'Inventory' },
+  { tools: require('./finance'), category: 'Finance' },
+  { tools: require('./hr'), category: 'HR' },
+  { tools: require('./sitara'), category: 'Sitara Drapes' },
 ];
 
-function wrapForCrossTenant(tool) {
+function wrapForCrossTenant(tool, category) {
   const originalProperties = (tool.inputSchema && tool.inputSchema.properties) || {};
   const originalRequired = (tool.inputSchema && tool.inputSchema.required) || [];
 
   return {
     name: `masteradmin_${tool.name}`,
+    category,
+    // Sitara's own tools subcategorize (Orders/Customers/Products/...) —
+    // carrying that through means masteradmin_sitara_* inherits the same
+    // grouping for free, no separate assignment needed here.
+    subcategory: tool.subcategory || null,
     // Deliberately just the base tool's own description — the "pass
     // companySlug, resolve a company NAME via masteradmin_list_companies
     // first" guidance used to be repeated verbatim in every one of these
@@ -134,4 +144,4 @@ function wrapForCrossTenant(tool) {
   };
 }
 
-module.exports = READABLE_TENANT_TOOL_MODULES.flat().map(wrapForCrossTenant);
+module.exports = READABLE_TENANT_TOOL_MODULES.flatMap(({ tools, category }) => tools.map((t) => wrapForCrossTenant(t, category)));

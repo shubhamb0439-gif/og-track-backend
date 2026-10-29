@@ -138,7 +138,10 @@ async function commitChanges({ owner, repo, token, dir, originalFiles, baseCommi
   const commit = await githubRequest(token, 'POST', `/repos/${owner}/${repo}/git/commits`, {
     message, tree: tree.sha, parents: [baseCommitSha],
   });
-  return { committed: true, commitSha: commit.sha };
+  // changedPaths — AIDA roadmap item 16, Part 2's diff-scope check (is this
+  // commit narrowly confined to src/aida/tools/actions/ + one registration
+  // line?) needs the real list of touched files; treeEntries already has it.
+  return { committed: true, commitSha: commit.sha, changedPaths: treeEntries.map((e) => e.path) };
 }
 
 /** Creates (or, if it already exists, force-updates) a branch ref pointing at `commitSha` — the "push" half of the git analogy. */

@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { materializeSandbox } = require('./githubApi');
+const vpsBridgeClient = require('./vpsBridgeClient');
 
 /**
  * Sandbox lifecycle for the coding agent — a disposable working directory
@@ -40,15 +41,38 @@ const DUMMY_ENV = [
  * originalFiles } — the last four are opaque state github.js's
  * commitAll/pushBranch need later to diff and commit on top of this exact
  * snapshot; callers shouldn't need to touch them directly.
+ *
+ * AIDA roadmap item 17 — `options.backend` picks WHERE that sandbox actually
+ * lives: 'local' (default, unchanged — every existing call site that doesn't
+ * pass this option keeps today's exact behavior) or 'vps', which provisions
+ * the sandbox on a separate VPS via a real `git clone` instead of this
+ * process's GitHub-Data-API materialization, and returns a `dir` that's a
+ * "vps://<id>" marker string rather than a real local path — tools.js's
+ * functions and github.js's commitAll/pushBranch recognize that marker and
+ * route to vpsBridgeClient.js instead of local fs/child_process. Deliberately
+ * NOT a global switch: only devFix.js opts in today (see its own comment on
+ * why create_module/userReportedIssueBuild stay local for now).
  */
-async function createSandbox(owner, repo, token, ref = 'main') {
+async function createSandbox(owner, repo, token, ref = 'main', { backend = 'local' } = {}) {
+  if (backend === 'vps') {
+    const { sandboxId, baseCommitSha } = await vpsBridgeClient.createSandbox({ owner, repo, token, ref, envFileContents: DUMMY_ENV });
+    return {
+      dir: `vps://${sandboxId}`, owner, repo, token, backend: 'vps', sandboxId,
+      baseCommitSha, baseTreeSha: null, originalFiles: null,
+      branch: null, // set by github.js's createBranch
+      cleanup: () => vpsBridgeClient.deleteSandbox(sandboxId),
+    };
+  }
+
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aida-coding-agent-'));
   const { baseCommitSha, baseTreeSha, originalFiles } = await materializeSandbox({ owner, repo, token, ref, destDir: dir });
   fs.writeFileSync(path.join(dir, '.env'), DUMMY_ENV, 'utf8');
   return {
-    dir, owner, repo, token, baseCommitSha, baseTreeSha, originalFiles,
+    dir, owner, repo, token, backend: 'local', baseCommitSha, baseTreeSha, originalFiles,
     branch: null, // set by github.js's createBranch
-    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+    // Always a Promise regardless of backend, since VPS cleanup is a real
+    // network call — callers can now safely `await sandbox.cleanup()`.
+    cleanup: () => Promise.resolve().then(() => fs.rmSync(dir, { recursive: true, force: true })),
   };
 }
 

@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const coreDb = require('../db/core');
 const config = require('../config');
-const { hashPassword, verifyPassword, issueToken } = require('../utils/auth');
+const { hashPassword, verifyPassword, issueTokenPair, verifyRefreshToken } = require('../utils/auth');
 const { provisionTenant, provisionModulesForExistingCompany } = require('../utils/provisioning');
 const { sendWhatsAppMessage } = require('../aida/whatsapp');
 
@@ -50,13 +50,34 @@ router.post('/login', async (req, res) => {
     if (admin.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
     const ok = await verifyPassword(password, admin.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
-    const jwt = require('jsonwebtoken');
-    const token = jwt.sign(
-      { adminId: admin.id, name: admin.name, email: admin.email, role: 'masteradmin' },
-      process.env.JWT_SECRET,
-      { expiresIn: '12h' }
-    );
-    res.json({ token, admin: { id: admin.id, name: admin.name, email: admin.email } });
+    const { token, refreshToken } = issueTokenPair({ adminId: admin.id, name: admin.name, email: admin.email, role: 'masteradmin' });
+    res.json({ token, refreshToken, admin: { id: admin.id, name: admin.name, email: admin.email } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/masteradmin/refresh ────────────────────────────────────────
+// Fixes the "forced to log in again once the access token expires" issue —
+// mints a fresh access token from a still-valid refresh token, no password
+// needed. Re-checks the admin account still exists and is active (not just
+// trusting the refresh token's own payload), same reasoning as the tenant
+// version in routes/users.js.
+router.post('/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (!refreshToken) return res.status(400).json({ error: 'refreshToken is required' });
+    let payload;
+    try {
+      payload = verifyRefreshToken(refreshToken);
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired refresh token — please log in again.' });
+    }
+    if (payload.role !== 'masteradmin') return res.status(403).json({ error: 'Forbidden' });
+    const admin = await coreDb('platform_admins').where({ id: payload.adminId }).first();
+    if (!admin || admin.status !== 'active') {
+      return res.status(401).json({ error: 'This account is no longer active — please log in again.' });
+    }
+    const { token, refreshToken: newRefreshToken } = issueTokenPair({ adminId: admin.id, name: admin.name, email: admin.email, role: 'masteradmin' });
+    res.json({ token, refreshToken: newRefreshToken });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

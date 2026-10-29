@@ -69,6 +69,12 @@ const kinds = {
   // dev_repo_fix job — no separate "_build" stage needed, see the file's own
   // header comment for why.
   capability_gap_proposal: require('./capabilityGapProposal'),
+  // AIDA roadmap item 14, Component C — generates a real pptx/xlsx/docx/pdf
+  // via Anthropic's own pre-built Agent Skills (server-side sandbox, not
+  // this app's coding-agent sandbox). No approval gate — never touches OG
+  // Track's own repos/data. See generateDocument.js's own header for why
+  // this has to be a background job (a real test took 157 seconds).
+  generate_document: require('./generateDocument'),
 };
 
 function getJobKind(kind) {

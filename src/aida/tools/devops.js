@@ -55,6 +55,38 @@ module.exports = [
   },
 
   {
+    name: 'generate_document',
+    category: 'Documents',
+    description:
+      'Generates a real PowerPoint (pptx), Excel (xlsx), Word (docx), or PDF file using Anthropic\'s own ' +
+      'pre-built Agent Skills — ALWAYS talks to Anthropic directly for this regardless of which provider the ' +
+      'rest of the conversation is using. Runs as a background job — returns a job id immediately, NOT the ' +
+      'file itself; a real one can take over two minutes. Call dev_get_job_status with that id later to get ' +
+      'the result (narrationText, and fileUrl if a file was produced — not every request produces a ' +
+      'retrievable file, in which case only narrationText is present).',
+    requiredModules: [MASTERADMIN_SENTINEL_MODULE],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        skillId: { type: 'string', enum: ['pptx', 'xlsx', 'docx', 'pdf'], description: 'Which kind of document to generate.' },
+        instructions: { type: 'string', description: 'A full, specific description of the document to create — exactly as you\'d phrase the request to Claude directly, e.g. "Create a presentation about renewable energy with 5 slides."' },
+      },
+      required: ['skillId', 'instructions'],
+    },
+    async handler(context, { skillId, instructions }) {
+      if (!config.aida.anthropicApiKey && !config.aida.apiKey) {
+        return { error: 'Document generation needs an Anthropic API key configured on this server (ANTHROPIC_API_KEY) — it always uses Anthropic directly for this, independent of the conversation\'s own provider.' };
+      }
+      const job = await jobStore.createJob({ kind: 'generate_document', createdByUserId: context.userId, payload: { skillId, instructions } });
+      return {
+        jobId: job.id,
+        status: job.status,
+        message: `Started generating that ${skillId} (job ${job.id}). This can take a couple of minutes — ask me to check on it in a bit.`,
+      };
+    },
+  },
+
+  {
     name: 'dev_repo_fix',
     description:
       'Ask AIDA to actually diagnose AND FIX a real problem in an authorized repo — clones it into ' +

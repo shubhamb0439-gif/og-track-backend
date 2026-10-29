@@ -1,5 +1,6 @@
 const jobStore = require('./jobStore');
 const { getJobKind } = require('./jobKinds');
+const { notifyJobComplete } = require('./jobCompletionNotifier');
 
 // Was widened to 2 hours briefly (see cost investigation, 2026-09-10) to stop
 // this from defeating OGCore's serverless auto-pause — reverted back to a
@@ -42,6 +43,16 @@ const helpers = {
   },
 };
 
+/** Re-fetches a job and emails its creator if (and only if) it just landed in a terminal state — see jobCompletionNotifier.js for why this is generic across every job kind. Never throws. */
+async function maybeNotifyCompletion(jobId) {
+  try {
+    const job = await jobStore.getJob(jobId);
+    if (job && (job.status === 'completed' || job.status === 'failed')) await notifyJobComplete(job);
+  } catch (e) {
+    console.error(`[aida-jobs] job ${jobId}: completion-notify lookup failed:`, e.message);
+  }
+}
+
 // Live-verified twice now: a freshly (re)started process has occasionally
 // failed to resolve an otherwise-valid, already-registered job kind on its
 // very first lookup for a given job, despite the kinds registry being fully
@@ -64,6 +75,7 @@ async function runOne(job) {
     }
     unknownKindMisses.delete(job.id);
     await jobStore.updateJobStatus(job.id, 'failed', { errorMessage: `Unknown job kind "${job.kind}"` });
+    await maybeNotifyCompletion(job.id);
     return;
   }
   unknownKindMisses.delete(job.id);
@@ -71,10 +83,12 @@ async function runOne(job) {
     await jobStore.updateJobStatus(job.id, 'running');
     emitJobUpdate(await jobStore.getJob(job.id));
     await kind.run(job, helpers);
+    await maybeNotifyCompletion(job.id);
   } catch (e) {
     console.error(`[aida-jobs] job ${job.id} (${job.kind}) failed:`, e);
     const failed = await jobStore.updateJobStatus(job.id, 'failed', { errorMessage: e.message });
     emitJobUpdate(failed);
+    await maybeNotifyCompletion(job.id);
   }
 }
 
@@ -82,15 +96,19 @@ async function runOne(job) {
 async function resumeApproved(job) {
   const kind = getJobKind(job.kind);
   if (!kind || !kind.resume) {
-    return jobStore.updateJobStatus(job.id, 'failed', { errorMessage: `Job kind "${job.kind}" has nothing to resume` });
+    const failed = await jobStore.updateJobStatus(job.id, 'failed', { errorMessage: `Job kind "${job.kind}" has nothing to resume` });
+    await maybeNotifyCompletion(job.id);
+    return failed;
   }
   try {
     await kind.resume(job, helpers);
+    await maybeNotifyCompletion(job.id);
     return jobStore.getJob(job.id);
   } catch (e) {
     console.error(`[aida-jobs] job ${job.id} (${job.kind}) failed to resume:`, e);
     const failed = await jobStore.updateJobStatus(job.id, 'failed', { errorMessage: e.message });
     emitJobUpdate(failed);
+    await maybeNotifyCompletion(job.id);
     return failed;
   }
 }

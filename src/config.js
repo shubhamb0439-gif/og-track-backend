@@ -58,6 +58,15 @@ module.exports = {
     port: parseInt(process.env.PORT || '3000', 10),
     qrSecret: process.env.QR_SECRET || 'ogtrack-qr-att-2024',
     jwtSecret: required('JWT_SECRET'),
+    // Refresh tokens (fixes the "forced re-login once the access token
+    // expires" issue — there was no refresh mechanism at all before).
+    // Deliberately falls back to a value DERIVED from JWT_SECRET (not the
+    // same literal string) rather than required()'ing a brand-new env var —
+    // every existing deployment keeps working unchanged after a deploy, with
+    // no new required setup step. Set JWT_REFRESH_SECRET explicitly later
+    // for a truly independent secret; this fallback is still a different
+    // value from jwtSecret, not a reuse of it.
+    jwtRefreshSecret: process.env.JWT_REFRESH_SECRET || `${required('JWT_SECRET')}::refresh-v1`,
     bcryptRounds: parseInt(process.env.BCRYPT_ROUNDS || '10', 10),
   },
   // AIDA (AI orchestration layer) — deliberately NOT validated via required()
@@ -236,6 +245,20 @@ module.exports = {
           apiKey,
           baseUrl: process.env.BROWSERLESS_BASE_URL || 'https://production-sfo.browserless.io',
         };
+      })(),
+      // AIDA roadmap item 17 — relocates ONLY the coding agent's sandbox
+      // EXECUTION (file I/O, npm install/test, git commit/push) from this
+      // Azure process onto a separate VPS reached over HTTPS, for
+      // dev_repo_fix jobs only. The decision/orchestration loop (this
+      // process, jobRunner.js, the provider files) never moves — only what
+      // tools.js's functions and github.js's commitAll/pushBranch DO
+      // internally changes when a sandbox is VPS-backed (see
+      // codingAgent/vpsBridgeClient.js). Deliberately its own secret, never
+      // reused from any other integration's token.
+      vpsBridge: (() => {
+        const secret = process.env.VPS_BRIDGE_SECRET || null;
+        const baseUrl = process.env.VPS_BRIDGE_BASE_URL || null;
+        return { enabled: !!(secret && baseUrl), secret, baseUrl };
       })(),
       // AIDA roadmap item 11 — real web search (src/aida/tools/webResearch.js's
       // search_web tool). Brave was the original pick but its free tier was

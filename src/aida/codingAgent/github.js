@@ -1,4 +1,5 @@
 const { commitChanges, updateBranchRef } = require('./githubApi');
+const vpsBridgeClient = require('./vpsBridgeClient');
 
 /**
  * Git/GitHub operations for the coding agent's fix flow — separate from
@@ -32,8 +33,19 @@ async function createBranch(sandbox, branchName) {
  * git identity of its own to inherit, and this shouldn't be credited to
  * whatever identity happens to be configured on the host machine anyway).
  * Does NOT move any branch yet — see pushBranch for that half.
+ *
+ * AIDA roadmap item 17 — a VPS-backed sandbox (sandbox.backend === 'vps')
+ * has real `git` available, so it bypasses the GitHub-Data-API diffing dance
+ * entirely (commitChanges needs a local `sandbox.dir` to diff against, which
+ * a VPS sandbox doesn't have) and runs a real `git commit` on the VPS
+ * instead — simpler and faster, with no tree-size truncation limit.
  */
 async function commitAll(sandbox, message) {
+  if (sandbox.backend === 'vps') {
+    const result = await vpsBridgeClient.commit(sandbox.sandboxId, message);
+    if (result.committed) sandbox.newCommitSha = result.commitSha;
+    return result;
+  }
   const result = await commitChanges({
     owner: sandbox.owner, repo: sandbox.repo, token: sandbox.token, dir: sandbox.dir,
     originalFiles: sandbox.originalFiles, baseCommitSha: sandbox.baseCommitSha, baseTreeSha: sandbox.baseTreeSha,
@@ -45,6 +57,10 @@ async function commitAll(sandbox, message) {
 
 /** Points sandbox.branch at the commit commitAll just created. */
 async function pushBranch(sandbox) {
+  if (sandbox.backend === 'vps') {
+    await vpsBridgeClient.push(sandbox.sandboxId, sandbox.branch);
+    return;
+  }
   await updateBranchRef({ owner: sandbox.owner, repo: sandbox.repo, token: sandbox.token, branch: sandbox.branch, commitSha: sandbox.newCommitSha });
 }
 

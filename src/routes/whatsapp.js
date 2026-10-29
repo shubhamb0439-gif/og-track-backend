@@ -155,6 +155,16 @@ router.post('/webhook', async (req, res) => {
     if (!message || !['text', 'document', 'image'].includes(message.type)) return; // status-only callback, audio/video, etc. — nothing further to do
     if (alreadyProcessed(message.id)) return;
 
+    // AIDA Flows (roadmap item 15) — fires for EVERY inbound message that
+    // reaches this point, regardless of which branch below handles it
+    // (admin/known-contact/unknown-sender) — a flow may deliberately want to
+    // react to messages from numbers outside the existing contact list.
+    // Lazy-required to avoid a load-order cycle (same precedent as
+    // previewResolver.js's own lazy require('./jobRunner')). Fire-and-forget
+    // — a Flows bug must never break AIDA's own WhatsApp reply below.
+    require('../aida/flows/flowRunner').checkWhatsAppTriggers({ from: message.from, body: message.text?.body })
+      .catch((e) => console.error('[whatsapp] Flows trigger check failed:', e.message));
+
     const from = message.from;
     const isAllowed = config.whatsapp.allowedNumbers.some((n) => last10(n) === last10(from));
     if (!isAllowed) {

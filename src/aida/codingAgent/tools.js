@@ -1,6 +1,22 @@
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
+const vpsBridgeClient = require('./vpsBridgeClient');
+
+// AIDA roadmap item 17 — a VPS-backed sandbox's `sandboxRoot` is a
+// "vps://<sandboxId>" marker string (set by sandbox.js's createSandbox)
+// rather than a real local path. Every exported function below branches on
+// this marker FIRST and routes to vpsBridgeClient.js instead of local
+// fs/child_process when present — resolveSafe/sandboxEnv below are never
+// called in that case (the bridge enforces its own path jail server-side,
+// since it's a network-reachable service and more exposed than local fs
+// calls ever were).
+function isVpsRoot(sandboxRoot) {
+  return typeof sandboxRoot === 'string' && sandboxRoot.startsWith('vps://');
+}
+function vpsId(sandboxRoot) {
+  return sandboxRoot.slice('vps://'.length);
+}
 
 /**
  * File/command tools for the coding agent — deliberately separate from
@@ -48,6 +64,9 @@ const MAX_READ_BYTES = 200_000; // guards against accidentally reading a huge/bi
 const MAX_OUTPUT_CHARS = 20_000; // command output truncation, same spirit as toolRegistry.js's MAX_RESULT_CHARS
 
 function readFile(sandboxRoot, relPath) {
+  if (isVpsRoot(sandboxRoot)) {
+    return vpsBridgeClient.readFile(vpsId(sandboxRoot), relPath).then((r) => r.content);
+  }
   const abs = resolveSafe(sandboxRoot, relPath);
   const stat = fs.statSync(abs);
   if (stat.isDirectory()) throw new Error(`"${relPath}" is a directory, not a file.`);
@@ -58,10 +77,34 @@ function readFile(sandboxRoot, relPath) {
 }
 
 function writeFile(sandboxRoot, relPath, content) {
+  if (isVpsRoot(sandboxRoot)) {
+    return vpsBridgeClient.writeFile(vpsId(sandboxRoot), relPath, content);
+  }
   const abs = resolveSafe(sandboxRoot, relPath);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   fs.writeFileSync(abs, content, 'utf8');
   return { bytesWritten: Buffer.byteLength(content, 'utf8') };
+}
+
+/**
+ * Does `relPath` exist in this sandbox? AIDA roadmap item 17 — added because
+ * devFix.js previously checked this via a raw `fs.existsSync(...)` call that
+ * bypassed this file entirely, which breaks unconditionally for a VPS-backed
+ * sandbox (there's no local path to realpath/exist-check). Always returns a
+ * Promise for signature symmetry across both backends, even though the local
+ * case is synchronous underneath.
+ */
+async function fileExists(sandboxRoot, relPath) {
+  if (isVpsRoot(sandboxRoot)) {
+    const { files } = await vpsBridgeClient.listFiles(vpsId(sandboxRoot), '.', { recursive: false });
+    return files.includes(relPath);
+  }
+  try {
+    fs.accessSync(resolveSafe(sandboxRoot, relPath));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Real, binary-safe cousin of writeFile — that one always encodes as 'utf8',
@@ -77,6 +120,9 @@ const MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024; // 8MB — comfortably covers real w
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 
 async function downloadFile(sandboxRoot, relPath, url) {
+  if (isVpsRoot(sandboxRoot)) {
+    return vpsBridgeClient.downloadFile(vpsId(sandboxRoot), relPath, url);
+  }
   let parsed;
   try {
     parsed = new URL(url);
@@ -109,6 +155,9 @@ async function downloadFile(sandboxRoot, relPath, url) {
 }
 
 function listFiles(sandboxRoot, relDir, { recursive = false } = {}) {
+  if (isVpsRoot(sandboxRoot)) {
+    return vpsBridgeClient.listFiles(vpsId(sandboxRoot), relDir || '.', { recursive }).then((r) => r.files);
+  }
   // Resolve the root ONCE and use that consistently for every relative-path
   // computation below — mixing the raw sandboxRoot with a realpath-resolved
   // path (as resolveSafe returns) broke this on Windows, where a temp dir's
@@ -152,6 +201,13 @@ function listFiles(sandboxRoot, relDir, { recursive = false } = {}) {
  * user input.
  */
 function runCommand(sandboxRoot, command, args = [], { timeoutMs = 120_000 } = {}) {
+  if (isVpsRoot(sandboxRoot)) {
+    // A bridge-network failure becomes a normal tool-error result the agent
+    // can see and retry/adapt from, not an unhandled rejection — matching
+    // this function's own "never reject" philosophy for the local path below.
+    return vpsBridgeClient.runCommand(vpsId(sandboxRoot), command, args, { timeoutMs })
+      .catch((e) => ({ exitCode: 1, timedOut: false, stdout: '', stderr: e.message }));
+  }
   // The model occasionally emits a JSON-stringified array instead of a real
   // one for this field (confirmed live) — execFile() validates args
   // SYNCHRONOUSLY and throws a TypeError if it isn't a real array, which
@@ -216,4 +272,4 @@ function sandboxEnv() {
   return base;
 }
 
-module.exports = { readFile, writeFile, downloadFile, listFiles, runCommand, resolveSafe, SandboxPathError, MAX_READ_BYTES };
+module.exports = { readFile, writeFile, downloadFile, listFiles, runCommand, fileExists, resolveSafe, SandboxPathError, MAX_READ_BYTES };
