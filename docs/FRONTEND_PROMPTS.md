@@ -3183,3 +3183,38 @@ settings page, or wherever is the natural home here), add:
 **Verification:** upload a real image, confirm the returned URL loads as a real picture (not a
 broken image), and confirm a fresh login afterward shows the SAME picture without re-uploading —
 proving it's actually persisted server-side, not just held in this session's local state.
+
+## 56. A live "preview ready" toast/card while the AIDA panel is open — no backend work needed
+
+**Status: the backend already does everything this needs — the moment a job's preview URL
+resolves, it's persisted AND broadcast live over the exact same `aida:job` socket event every other
+job update already uses (`previewResolver.js`'s `tryResolvePreviewUrl()` calls
+`jobRunner.emitJobUpdate(updated)` the instant it finds one). This is purely a frontend addition:
+react to a field that's already arriving on a socket event this page is presumably already
+subscribed to for the Job panel's own live updates.**
+
+**Why this exists:** today, finding out a preview is ready means either getting the WhatsApp ping
+(easy to miss if you're not on your phone) or manually reopening the Job panel to check. If the AIDA
+panel is already open and watching the live job stream, it should just show you right there — no
+reason to make you go find out.
+
+**What to watch for, on the existing `aida:job` socket listener:** an incoming job update whose
+`result.previewUrl` (for `dev_repo_fix` / `user_reported_issue_build`) — or `result.previewUrls.
+frontendUrl` / `result.previewUrls.backendUrl` (for `create_module`) — is present now but wasn't on
+the previous update you had for that same job id. That transition (`null`/absent → a real URL) is
+the actual "ready" moment, not just "the field exists" — a `create_module` job may legitimately
+already carry a known `backendUrl` from the start (same fixed-slot URL `dev_repo_fix` gets
+immediately) while `frontendUrl` is still pending, so compare against this job's own previous state,
+not just presence.
+
+**What to build:** a small dismissible toast/card — "🔗 Preview ready — `<job summary/moduleName>`"
+with the real URL as a clickable link (and each additional link, frontend/backend, on `create_module`
+jobs with both) — that appears the moment this transition is detected on the socket stream, stays
+up for a reasonable interval (e.g. 8-10s, mirroring how a toast normally behaves on this page) or
+until dismissed, and does nothing if the AIDA panel isn't open (which is already true for free — a
+closed panel isn't subscribed to the socket event at all).
+
+**Verification:** trigger a real `dev_repo_fix` job while the panel is open — since its preview URL
+is known immediately, the card should appear right as the job reaches `awaiting_approval`. Separately
+trigger a frontend-touching job and confirm the card appears 1-3 minutes later, once Azure's Static
+Web Apps build actually finishes and the poller picks up the resolved URL — not before.

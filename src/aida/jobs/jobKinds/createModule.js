@@ -1,9 +1,7 @@
-const fs = require('fs');
-const path = require('path');
 const sql = require('mssql');
 const config = require('../../../config');
 const { createSandbox } = require('../../codingAgent/sandbox');
-const { runCommand, listFiles, readFile, downloadFile } = require('../../codingAgent/tools');
+const { runCommand, listFiles, readFile, downloadFile, fileExists } = require('../../codingAgent/tools');
 const browserless = require('../../codingAgent/browserless');
 const depsCache = require('../../codingAgent/depsCache');
 const { snapshotExistingFiles } = require('../../codingAgent/moduleGuardrails');
@@ -13,7 +11,7 @@ const { snapshotExistingFiles } = require('../../codingAgent/moduleGuardrails');
 const { runModuleBuilderAgent } = config.aida.codingAgent.provider === 'anthropic'
   ? require('../../codingAgent/providers/anthropicModuleBuilder')
   : require('../../codingAgent/providers/moduleBuilder');
-const { runSqlFileAgainstPool } = require('../../../utils/provisioning');
+const { runSqlTextAgainstPool } = require('../../../utils/provisioning');
 const {
   createBranch, commitAll, pushBranch, openPullRequest,
   mergePullRequest, closePullRequest,
@@ -243,13 +241,21 @@ module.exports = {
     // agent ever mistakenly tries a backend-repo tool call on a page task.
     const needsBackend = !isPage;
 
+    // AIDA roadmap item 17's extension to create_module — same VPS-backed
+    // execution dev_repo_fix already proved out, now applied to both
+    // sandboxes here too. No actionFastLane-style exclusion needed (that
+    // concept is specific to capability_gap_proposal-originated dev_repo_fix
+    // jobs) — every create_module job can use the VPS once it's enabled.
+    const useVps = config.aida.vpsBridge.enabled;
+    const sandboxOpts = { backend: useVps ? 'vps' : 'local' };
+
     let backendSandbox, frontendSandbox;
     try {
       [backendSandbox, frontendSandbox] = await Promise.all([
-        needsBackend ? createSandbox(backendOwner, backendRepoName, ca.githubToken) : Promise.resolve(null),
-        createSandbox(frontendOwner, frontendRepoName, ca.githubToken),
+        needsBackend ? createSandbox(backendOwner, backendRepoName, ca.githubToken, 'main', sandboxOpts) : Promise.resolve(null),
+        createSandbox(frontendOwner, frontendRepoName, ca.githubToken, 'main', sandboxOpts),
       ]);
-      await appendEvent(job.id, 'cloned', { backendRepo: needsBackend ? mb.backendRepo : null, frontendRepo: mb.frontendRepo, backendSkipped: !needsBackend });
+      await appendEvent(job.id, 'cloned', { backendRepo: needsBackend ? mb.backendRepo : null, frontendRepo: mb.frontendRepo, backendSkipped: !needsBackend, backend: sandboxOpts.backend });
 
       await appendEvent(job.id, 'installing');
       // Not every repo here is guaranteed to be an npm project — the
@@ -258,18 +264,27 @@ module.exports = {
       // by serve.js, no build step). Running `npm install` against a
       // directory with no package.json fails hard (ENOENT), so check first
       // and skip per-sandbox rather than assuming every repo needs it.
-      const backendHasPkg = needsBackend && fs.existsSync(path.join(fs.realpathSync(backendSandbox.dir), 'package.json'));
-      const frontendHasPkg = fs.existsSync(path.join(fs.realpathSync(frontendSandbox.dir), 'package.json'));
+      // Uses tools.js's fileExists (VPS-aware) instead of raw fs calls —
+      // a vps:// marker isn't a real local path fs.realpathSync can resolve.
+      const backendHasPkg = needsBackend && await fileExists(backendSandbox.dir, 'package.json');
+      const frontendHasPkg = await fileExists(frontendSandbox.dir, 'package.json');
 
       const installOne = async (sandbox, hasPkg, label) => {
         if (!hasPkg) return { exitCode: 0, skipped: true };
-        const restored = await depsCache.tryRestore(sandbox.dir);
-        if (restored) {
-          await appendEvent(job.id, 'deps_cache_hit', { repo: label });
-          return { exitCode: 0, cached: true };
+        // depsCache reads/writes sandbox.dir directly as a local path and
+        // restores from Blob Storage — neither applies to a VPS-backed
+        // sandbox (no local dir to cache into, and the VPS's own disk is
+        // already fast enough that a fresh install there was confirmed
+        // quick — same reasoning as devFix.js not needing this either).
+        if (sandbox.backend !== 'vps') {
+          const restored = await depsCache.tryRestore(sandbox.dir);
+          if (restored) {
+            await appendEvent(job.id, 'deps_cache_hit', { repo: label });
+            return { exitCode: 0, cached: true };
+          }
         }
         const result = await runCommand(sandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 });
-        if (result.exitCode === 0) await depsCache.saveCacheSafely(sandbox.dir, label);
+        if (result.exitCode === 0 && sandbox.backend !== 'vps') await depsCache.saveCacheSafely(sandbox.dir, label);
         return result;
       };
 
@@ -456,9 +471,12 @@ module.exports = {
     } finally {
       // Nothing runs FROM these directories anymore (preview is real
       // deployed infrastructure now, not a local process pair) — safe to
-      // clean up unconditionally, same as devFix.js.
-      backendSandbox?.cleanup();
-      frontendSandbox?.cleanup();
+      // clean up unconditionally, same as devFix.js. Awaited and failure-
+      // tolerant (item 17) — a VPS-backed cleanup is a real network call
+      // now, and a cleanup failure must never mask the job's own already-
+      // recorded completed/failed status.
+      await backendSandbox?.cleanup().catch((e) => console.error(`[aida] backend sandbox cleanup failed for job ${job.id}:`, e.message));
+      await frontendSandbox?.cleanup().catch((e) => console.error(`[aida] frontend sandbox cleanup failed for job ${job.id}:`, e.message));
     }
   },
 
@@ -503,7 +521,15 @@ module.exports = {
   },
 };
 
-/** Runs newly-created (not-yet-merged) schema files straight from the sandbox against the staging DB, so the live preview actually has the new module's tables. Safe to re-run — same already-exists-skipping as the real provisioning path. */
+/**
+ * Runs newly-created (not-yet-merged) schema files straight from the sandbox
+ * against the staging DB, so the live preview actually has the new module's
+ * tables. Safe to re-run — same already-exists-skipping as the real
+ * provisioning path. Reads each file's text via tools.js's readFile (VPS-
+ * aware) and runs it with runSqlTextAgainstPool, rather than resolving a
+ * local absolute path — a vps:// marker isn't one fs.realpathSync can
+ * resolve, which is what this did before the VPS extension (item 17).
+ */
 async function applyNewSchemaFilesToStaging(relFiles, backendSandboxDir, stagingDb) {
   const pool = await sql.connect({
     server: stagingDb.server, port: stagingDb.port, user: stagingDb.user, password: stagingDb.password,
@@ -512,8 +538,8 @@ async function applyNewSchemaFilesToStaging(relFiles, backendSandboxDir, staging
   });
   try {
     for (const relFile of relFiles) {
-      const absPath = path.join(fs.realpathSync(backendSandboxDir), relFile);
-      const result = await runSqlFileAgainstPool(pool, absPath);
+      const sqlText = await readFile(backendSandboxDir, relFile);
+      const result = await runSqlTextAgainstPool(pool, sqlText);
       if (result.failed) throw new Error(`${relFile}: ${result.failureMessages.join(' | ')}`);
     }
   } finally {

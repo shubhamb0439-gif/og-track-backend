@@ -207,8 +207,15 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
  * runSchemaScripts itself needs since it's always logging progress for a
  * real company's provisioning run).
  */
-async function runSqlFileAgainstPool(pool, absPath) {
-  const sqlText = fs.readFileSync(absPath, 'utf8');
+/**
+ * The real batch-split-and-execute logic, taking SQL TEXT directly rather
+ * than a file path — split out (AIDA roadmap item 17's extension to
+ * create_module) so a VPS-backed sandbox's schema files, which have no
+ * local path to read with fs.readFileSync, can still be run against staging
+ * by fetching their text via tools.js's VPS-aware readFile() first. See
+ * createModule.js's applyNewSchemaFilesToStaging for that caller.
+ */
+async function runSqlTextAgainstPool(pool, sqlText) {
   const batches = sqlText.split(/^\s*GO\s*$/im).map(b => b.trim()).filter(Boolean);
   let skipped = 0, failed = 0;
   const failureMessages = [];
@@ -222,6 +229,10 @@ async function runSqlFileAgainstPool(pool, absPath) {
     }
   }
   return { skipped, failed, failureMessages, totalBatches: batches.length };
+}
+
+async function runSqlFileAgainstPool(pool, absPath) {
+  return runSqlTextAgainstPool(pool, fs.readFileSync(absPath, 'utf8'));
 }
 
 async function provisionTenant(company, enabledModules, adminInfo = null) {
@@ -370,5 +381,5 @@ async function provisionModulesForExistingCompany(company, moduleKeys) {
 
 module.exports = {
   provisionTenant, provisionModulesForExistingCompany, MODULE_TO_SCRIPT, MODULE_DEPENDENCIES,
-  runSqlFileAgainstPool, isAlreadyExistsError, generateTempPassword, SQL_DIR,
+  runSqlFileAgainstPool, runSqlTextAgainstPool, isAlreadyExistsError, generateTempPassword, SQL_DIR,
 };

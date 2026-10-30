@@ -1,8 +1,6 @@
-const fs = require('fs');
-const path = require('path');
 const config = require('../../../config');
 const { createSandbox } = require('../../codingAgent/sandbox');
-const { runCommand } = require('../../codingAgent/tools');
+const { runCommand, fileExists } = require('../../codingAgent/tools');
 const { runCodingAgent } = config.aida.codingAgent.provider === 'anthropic'
   ? require('../../codingAgent/providers/anthropic')
   : require('../../codingAgent/providers/openai');
@@ -109,13 +107,17 @@ module.exports = {
     const [owner, repoName] = repo.split('/');
     const effectiveTask = buildTask({ type, description, screenshotUrl });
 
+    // AIDA roadmap item 17's extension — same VPS-backed execution
+    // dev_repo_fix/create_module already use.
+    const useVps = config.aida.vpsBridge.enabled;
+
     let sandbox;
     try {
-      sandbox = await createSandbox(owner, repoName, ca.githubToken);
-      await appendEvent(job.id, 'cloned', { repo });
+      sandbox = await createSandbox(owner, repoName, ca.githubToken, 'main', { backend: useVps ? 'vps' : 'local' });
+      await appendEvent(job.id, 'cloned', { repo, backend: sandbox.backend });
 
       await appendEvent(job.id, 'installing');
-      const hasPackageJson = fs.existsSync(path.join(fs.realpathSync(sandbox.dir), 'package.json'));
+      const hasPackageJson = await fileExists(sandbox.dir, 'package.json');
       const install = hasPackageJson
         ? await runCommand(sandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 })
         : { exitCode: 0, skipped: true };
@@ -203,7 +205,10 @@ module.exports = {
       await appendEvent(job.id, 'failed', { error: safeMessage });
       notifyBuildResult(job, `⚠️ AIDA hit an unexpected error while working on this and had to stop: ${safeMessage}`);
     } finally {
-      sandbox?.cleanup();
+      // Awaited and failure-tolerant (item 17) — a VPS-backed cleanup is a
+      // real network call, and a cleanup failure must never mask the job's
+      // own already-recorded completed/failed status.
+      await sandbox?.cleanup().catch((e) => console.error(`[aida] sandbox cleanup failed for job ${job.id}:`, e.message));
     }
   },
 
