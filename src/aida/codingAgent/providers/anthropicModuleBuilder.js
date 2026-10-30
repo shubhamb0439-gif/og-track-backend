@@ -244,7 +244,16 @@ async function runModuleBuilderAgent({
   return { success: false, summary: `Stopped after ${maxIterations} iterations without calling finish — likely stuck in a loop.`, toolLog };
 }
 
-function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalContents, name, args }) {
+// Async (item 17) — read_file/list_files below wrap tools.js's result inside
+// a {content:...}/{files:...} object before returning. For a VPS-backed
+// sandbox, tools.readFile()/listFiles() return a Promise (a real network
+// call) — nested a level deep like that, the call site's own
+// `result instanceof Promise` check never sees it (the OUTER object isn't a
+// Promise, only its property is), so the agent would silently receive an
+// empty {} instead of real file content/listings. Making this function
+// itself async — and awaiting those two calls — means it always returns a
+// real Promise, which that outer check already handles correctly either way.
+async function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalContents, name, args }) {
   try {
     const repo = args.repo === 'frontend' ? 'frontend' : 'backend';
     const sandboxDir = sandboxDirs[repo];
@@ -252,7 +261,7 @@ function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalCont
 
     switch (name) {
       case 'read_file':
-        return { content: tools.readFile(sandboxDir, args.path) };
+        return { content: await tools.readFile(sandboxDir, args.path) };
       case 'write_file': {
         // See the max_tokens comment above — a missing `content` key means
         // this call's JSON got cut off before the content string was
@@ -273,7 +282,7 @@ function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalCont
         return tools.writeFile(sandboxDir, args.path, args.content);
       }
       case 'list_files':
-        return { files: tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
+        return { files: await tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
       case 'run_command':
         return tools.runCommand(sandboxDir, args.command, args.args || []);
       case 'inspect_website':

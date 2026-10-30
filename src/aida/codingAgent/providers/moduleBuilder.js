@@ -258,7 +258,12 @@ async function runModuleBuilderAgent({
   return { success: false, summary: `Stopped after ${maxIterations} iterations without calling finish — likely stuck in a loop.`, toolLog };
 }
 
-function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalContents, name, args }) {
+// Async (item 17) — see anthropicModuleBuilder.js's identical executeTool for
+// the full reasoning: read_file/list_files wrap tools.js's result inside an
+// object before returning, which hides a VPS-backed sandbox's Promise from
+// the call site's `result instanceof Promise` check unless this function
+// itself is async and awaits those two calls directly.
+async function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalContents, name, args }) {
   try {
     const repo = args.repo === 'frontend' ? 'frontend' : 'backend';
     const sandboxDir = sandboxDirs[repo];
@@ -266,7 +271,7 @@ function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalCont
 
     switch (name) {
       case 'read_file':
-        return { content: tools.readFile(sandboxDir, args.path) };
+        return { content: await tools.readFile(sandboxDir, args.path) };
       case 'write_file': {
         // See anthropicModuleBuilder.js's write_file case for why this is
         // checked explicitly rather than defaulting to '' — a missing
@@ -285,7 +290,7 @@ function executeTool({ sandboxDirs, existingFiles, insertOnlyFiles, originalCont
         return tools.writeFile(sandboxDir, args.path, args.content);
       }
       case 'list_files':
-        return { files: tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
+        return { files: await tools.listFiles(sandboxDir, args.path || '.', { recursive: !!args.recursive }) };
       case 'run_command':
         return tools.runCommand(sandboxDir, args.command, args.args || []);
       case 'inspect_website':

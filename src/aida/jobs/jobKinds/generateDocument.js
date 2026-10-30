@@ -1,5 +1,6 @@
 const config = require('../../../config');
 const Anthropic = require('@anthropic-ai/sdk');
+const PDFDocument = require('pdfkit');
 const { uploadBuffer, logoContainerName } = require('../../../utils/blobStorage');
 
 /**
@@ -80,6 +81,27 @@ async function fetchFileContent(fileId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+/**
+ * Fallback for the real, observed quirk above (skillId 'pdf' sometimes
+ * produces no retrievable file_id at all) — renders the narration text
+ * itself as a plain PDF via pdfkit (same library/approach as the
+ * purpose-built make_pdf tool) so a Flow's next step always has a real
+ * fileUrl to attach when 'pdf' was requested, instead of silently getting
+ * null. Not attempted for pptx/xlsx/docx — pdfkit can't produce those
+ * formats, and live testing found this quirk only ever hits 'pdf'.
+ */
+function renderFallbackPdfBuffer(narrationText) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    const chunks = [];
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+    doc.font('Helvetica').fontSize(11).text(narrationText || '(no content returned)', { align: 'left' });
+    doc.end();
+  });
+}
+
 module.exports = {
   async run(job, { appendEvent, updateStatus }) {
     const { skillId, instructions } = job.payload || {};
@@ -117,7 +139,26 @@ module.exports = {
     const fileId = extractFileId(response.content || []);
 
     if (!fileId) {
-      // Real, observed outcome (see header comment) — complete with the text only rather than failing a job that genuinely succeeded from Anthropic's side.
+      // Real, observed outcome (see header comment). For 'pdf' specifically,
+      // don't leave fileUrl null — a Flow step chaining this into
+      // send_email/message_contact's attachFileUrl would have nothing to
+      // attach. Render the narration text as a plain fallback PDF instead,
+      // so there's always a real, attachable file for this skill.
+      if (skillId === 'pdf') {
+        try {
+          const buffer = await renderFallbackPdfBuffer(narrationText);
+          const filename = `document-${job.id}.pdf`;
+          const blobName = `${BLOB_PREFIX}${job.id}-${filename}`;
+          const fileUrl = await uploadBuffer(buffer, blobName, 'application/pdf', FILES_CONTAINER);
+          await appendEvent(job.id, 'fallback_pdf_rendered', { note: 'No file_id came back from Anthropic — rendered the narration text as a plain PDF instead.' });
+          await updateStatus(job.id, 'completed', { result: { narrationText, fileUrl, filename } });
+          await appendEvent(job.id, 'completed', {});
+          return;
+        } catch (e) {
+          await appendEvent(job.id, 'fallback_pdf_failed', { error: e.message });
+          // Fall through to the text-only completion below if even the fallback fails.
+        }
+      }
       await updateStatus(job.id, 'completed', { result: { narrationText, fileUrl: null, filename: null } });
       await appendEvent(job.id, 'completed', { note: 'No file_id came back — only narration text is available for this one.' });
       return;
