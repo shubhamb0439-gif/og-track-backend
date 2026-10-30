@@ -39,6 +39,7 @@ const tokenRoutes = require('./routes/token');
 const notesRoutes = require('./routes/notes');
 const birthdayRoutes = require('./routes/birthday');
 const sitaraRoutes = require('./routes/sitara');
+const test_moduleRoutes = require('./routes/test_module');
 
 const app = express();
 const server = http.createServer(app);
@@ -166,6 +167,11 @@ app.use('/api/:slug/birthday', resolveTenant, requireModule('birthday'), birthda
 // Sitara Bespoke module bundle (dashboard, people, stocks, orders) — any of
 // its 4 module keys unlocks the whole route file, same pattern as acc/hr above.
 app.use('/api/:slug/sitara', resolveTenant, requireModule(['sitara_dashboard', 'sitara_people', 'sitara_stocks', 'sitara_orders']), sitaraRoutes);
+// Test Module — a tester/developer-only diagnostic utility with no real
+// business data model (see routes/test_module.js). requireAuth is mounted
+// here (same pattern as test-cases above) since the role lock inside the
+// route file needs req.auth populated.
+app.use('/api/:slug/test_module', resolveTenant, requireModule('test_module'), requireAuth, test_moduleRoutes);
 
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));
