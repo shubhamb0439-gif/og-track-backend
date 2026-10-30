@@ -47,6 +47,7 @@ const MODULE_TO_SCRIPT = {
   sitara_people:    '17_module_sitara.sql',
   sitara_stocks:    '17_module_sitara.sql',
   sitara_orders:    '17_module_sitara.sql',
+  module_x:         '18_module_module_x.sql',
 };
 
 // Some modules' tables have foreign keys into another module's tables (e.g.
@@ -152,6 +153,7 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   if (scriptsNeeded.has('15_module_notes.sql')) orderedScripts.push('15_module_notes.sql');
   if (scriptsNeeded.has('16_module_birthday.sql')) orderedScripts.push('16_module_birthday.sql');
   if (scriptsNeeded.has('17_module_sitara.sql')) orderedScripts.push('17_module_sitara.sql');
+  if (scriptsNeeded.has('18_module_module_x.sql')) orderedScripts.push('18_module_module_x.sql');
 
   // Patch files are additive schema changes (see ogtrack-sql-schema/tenant's
   // patch_*.sql convention) meant to be run once against an already-live
