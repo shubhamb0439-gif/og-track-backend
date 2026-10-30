@@ -56,10 +56,15 @@ function formatFeatures(features) {
   return String(features || '').trim();
 }
 
-function nextSchemaScriptNumber(backendSandboxDir) {
+// Async + awaited internally (item 17) — same reasoning as
+// snapshotExistingFiles above: listFiles() returns a Promise for a VPS-
+// backed sandbox, and calling .map()/.filter() on an un-awaited Promise
+// crashes instead of throwing the "listing failed" case this already
+// handles for local sandboxes.
+async function nextSchemaScriptNumber(backendSandboxDir) {
   let entries = [];
   try {
-    entries = listFiles(backendSandboxDir, 'ogtrack-sql-schema/tenant', { recursive: false });
+    entries = await listFiles(backendSandboxDir, 'ogtrack-sql-schema/tenant', { recursive: false });
   } catch {
     return '13'; // directory listing failed (shouldn't happen in a real clone) — safe-ish fallback, agent should verify itself
   }
@@ -309,18 +314,26 @@ module.exports = {
       if (needsBackend) await createBranch(backendSandbox, branchName);
       await createBranch(frontendSandbox, branchName);
 
-      const existingFiles = { backend: needsBackend ? snapshotExistingFiles(backendSandbox.dir) : new Set(), frontend: snapshotExistingFiles(frontendSandbox.dir) };
+      const existingFiles = {
+        backend: needsBackend ? await snapshotExistingFiles(backendSandbox.dir) : new Set(),
+        frontend: await snapshotExistingFiles(frontendSandbox.dir),
+      };
+      // Awaited (item 17) — readFile() is a real network call for a VPS-backed
+      // sandbox (a Promise), not the plain synchronous read it is locally; an
+      // un-awaited call here would store a pending Promise into the map
+      // instead of the real file text, and a VPS rejection wouldn't be
+      // caught by this same try/catch the way a local throw already is.
       const originalContents = { backend: new Map(), frontend: new Map() };
       if (needsBackend) {
         for (const f of mb.insertOnlyFiles.backend) {
-          try { originalContents.backend.set(f, readFile(backendSandbox.dir, f)); } catch { /* file may not exist in this checkout — write will fail its own way */ }
+          try { originalContents.backend.set(f, await readFile(backendSandbox.dir, f)); } catch { /* file may not exist in this checkout — write will fail its own way */ }
         }
       }
       for (const f of mb.insertOnlyFiles.frontend) {
-        try { originalContents.frontend.set(f, readFile(frontendSandbox.dir, f)); } catch { /* same as above */ }
+        try { originalContents.frontend.set(f, await readFile(frontendSandbox.dir, f)); } catch { /* same as above */ }
       }
 
-      const nextNumber = needsBackend ? nextSchemaScriptNumber(backendSandbox.dir) : null;
+      const nextNumber = needsBackend ? await nextSchemaScriptNumber(backendSandbox.dir) : null;
 
       let researchSummary = null;
       if (sourceUrl) {
@@ -406,7 +419,7 @@ module.exports = {
         // path can't pick it up — run whatever NEW .sql files the agent added
         // directly against the staging DB here, so the preview actually has
         // the module's own tables before it boots.
-        const newSqlFiles = listFiles(backendSandbox.dir, 'ogtrack-sql-schema/tenant', { recursive: false })
+        const newSqlFiles = (await listFiles(backendSandbox.dir, 'ogtrack-sql-schema/tenant', { recursive: false }))
           .filter((f) => f.endsWith('.sql') && !existingFiles.backend.has(f));
         if (newSqlFiles.length) {
           await appendEvent(job.id, 'seeding_preview_schema', { files: newSqlFiles });

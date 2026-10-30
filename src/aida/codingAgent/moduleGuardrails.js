@@ -17,9 +17,19 @@ const { listFiles } = require('./tools');
  * everything else stays exactly as strict as "new files only."
  */
 
-/** Snapshot of every file that already existed right after clone, before the agent runs — anything not in here is a new file the agent is free to create. */
-function snapshotExistingFiles(sandboxDir) {
-  return new Set(listFiles(sandboxDir, '.', { recursive: true }).filter((p) => !p.endsWith('/')));
+/**
+ * Snapshot of every file that already existed right after clone, before the
+ * agent runs — anything not in here is a new file the agent is free to
+ * create. Async (and every caller must await it) because tools.js's
+ * listFiles() returns a Promise for a VPS-backed sandbox (a real network
+ * call) but a plain array for a local one — awaiting works correctly either
+ * way, but calling .filter() on the un-awaited result crashes with "...
+ * .filter is not a function" the instant a VPS-backed sandbox reaches this
+ * (confirmed live, AIDA roadmap item 17's create_module extension).
+ */
+async function snapshotExistingFiles(sandboxDir) {
+  const files = await listFiles(sandboxDir, '.', { recursive: true });
+  return new Set(files.filter((p) => !p.endsWith('/')));
 }
 
 function normalizeRelPath(relPath) {

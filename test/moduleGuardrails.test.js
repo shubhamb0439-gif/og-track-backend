@@ -13,27 +13,31 @@ function makeSandboxWithExistingFiles() {
   return dir;
 }
 
-test('write to a brand-new file is allowed', () => {
+// snapshotExistingFiles is async (AIDA roadmap item 17 — it has to await
+// tools.js's listFiles(), which is a real network call for a VPS-backed
+// sandbox) — every test below awaits it accordingly.
+
+test('write to a brand-new file is allowed', async () => {
   const dir = makeSandboxWithExistingFiles();
-  const existingFiles = snapshotExistingFiles(dir);
+  const existingFiles = await snapshotExistingFiles(dir);
   assert.doesNotThrow(() => assertModuleWriteAllowed({
     relPath: 'src/routes/attendance.js', content: 'module.exports = {};\n', existingFiles, insertOnlyFiles: [],
   }));
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('write to a pre-existing file NOT on the insert-only list is refused', () => {
+test('write to a pre-existing file NOT on the insert-only list is refused', async () => {
   const dir = makeSandboxWithExistingFiles();
-  const existingFiles = snapshotExistingFiles(dir);
+  const existingFiles = await snapshotExistingFiles(dir);
   assert.throws(() => assertModuleWriteAllowed({
     relPath: 'src/routes/existing.js', content: 'module.exports = { changed: true };\n', existingFiles, insertOnlyFiles: [],
   }), /already existed/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('insert-only file: adding a line is allowed', () => {
+test('insert-only file: adding a line is allowed', async () => {
   const dir = makeSandboxWithExistingFiles();
-  const existingFiles = snapshotExistingFiles(dir);
+  const existingFiles = await snapshotExistingFiles(dir);
   const original = "const a = require('a');\napp.use('/a', a);\n";
   assert.doesNotThrow(() => assertModuleWriteAllowed({
     relPath: 'src/server.js',
@@ -43,9 +47,9 @@ test('insert-only file: adding a line is allowed', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('insert-only file: removing or changing an existing line is refused', () => {
+test('insert-only file: removing or changing an existing line is refused', async () => {
   const dir = makeSandboxWithExistingFiles();
-  const existingFiles = snapshotExistingFiles(dir);
+  const existingFiles = await snapshotExistingFiles(dir);
   const original = "const a = require('a');\napp.use('/a', a);\n";
   assert.throws(() => assertModuleWriteAllowed({
     relPath: 'src/server.js',
@@ -60,9 +64,9 @@ test('insert-only file: reordering lines still counts as preserved (line-set che
   assert.doesNotThrow(() => assertInsertOnlyEdit(original, 'line2\nline1\nline3\n', 'src/server.js'));
 });
 
-test('destructive SQL in a new .sql file is refused', () => {
+test('destructive SQL in a new .sql file is refused', async () => {
   const dir = makeSandboxWithExistingFiles();
-  const existingFiles = snapshotExistingFiles(dir);
+  const existingFiles = await snapshotExistingFiles(dir);
   assert.throws(() => assertModuleWriteAllowed({
     relPath: 'ogtrack-sql-schema/tenant/13_module_attendance.sql',
     content: 'DROP TABLE dbo.users;\n',
@@ -71,9 +75,9 @@ test('destructive SQL in a new .sql file is refused', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('additive SQL in a new .sql file is allowed', () => {
+test('additive SQL in a new .sql file is allowed', async () => {
   const dir = makeSandboxWithExistingFiles();
-  const existingFiles = snapshotExistingFiles(dir);
+  const existingFiles = await snapshotExistingFiles(dir);
   assert.doesNotThrow(() => assertModuleWriteAllowed({
     relPath: 'ogtrack-sql-schema/tenant/13_module_attendance.sql',
     content: 'CREATE TABLE dbo.attendance_v2 (id INT PRIMARY KEY);\n',
