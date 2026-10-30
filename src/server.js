@@ -39,6 +39,7 @@ const tokenRoutes = require('./routes/token');
 const notesRoutes = require('./routes/notes');
 const birthdayRoutes = require('./routes/birthday');
 const sitaraRoutes = require('./routes/sitara');
+const tester_bug_trackerRoutes = require('./routes/tester_bug_tracker');
 
 const app = express();
 const server = http.createServer(app);
@@ -166,6 +167,7 @@ app.use('/api/:slug/birthday', resolveTenant, requireModule('birthday'), birthda
 // Sitara Bespoke module bundle (dashboard, people, stocks, orders) — any of
 // its 4 module keys unlocks the whole route file, same pattern as acc/hr above.
 app.use('/api/:slug/sitara', resolveTenant, requireModule(['sitara_dashboard', 'sitara_people', 'sitara_stocks', 'sitara_orders']), sitaraRoutes);
+app.use('/api/:slug/tester_bug_tracker', resolveTenant, requireModule('tester_bug_tracker'), tester_bug_trackerRoutes);
 
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));
