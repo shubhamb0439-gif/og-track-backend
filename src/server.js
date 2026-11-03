@@ -39,10 +39,6 @@ const tokenRoutes = require('./routes/token');
 const notesRoutes = require('./routes/notes');
 const birthdayRoutes = require('./routes/birthday');
 const sitaraRoutes = require('./routes/sitara');
-// TEMPORARY — one-time Shopify Admin API token bootstrap, see the file's own
-// doc comment. Delete this require + the app.use(shopifyBootstrapRoutes)
-// below once SHOPIFY_ADMIN_API_TOKEN has a real value.
-const shopifyBootstrapRoutes = require('./routes/shopifyBootstrap');
 
 const app = express();
 const server = http.createServer(app);
@@ -86,11 +82,6 @@ io.on('connection', (socket) => {
     if (slug) socket.join(slug);
   });
 });
-
-// TEMPORARY — see src/routes/shopifyBootstrap.js's doc comment. Mounted at
-// root since the Shopify app's application_url points straight at this
-// backend's bare domain.
-app.use('/', shopifyBootstrapRoutes);
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', async (_req, res) => {

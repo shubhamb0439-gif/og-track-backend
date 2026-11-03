@@ -830,6 +830,294 @@ router.get('/bigcommerce/backfill/status', (req, res) => {
   res.json(backfillStatus.get(req.company.slug) || { status: 'never_run' });
 });
 
+// ── Shopify (second order source, same company) ───────────────────────────────
+// Sitara ran on Shopify before migrating to BigCommerce, and is being
+// reconnected as a SECOND live order source alongside it — same
+// sitara_orders/sitara_order_items/sitara_customers tables, source: 'shopify',
+// its own shopify_order_id/shopify_customer_id/shopify_product_id id columns
+// (patch_20_sitara_shopify_ids.sql) so neither source's ids collide with the
+// other's. Razorpay is confirmed to be the SAME account behind Shopify
+// checkout too, so no separate reconciliation logic is needed there — once an
+// order lands here with a real total/created_at, matchRazorpayPaymentToOrder's
+// existing customer+amount and amount+time-proximity fallbacks already work
+// regardless of source.
+
+// Mirrors BC_STATUS_MAP's role: Shopify splits status across TWO fields
+// (financial_status + fulfillment_status, plus a separate cancelled_at) where
+// BigCommerce uses one string — folded into the SAME ORDER_STATUSES enum so
+// the Orders view displays consistently no matter which source an order came
+// from.
+function mapShopifyStatus(order) {
+  if (order.cancelled_at) return 'cancelled';
+  const fin = order.financial_status;
+  const ful = order.fulfillment_status;
+  if (fin === 'refunded') return 'refunded';
+  if (fin === 'partially_refunded') return 'partially_refunded';
+  if (fin === 'voided') return 'declined';
+  if (fin === 'pending' || fin === 'authorized') return 'awaiting_payment';
+  if (fin === 'paid' || fin === 'partially_paid') {
+    if (ful === 'fulfilled') return 'completed';
+    if (ful === 'partial') return 'partially_shipped';
+    return 'awaiting_fulfillment';
+  }
+  return 'awaiting_fulfillment';
+}
+
+function shopifyApiHeaders() {
+  return { 'X-Shopify-Access-Token': config.shopify.adminApiToken, 'Content-Type': 'application/json' };
+}
+
+async function fetchShopifyOrder(shopifyOrderId) {
+  const res = await fetch(
+    `https://${config.shopify.shopDomain}/admin/api/${config.shopify.apiVersion}/orders/${shopifyOrderId}.json`,
+    { headers: shopifyApiHeaders() }
+  );
+  if (!res.ok) throw new Error(`Shopify order fetch failed (${res.status}): ${await res.text()}`);
+  return (await res.json()).order;
+}
+
+// Shopify's line_item.price is PER UNIT and tax-inclusive only when the
+// order itself has taxes_included: true — otherwise it's tax-exclusive and
+// the line's own tax_lines need adding back in. Returns {unitPrice, lineTotal}
+// both tax-inclusive, matching BigCommerce's price_inc_tax/total_inc_tax
+// convention so unit_price/line_total mean the same thing regardless of source.
+function shopifyLineItemInclTax(lineItem, order) {
+  const qty = Number(lineItem.quantity || 1);
+  const baseLineTotal = Number(lineItem.price || 0) * qty;
+  const taxSum = (lineItem.tax_lines || []).reduce((s, t) => s + Number(t.price || 0), 0);
+  const lineTotal = order.taxes_included ? baseLineTotal : baseLineTotal + taxSum;
+  return { unitPrice: qty > 0 ? lineTotal / qty : lineTotal, lineTotal };
+}
+
+/**
+ * Upserts one Shopify order (the FULL order object — Shopify's webhooks send
+ * the whole order inline, unlike BigCommerce's id-only webhook, so no
+ * follow-up fetch is needed there; the backfill path below fetches first and
+ * passes the result in here the same way). Mirrors syncBigCommerceOrder's
+ * exact shape: guest-vs-registered customer handling, real order date
+ * preservation, stock decrement only on first sync, items replaced on
+ * re-sync.
+ */
+async function syncShopifyOrder(db, io, companySlug, order) {
+  const mappedStatus = mapShopifyStatus(order);
+
+  // Shopify orders almost always carry billing_address even for a guest
+  // checkout (no customer account) — same "name/email lives on the address,
+  // not just on a linked customer record" situation BigCommerce's guest
+  // orders have. Registered customers key off shopify_customer_id; guests
+  // key off email instead, so repeat guest orders from the same email still
+  // link to one customer record.
+  let customerId = null;
+  const billing = order.billing_address || order.shipping_address || {};
+  const customerName = [billing.first_name, billing.last_name].filter(Boolean).join(' ').trim();
+  const shopifyCustomerId = order.customer?.id ? String(order.customer.id) : null;
+  const customerEmail = order.email || order.contact_email || billing.email || null;
+
+  if (shopifyCustomerId || customerEmail || customerName) {
+    let customer = shopifyCustomerId
+      ? await db('sitara_customers').where({ shopify_customer_id: shopifyCustomerId }).first()
+      : (customerEmail ? await db('sitara_customers').where({ email: customerEmail, source: 'shopify' }).first() : null);
+    if (!customer) {
+      const id = newId('cust');
+      await db('sitara_customers').insert({
+        id,
+        name: customerName || (shopifyCustomerId ? `Customer ${shopifyCustomerId}` : 'Guest'),
+        phone: billing.phone || null,
+        email: customerEmail,
+        source: 'shopify',
+        city: billing.city || null,
+        address_line1: billing.address1 || null,
+        address_line2: billing.address2 || null,
+        state: billing.province || null,
+        postal_code: billing.zip || null,
+        country: billing.country || null,
+        shopify_customer_id: shopifyCustomerId,
+      });
+      customer = await db('sitara_customers').where({ id }).first();
+    } else if (!customer.address_line1 && billing.address1) {
+      await db('sitara_customers').where({ id: customer.id }).update({
+        address_line1: billing.address1 || null, address_line2: billing.address2 || null,
+        state: billing.province || null, postal_code: billing.zip || null, country: billing.country || null,
+        updated_at: new Date(),
+      });
+      customer = await db('sitara_customers').where({ id: customer.id }).first();
+    }
+    customerId = customer.id;
+  }
+
+  const existing = await db('sitara_orders').where({ shopify_order_id: String(order.id) }).first();
+  const statusChanged = !existing || existing.status !== mappedStatus;
+  const realOrderDate = order.created_at ? new Date(order.created_at) : new Date();
+
+  let orderId = existing?.id;
+  if (!existing) {
+    orderId = newId('sord');
+    await db('sitara_orders').insert({
+      id: orderId, shopify_order_id: String(order.id), order_number: `SH-${order.order_number || order.id}`,
+      customer_id: customerId, status: mappedStatus, total: Number(order.total_price || 0),
+      source: 'shopify', status_changed_at: new Date(), created_at: realOrderDate,
+    });
+  } else {
+    await db('sitara_orders').where({ id: orderId }).update({
+      customer_id: customerId, status: mappedStatus, total: Number(order.total_price || 0),
+      status_changed_at: statusChanged ? new Date() : existing.status_changed_at,
+      flagged: statusChanged ? 0 : existing.flagged,
+      created_at: realOrderDate, updated_at: new Date(),
+    });
+    await db('sitara_order_items').where({ order_id: orderId }).delete();
+  }
+
+  for (const li of (order.line_items || [])) {
+    const cleanName = String(li.name || li.title || 'Item').trim();
+    const { unitPrice, lineTotal } = shopifyLineItemInclTax(li, order);
+
+    let productId = null;
+    if (li.product_id) {
+      const shopifyProductId = String(li.product_id);
+      let product = await db('sitara_products').where({ shopify_product_id: shopifyProductId }).first();
+      if (!product) {
+        const id = newId('prod');
+        await db('sitara_products').insert({
+          id, name: cleanName, sku: li.sku || null, stock: 0, unit: 'pcs',
+          shopify_product_id: shopifyProductId,
+        });
+        product = await db('sitara_products').where({ id }).first();
+      }
+      productId = product.id;
+
+      // Same "only decrement on first sync" guard as BigCommerce — a
+      // status-update webhook re-syncs the SAME order later (the `existing`
+      // branch above), which would otherwise double-decrement stock.
+      if (!existing) {
+        await db('sitara_products').where({ id: productId }).decrement('stock', Number(li.quantity || 1));
+      }
+    }
+
+    await db('sitara_order_items').insert({
+      id: newId('soi'), order_id: orderId, product_id: productId,
+      product_name: cleanName, quantity: Number(li.quantity || 1),
+      unit_price: unitPrice, line_total: lineTotal,
+    });
+  }
+
+  const saved = await ordersQuery(db).where({ 'sitara_orders.id': orderId }).first();
+  io.to(companySlug).emit(existing ? 'sitara:order_updated' : 'sitara:order_created', mapOrder(saved));
+}
+
+// Shopify signs every webhook with a computed HMAC-SHA256 of the RAW request
+// body (base64-encoded), using the app's Client Secret — config.shopify.
+// webhookSecret already holds that same value (see config.js's comment).
+function verifyShopifyWebhook(req) {
+  if (!config.shopify.webhookSecret) {
+    console.warn('[sitara] SHOPIFY_WEBHOOK_SECRET not set — skipping webhook verification.');
+    return true;
+  }
+  const provided = req.headers['x-shopify-hmac-sha256'];
+  if (!provided || !req.rawBody) return false;
+  const computed = crypto.createHmac('sha256', config.shopify.webhookSecret).update(req.rawBody).digest('base64');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(computed));
+  } catch {
+    return false; // length mismatch etc. — definitely not a match
+  }
+}
+
+// POST /api/:slug/sitara/shopify/webhook
+// Register this URL for topics orders/create, orders/updated, orders/
+// cancelled, orders/fulfilled (via Shopify's Settings > Notifications >
+// Webhooks, or POST /admin/api/{version}/webhooks.json) — all four are
+// handled identically here (just re-sync from whatever payload arrived),
+// same as how BigCommerce's webhook treats any store/order/* scope the same.
+router.post('/shopify/webhook', async (req, res) => {
+  res.sendStatus(200); // ack fast — same reasoning as the WhatsApp/BigCommerce webhooks
+  try {
+    if (!config.shopify.enabled) return;
+    if (!verifyShopifyWebhook(req)) {
+      console.error('[sitara] rejected a Shopify webhook POST with an invalid/missing HMAC.');
+      return;
+    }
+    const topic = req.headers['x-shopify-topic'];
+    if (!topic || !topic.startsWith('orders/')) return;
+    const order = req.body;
+    if (!order?.id) return;
+    await syncShopifyOrder(req.db, req.io, req.company.slug, order);
+  } catch (e) {
+    console.error('[sitara] Shopify webhook processing failed:', e);
+  }
+});
+
+// GET /api/:slug/sitara/shopify/debug/:orderId — same temporary-diagnostic
+// role as the BigCommerce debug route above: raw Shopify order payload,
+// unmodified, for fixing field-mapping issues against real data.
+router.get('/shopify/debug/:orderId', async (req, res) => {
+  if (!config.shopify.enabled) return res.status(503).json({ error: 'Shopify is not configured.' });
+  try {
+    const order = await fetchShopifyOrder(req.params.orderId);
+    res.json({ order });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Shopify's REST order list is cursor-paginated (a `Link` response header
+// with rel="next"), unlike BigCommerce's page-number pagination — this walks
+// that cursor to collect every order id for the one-time backfill below.
+async function listAllShopifyOrderIds() {
+  const ids = [];
+  let url = `https://${config.shopify.shopDomain}/admin/api/${config.shopify.apiVersion}/orders.json?limit=250&status=any`;
+  for (;;) {
+    const res = await fetch(url, { headers: shopifyApiHeaders() });
+    if (!res.ok) throw new Error(`Shopify order list failed (${res.status}): ${await res.text()}`);
+    const page = await res.json();
+    (page.orders || []).forEach((o) => ids.push(o.id));
+    const link = res.headers.get('link') || '';
+    const nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
+    if (!nextMatch) break;
+    url = nextMatch[1];
+  }
+  return ids;
+}
+
+const shopifyBackfillStatus = new Map(); // one entry per company slug, same in-memory convention as backfillStatus above
+
+// POST /api/:slug/sitara/shopify/backfill — one-time (or re-runnable)
+// catch-up for orders that existed before the webhooks were created. Fire-
+// and-forget, same pattern as the BigCommerce backfill — poll GET
+// /shopify/backfill/status for progress.
+router.post('/shopify/backfill', async (req, res) => {
+  if (!config.shopify.enabled) return res.status(503).json({ error: 'Shopify is not configured.' });
+  const slug = req.company.slug;
+  if (shopifyBackfillStatus.get(slug)?.status === 'running') {
+    return res.status(409).json({ error: 'A backfill is already running for this company — check GET /shopify/backfill/status.' });
+  }
+  shopifyBackfillStatus.set(slug, { status: 'running', startedAt: new Date() });
+  res.json({ started: true, message: 'Running in the background — poll GET /shopify/backfill/status for progress.' });
+
+  const db = req.db;
+  const io = req.io;
+  (async () => {
+    try {
+      const orderIds = await listAllShopifyOrderIds();
+      let succeeded = 0;
+      const failures = [];
+      for (const id of orderIds) {
+        try {
+          const order = await fetchShopifyOrder(id);
+          await syncShopifyOrder(db, io, slug, order);
+          succeeded += 1;
+        } catch (e) {
+          failures.push({ id, error: e.message });
+        }
+      }
+      shopifyBackfillStatus.set(slug, { status: 'completed', totalFound: orderIds.length, succeeded, failed: failures.length, failures, finishedAt: new Date() });
+    } catch (e) {
+      shopifyBackfillStatus.set(slug, { status: 'failed', error: e.message, finishedAt: new Date() });
+    }
+  })();
+});
+
+router.get('/shopify/backfill/status', (req, res) => {
+  res.json(shopifyBackfillStatus.get(req.company.slug) || { status: 'never_run' });
+});
+
 // ── Razorpay reconciliation ───────────────────────────────────────────────────
 // Razorpay is the payment gateway already sitting behind BigCommerce checkout
 // (confirmed with the user) — this cross-checks Razorpay's own payment
@@ -1231,6 +1519,19 @@ async function matchRazorpayPaymentToOrder(db, entity) {
   const bigcOrderId = entity.notes?.bigc_order_id;
   if (bigcOrderId) {
     const order = await db('sitara_orders').where({ bigcommerce_order_id: String(bigcOrderId) }).first();
+    if (order) {
+      const alreadyLinked = await db('sitara_razorpay_payments').where({ order_id: order.id }).first();
+      if (!alreadyLinked) return order.id;
+    }
+  }
+
+  // Same idea, for the Shopify-side checkout — whatever Razorpay app Shopify
+  // uses may stamp its own order-identifying note field. Harmless to check
+  // even if it never fires: the customer+amount and amount+time-proximity
+  // fallbacks below already cover Shopify orders regardless.
+  const shopifyOrderId = entity.notes?.shopify_order_id;
+  if (shopifyOrderId) {
+    const order = await db('sitara_orders').where({ shopify_order_id: String(shopifyOrderId) }).first();
     if (order) {
       const alreadyLinked = await db('sitara_razorpay_payments').where({ order_id: order.id }).first();
       if (!alreadyLinked) return order.id;
@@ -1805,5 +2106,10 @@ router.listAllBigCommerceOrderIds = listAllBigCommerceOrderIds;
 // the scheduled backfill rather than a second copy of the Razorpay sync logic.
 router.listAllRazorpayPayments = listAllRazorpayPayments;
 router.syncRazorpayPayment = syncRazorpayPayment;
+// Same reasoning — exposed for direct reuse/testing, same as the BigCommerce
+// equivalents above.
+router.syncShopifyOrder = syncShopifyOrder;
+router.fetchShopifyOrder = fetchShopifyOrder;
+router.listAllShopifyOrderIds = listAllShopifyOrderIds;
 
 module.exports = router;
