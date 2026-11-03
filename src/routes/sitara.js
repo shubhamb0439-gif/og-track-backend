@@ -1243,14 +1243,39 @@ async function matchRazorpayPaymentToOrder(db, entity) {
   let customer = null;
   if (entity.email) customer = await db('sitara_customers').where({ email: entity.email }).first();
   if (!customer && entity.contact) customer = await db('sitara_customers').where({ phone: entity.contact }).first();
-  if (!customer) return null;
-
-  const candidateOrders = await db('sitara_orders').where({ customer_id: customer.id });
-  for (const order of candidateOrders) {
-    if (Math.abs(Number(order.total) - amountRupees) > 1) continue;
-    const alreadyLinked = await db('sitara_razorpay_payments').where({ order_id: order.id }).first();
-    if (!alreadyLinked) return order.id;
+  if (customer) {
+    const candidateOrders = await db('sitara_orders').where({ customer_id: customer.id });
+    for (const order of candidateOrders) {
+      if (Math.abs(Number(order.total) - amountRupees) > 1) continue;
+      const alreadyLinked = await db('sitara_razorpay_payments').where({ order_id: order.id }).first();
+      if (!alreadyLinked) return order.id;
+    }
   }
+
+  // Tertiary fallback: live-confirmed 2026-11-03 that the two heuristics
+  // above were STILL leaving the large majority of a given month's captured
+  // payments unlinked (18 of 21 for Oct 14-31) despite an obviously correct,
+  // unambiguous order sitting right there — entity.notes.bigc_order_id isn't
+  // always stamped, and entity.email/entity.contact frequently don't match
+  // sitara_customers' stored value verbatim (e.g. Razorpay's
+  // "+91 97-69-545529" vs BigCommerce's stored "9769545529"). This matches
+  // purely on amount + order-creation-time proximity to the payment's own
+  // capture time, which needs neither field — and only ever returns a match
+  // when there is EXACTLY ONE unlinked order at that exact amount within the
+  // window, so it can't misfire on an ambiguous day.
+  const capturedAt = entity.created_at ? new Date(entity.created_at * 1000) : new Date();
+  const windowStart = new Date(capturedAt.getTime() - 15 * 60 * 1000);
+  const windowEnd = new Date(capturedAt.getTime() + 15 * 60 * 1000);
+  const nearbyOrders = await db('sitara_orders')
+    .whereRaw('ABS(total - ?) < 1', [amountRupees])
+    .andWhere('created_at', '>=', windowStart)
+    .andWhere('created_at', '<=', windowEnd);
+  const unlinkedNearbyOrders = [];
+  for (const order of nearbyOrders) {
+    const alreadyLinked = await db('sitara_razorpay_payments').where({ order_id: order.id }).first();
+    if (!alreadyLinked) unlinkedNearbyOrders.push(order);
+  }
+  if (unlinkedNearbyOrders.length === 1) return unlinkedNearbyOrders[0].id;
   return null;
 }
 
