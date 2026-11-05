@@ -3218,3 +3218,97 @@ closed panel isn't subscribed to the socket event at all).
 is known immediately, the card should appear right as the job reaches `awaiting_approval`. Separately
 trigger a frontend-touching job and confirm the card appears 1-3 minutes later, once Azure's Static
 Web Apps build actually finishes and the poller picks up the resolved URL — not before.
+
+---
+
+## 57. "Sign in with Microsoft" on the masteradmin login page (AIDA roadmap item 18 — MFA)
+
+**Status: backend built and live-tested (routes respond correctly; not yet usable end-to-end — needs
+real Entra app credentials, see below).** This is an ADDITIONAL, optional sign-in path next to the
+existing email/password form — nothing about the current login changes for anyone who doesn't use it.
+
+**What to build on the masteradmin login page:**
+- A "Sign in with Microsoft" button alongside the existing password form. Clicking it just navigates
+  the browser (full page redirect, not a fetch/XHR) to `GET /api/masteradmin/sso/login` — the backend
+  takes it from there (redirects to Microsoft, then back).
+- A new small route/page in this frontend app that Microsoft's sign-in flow eventually lands back on
+  — whatever exact URL you choose, give that EXACT full URL to whoever configures this server's
+  `MS_SSO_FRONTEND_CALLBACK_URL` env var (it's read verbatim, not derived from anything). On load, that
+  page reads its own query string:
+  - `?code=<opaque>` (success) — POST it as JSON to `POST /api/masteradmin/sso/exchange` with body
+    `{ code }`. A 200 response is `{ token, refreshToken, admin: { id, name, email, profilePictureUrl } }`
+    — store it exactly the way the existing password `/login` response is stored today, then redirect
+    into the normal masteradmin app (same place `/login` sends a user after success). A 400 means the
+    code was already used or expired (e.g. the page got reloaded) — show a plain "please sign in again"
+    message with a link back to the login page, don't retry automatically.
+  - `?error=<message>` (failure — e.g. no matching master admin account for that Microsoft identity, or
+    the account isn't active) — show that message on the login page the same way a wrong-password error
+    shows today.
+- If a password-login attempt ever comes back `403` with `{ ssoOnly: true, ssoLoginUrl }` in the body
+  (only possible for an account explicitly switched to Microsoft-only — not the default for anyone
+  today), show a message pointing them at the "Sign in with Microsoft" button instead of a generic
+  "wrong password" error.
+
+**Why the extra round trip (`code` → `/sso/exchange`) instead of the callback just handing back the
+real token directly:** keeps the actual session tokens out of the browser's URL bar/history/referrer
+and any server access logs along the way — the `code` is single-use and expires in 60 seconds either
+way, so there's nothing to gain by skipping this step.
+
+**Real prerequisite before this works at all (not a frontend blocker, just can't be tested until
+it's done):** a Microsoft Entra app registration with a delegated `openid profile email` scope and
+this frontend's real callback URL registered as a redirect URI — `MS_SSO_TENANT_ID`/`MS_SSO_CLIENT_ID`/
+`MS_SSO_CLIENT_SECRET`/`MS_SSO_REDIRECT_URI`/`MS_SSO_FRONTEND_CALLBACK_URL` all need to be set on the
+server before `GET /api/masteradmin/sso/login` does anything but return a 503.
+
+**Verification:** once the server-side env vars are set, click the button, complete a real Microsoft
+sign-in, confirm it lands back in the masteradmin app logged in exactly like a normal password login
+would; confirm a second sign-in (same Microsoft account) logs in instantly without any "create account"
+step. Separately, reload the callback page after a successful exchange (so the `code` is replayed) and
+confirm it shows the "please sign in again" message rather than erroring or hanging.
+
+---
+
+## 58. "Sign in with Microsoft" on EVERY company's tenant login page (AIDA roadmap item 18 Phase 2)
+
+**Status: backend built — not yet usable end-to-end (needs real Entra app credentials; see below).**
+Same idea as #57, but for regular company logins (every tenant, by default), not masteradmin — and
+one real difference in the flow worth reading carefully before building this.
+
+**What to build on the tenant login page** (the one at `/<slug>/login` or wherever a company's own
+users sign in today):
+- A "Sign in with Microsoft" button next to the existing password form. Clicking it does a full page
+  redirect (not a fetch/XHR) to `GET /api/<slug>/users/sso/login` — note this one DOES need the
+  company's slug in the URL (unlike masteradmin, which has no slug).
+- **The callback page is SHARED across every company** (one fixed URL registered with Microsoft,
+  the same for every tenant) — build ONE route/page for this, e.g. `/sso-callback.html`, and give that
+  exact full URL to whoever sets `TENANT_SSO_FRONTEND_CALLBACK_URL` on the server. On load, it reads:
+  - `?code=<opaque>&slug=<company-slug>` (success) — POST the code as JSON to
+    `POST /api/tenant-sso/exchange` with body `{ code }`. A 200 response is
+    `{ token, refreshToken, user: {...} }` — store it exactly like the existing per-company password
+    `/login` response is stored today, then redirect into THAT company's app using the `slug` query
+    param (since this one callback page serves every company, it needs the slug to know where to send
+    the browser next — the existing password-login flow already knows the slug from the URL the person
+    started on, this page has to read it back out of its own query string instead).
+  - `?error=<message>&slug=<company-slug>` (failure) — show the message; if `slug` is present, offer a
+    link back to that company's own login page.
+- If a password-login attempt ever comes back `403` with `{ ssoOnly: true, ssoLoginUrl }`, show a
+  message pointing at Microsoft sign-in instead of "wrong password" — same as #57, only relevant for
+  an account explicitly switched to Microsoft-only later, not anyone today.
+
+**Why this works for literally any company, with zero per-company Entra setup:** the Microsoft app
+registration behind this is configured to accept sign-ins from ANY organization's Microsoft 365 AND
+personal Microsoft accounts (outlook.com/hotmail.com) — so any tenant user can sign in with whatever
+Microsoft identity they actually have, not just ones from your own organization. It still only ever
+LOGS IN an existing user — the email on the Microsoft account has to already match an active user row
+at that specific company, exactly like masteradmin's own SSO; it never creates a new account.
+
+**Real prerequisite before this works at all:** a separate Entra app registration (registered as
+"Accounts in any organizational directory and personal Microsoft accounts") plus
+`TENANT_SSO_CLIENT_ID`/`TENANT_SSO_CLIENT_SECRET`/`TENANT_SSO_REDIRECT_URI`/
+`TENANT_SSO_FRONTEND_CALLBACK_URL` set on the server — until then `GET /api/<slug>/users/sso/login`
+just returns a 503 (confirmed live for a real company slug).
+
+**Verification:** once configured, click the button from a real company's login page, sign in with a
+Microsoft account whose email matches an existing active user at that company, confirm it lands back
+in THAT company's app, logged in. Separately try a Microsoft account whose email doesn't match anyone
+at that company and confirm it shows the "no matching account" message rather than creating one.

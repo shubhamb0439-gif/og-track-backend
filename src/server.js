@@ -2,8 +2,20 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const helmet = require('helmet');
 const config = require('./config');
 const coreDb = require('./db/core');
+
+// AIDA roadmap item 21 — shared origin check for both Express's CORS and
+// Socket.IO's CORS, so the two can never silently drift apart. `origin`
+// is undefined for non-browser/same-origin requests (curl, server-to-server
+// webhook calls, Postman) — those are allowed through; this check only ever
+// restricts browser-originated cross-origin calls.
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (config.security.corsAllowedOrigins.includes(origin)) return true;
+  return config.security.corsAllowedOriginSuffixes.some((suffix) => origin.endsWith(suffix));
+}
 
 const resolveTenant = require('./middleware/resolveTenant');
 const requireModule = require('./middleware/requireModule');
@@ -15,6 +27,7 @@ const masteradminZohoRoutes = require('./routes/masteradminZoho');
 const masteradminAzureCostsRoutes = require('./routes/masteradminAzureCosts');
 const zohoRoutes = require('./routes/zoho');
 const usersRoutes = require('./routes/users');
+const tenantSsoRoutes = require('./routes/tenantSso');
 const projectsRoutes = require('./routes/projects');
 const bugsRoutes = require('./routes/bugs');
 const sprintsRoutes = require('./routes/sprints');
@@ -42,9 +55,22 @@ const sitaraRoutes = require('./routes/sitara');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'] } });
+const io = new Server(server, {
+  cors: {
+    origin: (origin, callback) => callback(null, isAllowedOrigin(origin)),
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  },
+});
 
-app.use(cors());
+// AIDA roadmap item 21 — Azure App Service sits in front of this app as a
+// single reverse-proxy hop, so `req.ip`/`req.ips` need this to resolve the
+// real client IP from X-Forwarded-For instead of the proxy's own address.
+// Required for the rate limiter below to key per-real-client rather than
+// per-proxy, and is the prerequisite item 19's IP allowlist builds on.
+app.set('trust proxy', 1);
+
+app.use(helmet());
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin)) }));
 // `verify` stashes the raw request bytes on req.rawBody alongside the parsed
 // req.body — needed by routes/whatsapp.js to check Meta's X-Hub-Signature-256
 // header (HMAC is computed over the exact raw bytes, not the re-serialized
@@ -156,6 +182,11 @@ app.use('/api/:slug/aida/report-issue-jobs', reportIssueApprovalRouter);
 // either /api/:slug or /api/masteradmin: see connectorCallbackRouter's own
 // doc comment in routes/aida.js for why.
 app.use('/api/aida/connectors', connectorCallbackRouter);
+// AIDA roadmap item 18 Phase 2 — tenant-user Microsoft SSO's shared callback,
+// same "one fixed URL, not slug-scoped" reasoning as connectorCallbackRouter
+// above (the company slug rides in the signed `state` param instead — see
+// routes/tenantSso.js's own doc comment).
+app.use('/api/tenant-sso', tenantSsoRoutes);
 // AIDA Flows' webhook trigger — one flow-specific secret URL per webhook-
 // type flow, not behind masteradmin auth (see flowWebhookRouter's own doc
 // comment in routes/aida.js).

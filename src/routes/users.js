@@ -1,9 +1,13 @@
 const express = require('express');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const config = require('../config');
 const { hashPassword, verifyPassword, issueTokenPair, verifyRefreshToken, requireAuth } = require('../utils/auth');
 const { matchTodayCelebrations } = require('../aida/celebrations');
 const { sendEmail } = require('../utils/email');
+const { loginRateLimit } = require('../middleware/loginRateLimit');
+const { recordLoginAttempt } = require('../utils/loginAttempts');
+const { getTenantSsoMsalClient } = require('../utils/tenantSsoClient');
 
 const router = express.Router();
 
@@ -113,19 +117,53 @@ router.patch('/me/dob', requireAuth, async (req, res) => {
 });
 
 // POST /api/:slug/users/login
-router.post('/login', async (req, res) => {
+router.post('/login', loginRateLimit, async (req, res) => {
+  const { email, password } = req.body;
+  let logged = false;
+  const log = (success) => { if (!logged) { logged = true; recordLoginAttempt({ scope: 'tenant_user', companySlug: req.company.slug, emailTried: email, ip: req.ip, success }); } };
   try {
-    const { email, password } = req.body;
     const user = await req.db('users').where({ email: (email || '').toLowerCase() }).first();
-    if (!user) return res.status(401).json({ error: 'Incorrect email or password.' });
+    if (!user) { log(false); return res.status(401).json({ error: 'Incorrect email or password.' }); }
 
+    // AIDA roadmap item 18 Phase 2 — once an account has been explicitly
+    // switched to sso_only, password login is rejected outright regardless
+    // of whether the password itself is correct. Not auto-flipped by
+    // anything shipped alongside this yet (see routes/tenantSso.js's
+    // /callback) — every existing user's password login is completely
+    // unaffected until this is deliberately turned on for a specific account.
+    if (user.sso_only) {
+      log(false);
+      return res.status(403).json({ error: 'This account signs in with Microsoft only.', ssoOnly: true, ssoLoginUrl: `/api/${req.company.slug}/users/sso/login` });
+    }
     const ok = await verifyPassword(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Incorrect email or password.' });
-    if (user.status === 'pending') return res.status(403).json({ error: 'Account pending Super Admin approval.' });
-    if (user.status === 'rejected') return res.status(403).json({ error: 'Account request was rejected.' });
+    if (!ok) { log(false); return res.status(401).json({ error: 'Incorrect email or password.' }); }
+    if (user.status === 'pending') { log(false); return res.status(403).json({ error: 'Account pending Super Admin approval.' }); }
+    if (user.status === 'rejected') { log(false); return res.status(403).json({ error: 'Account request was rejected.' }); }
 
     const { token, refreshToken } = issueTokenPair({ userId: user.id, role: user.role, slug: req.company.slug });
+    log(true);
     res.json({ token, refreshToken, user: stripPassword(user) });
+  } catch (e) { log(false); res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/:slug/users/sso/login ───────────────────────────────────────
+// AIDA roadmap item 18 Phase 2 — redirects to Microsoft's sign-in page for
+// THIS company. The company slug is embedded in a short-lived signed `state`
+// (verified in routes/tenantSso.js's shared /callback) since Entra only
+// allows ONE fixed, pre-registered redirect URI shared across every company
+// — req.company is already resolved here (this router runs under
+// resolveTenant), so a bad/suspended slug 404s/403s before Microsoft is even
+// involved, same as every other route on this router.
+router.get('/sso/login', async (req, res) => {
+  if (!config.tenantSso.enabled) return res.status(503).json({ error: 'Microsoft SSO is not configured on this server.' });
+  try {
+    const state = jwt.sign({ type: 'tenant_sso_state', slug: req.company.slug }, config.app.jwtSecret, { expiresIn: '10m' });
+    const url = await getTenantSsoMsalClient().getAuthCodeUrl({
+      scopes: ['openid', 'profile', 'email'],
+      redirectUri: config.tenantSso.redirectUri,
+      state,
+    });
+    res.redirect(url);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

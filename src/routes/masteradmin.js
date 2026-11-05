@@ -5,6 +5,30 @@ const config = require('../config');
 const { hashPassword, verifyPassword, issueTokenPair, verifyRefreshToken } = require('../utils/auth');
 const { provisionTenant, provisionModulesForExistingCompany } = require('../utils/provisioning');
 const { sendWhatsAppMessage } = require('../aida/whatsapp');
+const { loginRateLimit } = require('../middleware/loginRateLimit');
+const { recordLoginAttempt } = require('../utils/loginAttempts');
+const { createHandoffCode, consumeHandoffCode } = require('../utils/ssoHandoff');
+
+// AIDA roadmap item 18 — Microsoft SSO. Built lazily (not at module load) so
+// a server with no MS_SSO_* env vars set keeps booting exactly like today —
+// same "soft-optional, no crash" convention as every other integration in
+// config.js. Cached after first build since ConfidentialClientApplication
+// is meant to be a long-lived singleton, not re-created per request.
+let _msalClient = null;
+function getMsalClient() {
+  if (!config.microsoftSso.enabled) return null;
+  if (!_msalClient) {
+    const { ConfidentialClientApplication } = require('@azure/msal-node');
+    _msalClient = new ConfidentialClientApplication({
+      auth: {
+        clientId: config.microsoftSso.clientId,
+        authority: `https://login.microsoftonline.com/${config.microsoftSso.tenantId}`,
+        clientSecret: config.microsoftSso.clientSecret,
+      },
+    });
+  }
+  return _msalClient;
+}
 
 const multer = require('multer');
 const path = require('path');
@@ -41,18 +65,33 @@ function requireMasterAdmin(req, res, next) {
 }
 
 // ── POST /api/masteradmin/login ──────────────────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', loginRateLimit, async (req, res) => {
+  const { email, password } = req.body;
+  // Recorded via a tiny wrapper so every return path below — including the
+  // early validation one — logs exactly once, success or failure.
+  let logged = false;
+  const log = (success) => { if (!logged) { logged = true; recordLoginAttempt({ scope: 'masteradmin', emailTried: email, ip: req.ip, success }); } };
   try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    if (!email || !password) { log(false); return res.status(400).json({ error: 'email and password required' }); }
     const admin = await coreDb('platform_admins').where({ email: email.toLowerCase() }).first();
-    if (!admin) return res.status(401).json({ error: 'Invalid email or password' });
-    if (admin.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
+    if (!admin) { log(false); return res.status(401).json({ error: 'Invalid email or password' }); }
+    if (admin.status !== 'active') { log(false); return res.status(403).json({ error: 'Account is not active' }); }
+    // AIDA roadmap item 18 — once an account has been explicitly switched to
+    // sso_only, password login is rejected outright regardless of whether
+    // the password itself is correct. Not auto-flipped by anything shipped
+    // alongside this yet (see /sso/callback) — every existing admin's
+    // password login is completely unaffected until this is deliberately
+    // turned on for a specific account.
+    if (admin.sso_only) {
+      log(false);
+      return res.status(403).json({ error: 'This account signs in with Microsoft only.', ssoOnly: true, ssoLoginUrl: '/api/masteradmin/sso/login' });
+    }
     const ok = await verifyPassword(password, admin.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
+    if (!ok) { log(false); return res.status(401).json({ error: 'Invalid email or password' }); }
     const { token, refreshToken } = issueTokenPair({ adminId: admin.id, name: admin.name, email: admin.email, role: 'masteradmin' });
+    log(true);
     res.json({ token, refreshToken, admin: { id: admin.id, name: admin.name, email: admin.email, profilePictureUrl: admin.profile_picture_url || null } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { log(false); res.status(500).json({ error: e.message }); }
 });
 
 // ── POST /api/masteradmin/profile-picture — upload/replace the signed-in
@@ -93,6 +132,102 @@ router.post('/refresh', async (req, res) => {
     }
     const { token, refreshToken: newRefreshToken } = issueTokenPair({ adminId: admin.id, name: admin.name, email: admin.email, role: 'masteradmin' });
     res.json({ token, refreshToken: newRefreshToken });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/masteradmin/sso/login ───────────────────────────────────────────
+// AIDA roadmap item 18 — redirects the browser to Microsoft's own sign-in
+// page. An ADDITIONAL login path alongside the existing password one, not a
+// replacement — nothing about today's /login route changes for an account
+// that never uses this.
+router.get('/sso/login', async (req, res) => {
+  if (!config.microsoftSso.enabled) return res.status(503).json({ error: 'Microsoft SSO is not configured on this server.' });
+  try {
+    const url = await getMsalClient().getAuthCodeUrl({
+      scopes: ['openid', 'profile', 'email'],
+      redirectUri: config.microsoftSso.redirectUri,
+    });
+    res.redirect(url);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/masteradmin/sso/callback ────────────────────────────────────────
+// Microsoft redirects the browser back here with an authorization code.
+// Exchanges it for tokens, resolves the matching platform_admins row, mints
+// the SAME token pair the password login issues (so requireMasterAdmin and
+// everything downstream of login stay completely unchanged), then hands the
+// browser off to the frontend via a short-lived one-time code rather than
+// putting the real JWTs in this redirect's URL (see utils/ssoHandoff.js).
+router.get('/sso/callback', async (req, res) => {
+  if (!config.microsoftSso.enabled) return res.status(503).json({ error: 'Microsoft SSO is not configured on this server.' });
+  const failureRedirect = (message) => {
+    const url = new URL(config.microsoftSso.frontendCallbackUrl);
+    url.searchParams.set('error', message);
+    return res.redirect(url.toString());
+  };
+
+  const { code, error, error_description: errorDescription } = req.query;
+  if (error) return failureRedirect(errorDescription || error);
+  if (!code) return res.status(400).json({ error: 'Missing authorization code' });
+
+  let emailForLog = 'unknown';
+  try {
+    const result = await getMsalClient().acquireTokenByCode({
+      code,
+      scopes: ['openid', 'profile', 'email'],
+      redirectUri: config.microsoftSso.redirectUri,
+    });
+    const claims = result.idTokenClaims || {};
+    const microsoftOid = claims.oid;
+    const email = (claims.preferred_username || claims.email || '').toLowerCase();
+    emailForLog = email || 'unknown';
+    if (!microsoftOid) throw new Error('Microsoft did not return an account identifier for this sign-in.');
+
+    let admin = await coreDb('platform_admins').where({ microsoft_oid: microsoftOid }).first();
+    if (!admin && email) {
+      // First-ever SSO login for an existing password-based account — match
+      // once by email, then store microsoft_oid so every future login
+      // resolves by oid directly (an email can change; oid can't).
+      admin = await coreDb('platform_admins').where({ email }).first();
+      if (admin) await coreDb('platform_admins').where({ id: admin.id }).update({ microsoft_oid: microsoftOid });
+    }
+    if (!admin) {
+      recordLoginAttempt({ scope: 'masteradmin', emailTried: emailForLog, ip: req.ip, success: false });
+      return failureRedirect('No master admin account matches this Microsoft identity. Ask an existing admin to add you first.');
+    }
+    if (admin.status !== 'active') {
+      recordLoginAttempt({ scope: 'masteradmin', emailTried: admin.email, ip: req.ip, success: false });
+      return failureRedirect('This account is not active.');
+    }
+
+    const { token, refreshToken } = issueTokenPair({ adminId: admin.id, name: admin.name, email: admin.email, role: 'masteradmin' });
+    recordLoginAttempt({ scope: 'masteradmin', emailTried: admin.email, ip: req.ip, success: true });
+    const handoffCode = createHandoffCode({
+      token, refreshToken,
+      admin: { id: admin.id, name: admin.name, email: admin.email, profilePictureUrl: admin.profile_picture_url || null },
+    });
+    const url = new URL(config.microsoftSso.frontendCallbackUrl);
+    url.searchParams.set('code', handoffCode);
+    res.redirect(url.toString());
+  } catch (e) {
+    recordLoginAttempt({ scope: 'masteradmin', emailTried: emailForLog, ip: req.ip, success: false });
+    failureRedirect(e.message);
+  }
+});
+
+// ── POST /api/masteradmin/sso/exchange ───────────────────────────────────────
+// The frontend calls this with the one-time code from /sso/callback's
+// redirect to get the real token/refreshToken back in a JSON body — keeps
+// the actual JWTs out of the browser URL/history/referrer/server logs.
+// Single-use and short-lived (60s): a stale or already-used code is a plain
+// 400, meaning "go sign in again," not a crash.
+router.post('/sso/exchange', async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ error: 'code is required' });
+    const payload = consumeHandoffCode(code);
+    if (!payload) return res.status(400).json({ error: 'This sign-in link has expired or was already used. Please sign in again.' });
+    res.json(payload);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

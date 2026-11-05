@@ -6,6 +6,19 @@ function required(name) {
   return v;
 }
 
+// Guards against a leftover placeholder string (e.g. "<TBD — ...>") being
+// treated as "configured" just because it's truthy — several soft-optional
+// blocks below gate `enabled` on a real http(s) URL being present.
+function isHttpUrl(value) {
+  if (!value) return false;
+  try {
+    const u = new URL(value);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 // Multiple SQL logical servers, one per Azure region you've set up, so
 // masteradmin can pick where a new company's database gets created.
 // AZURE_SQL_REGIONS is optional JSON, e.g.:
@@ -68,6 +81,20 @@ module.exports = {
     // value from jwtSecret, not a reuse of it.
     jwtRefreshSecret: process.env.JWT_REFRESH_SECRET || `${required('JWT_SECRET')}::refresh-v1`,
     bcryptRounds: parseInt(process.env.BCRYPT_ROUNDS || '10', 10),
+  },
+  // AIDA roadmap item 21 — security hardening. CORS used to be wide open
+  // (`cors()` with no options at all, reflecting any origin); this locks it
+  // to the real production frontend plus any Azure Static Web Apps PR
+  // preview deploy (a per-PR random subdomain under azurestaticapps.net —
+  // see getSwaPreviewUrl's own comment in codingAgent/github.js for the exact
+  // hostname shape), matched by the `.azurestaticapps.net` suffix rather than
+  // an exact per-PR string since that subdomain is random per PR. Extra
+  // origins (e.g. a future additional frontend) can be added via the env var
+  // without a code change.
+  security: {
+    corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS || 'https://aida.sanj.co')
+      .split(',').map((s) => s.trim()).filter(Boolean),
+    corsAllowedOriginSuffixes: ['.azurestaticapps.net'],
   },
   // AIDA (AI orchestration layer) — deliberately NOT validated via required()
   // like the rest of config: the app must keep booting for every existing
@@ -520,6 +547,67 @@ module.exports = {
       mailbox: process.env.MS_GRAPH_MAILBOX || 'aida@sanj.co',
       recipientRouting,
       pollIntervalMs: parseInt(process.env.MS_GRAPH_POLL_INTERVAL_MS || '', 10) || 4 * 60 * 1000,
+    };
+  })(),
+  // AIDA roadmap item 18 — masteradmin "Sign in with Microsoft" (an
+  // additional, optional login path — NOT a replacement for the existing
+  // password login; see masteradmin.js's /sso/login, /sso/callback,
+  // /sso/exchange). Reuses the same Entra tenant as config.microsoftGraph by
+  // default (same M365 org), but takes its OWN clientId/clientSecret/
+  // redirectUri — sign-in needs a DELEGATED `openid profile email` scope,
+  // a different permission TYPE from microsoftGraph's APPLICATION-only
+  // Mail.Read, so this is deliberately a separate (or separately-configured)
+  // app registration, never assumed to share microsoftGraph's client
+  // credentials. redirectUri/frontendCallbackUrl are full URIs you set
+  // directly (same "no derived guessing" convention as ZOHO_REDIRECT_URI),
+  // not built from a base URL. Deliberately NOT validated via required() —
+  // same "keep booting either way" reasoning as every other integration here.
+  microsoftSso: (() => {
+    const tenantId = process.env.MS_SSO_TENANT_ID || process.env.MS_GRAPH_TENANT_ID || null;
+    const clientId = process.env.MS_SSO_CLIENT_ID || null;
+    const clientSecret = process.env.MS_SSO_CLIENT_SECRET || null;
+    const redirectUri = process.env.MS_SSO_REDIRECT_URI || null; // this backend's own callback, e.g. https://og-track-backend.azurewebsites.net/api/masteradmin/sso/callback
+    const frontendCallbackUrl = process.env.MS_SSO_FRONTEND_CALLBACK_URL || null; // where the browser lands after a successful/failed sign-in, e.g. https://aida.sanj.co/masteradmin-sso-callback.html
+    return {
+      enabled: !!(tenantId && clientId && clientSecret && isHttpUrl(redirectUri) && isHttpUrl(frontendCallbackUrl)),
+      tenantId, clientId, clientSecret, redirectUri, frontendCallbackUrl,
+    };
+  })(),
+  // AIDA roadmap item 18 Phase 2 — tenant-user "Sign in with Microsoft",
+  // available to every company by default, no per-company setup. A
+  // DELIBERATELY SEPARATE Entra app registration from `microsoftSso` above —
+  // that one is locked to a single org (your own M365 tenant, for
+  // masteradmin only); this one must be registered as "Accounts in any
+  // organizational directory and personal Microsoft accounts" (authority
+  // `common`) so literally any tenant user's own Microsoft identity — their
+  // employer's M365 tenant, or just a personal outlook.com account — can
+  // sign in, since most OG Track customer companies won't have their own
+  // M365 tenant at all. ONE shared client/secret/redirect URI across every
+  // company (Entra needs one fixed, pre-registered redirect URI — a tenant
+  // user's company slug is threaded through the OAuth `state` parameter
+  // instead, signed with the app's own JWT secret so it can't be tampered
+  // with in transit — see routes/users.js's sso/login + the global
+  // tenantSsoCallbackRouter). SSO only ever LINKS an existing active user row
+  // by email on first use — it never creates a new user account, exactly
+  // like masteradmin's own SSO (no equivalent of "sign up via Microsoft").
+  // clientId/clientSecret default to the SAME app registration as
+  // microsoftSso above — a single Entra app CAN serve both flows as long as
+  // it's registered with the broadest "Accounts in any organizational
+  // directory and personal Microsoft accounts" option (Microsoft allows
+  // restricting to a MORE specific authority than an app's own registration
+  // at request time, e.g. masteradmin's flow using its own tenant-specific
+  // authority, but never a broader one) — so set MS_SSO_CLIENT_ID/SECRET
+  // once and add a second redirect URI to that same app instead of
+  // registering a brand new one, unless you'd rather keep them fully
+  // separate (then just set TENANT_SSO_CLIENT_ID/SECRET explicitly too).
+  tenantSso: (() => {
+    const clientId = process.env.TENANT_SSO_CLIENT_ID || process.env.MS_SSO_CLIENT_ID || null;
+    const clientSecret = process.env.TENANT_SSO_CLIENT_SECRET || process.env.MS_SSO_CLIENT_SECRET || null;
+    const redirectUri = process.env.TENANT_SSO_REDIRECT_URI || null; // this backend's own fixed callback, e.g. https://<backend>/api/tenant-sso/callback — MUST differ from MS_SSO_REDIRECT_URI even when the app is shared
+    const frontendCallbackUrl = process.env.TENANT_SSO_FRONTEND_CALLBACK_URL || null; // where the browser lands after sign-in, e.g. https://aida.sanj.co/sso-callback.html
+    return {
+      enabled: !!(clientId && clientSecret && isHttpUrl(redirectUri) && isHttpUrl(frontendCallbackUrl)),
+      clientId, clientSecret, redirectUri, frontendCallbackUrl,
     };
   })(),
   // Zoho Books (AIDA roadmap item 5) — per-company OAuth2, NOT a global

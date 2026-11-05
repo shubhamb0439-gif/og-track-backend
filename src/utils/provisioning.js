@@ -164,6 +164,7 @@ async function runSchemaScripts(tenantPool, companyId, slug, moduleKeys, { alway
   // script already ran is always safe, including on a re-provision.
   orderedScripts.push('patch_01_users_dob_and_joining_date.sql');
   orderedScripts.push('patch_07_users_reset_token.sql');
+  orderedScripts.push('patch_22_users_mfa.sql');
   if (scriptsNeeded.has('02_module_projects.sql')) orderedScripts.push('patch_05_sprints_completed_at_column.sql');
   if (scriptsNeeded.has('08_module_crm.sql')) orderedScripts.push('patch_02_crm_po_bom_and_payment_terms.sql');
   if (scriptsNeeded.has('09_module_inventory.sql')) orderedScripts.push('patch_03_inventory_optional_po_and_vendor.sql');
