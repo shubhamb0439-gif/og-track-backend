@@ -1828,6 +1828,17 @@ router.get('/orders', async (req, res) => {
     // rather than a single hardcoded "today" special case.
     if (req.query.createdFrom) q = q.where('sitara_orders.created_at', '>=', new Date(req.query.createdFrom));
     if (req.query.createdTo) q = q.where('sitara_orders.created_at', '<', new Date(req.query.createdTo));
+    // "Type of product" filter (Orders page) — an order has no product of
+    // its own, only line items, so this matches any order with at least one
+    // sitara_order_items row for the given product.
+    if (req.query.productId) {
+      const productId = req.query.productId;
+      q = q.whereExists(function () {
+        this.select(req.db.raw(1)).from('sitara_order_items')
+          .whereRaw('sitara_order_items.order_id = sitara_orders.id')
+          .andWhere('sitara_order_items.product_id', productId);
+      });
+    }
     const rows = await q.orderBy('sitara_orders.created_at', 'desc');
     const mapped = rows.map(mapOrder);
     // Stale orders float to the top (oldest-unchanged first) so the ones
