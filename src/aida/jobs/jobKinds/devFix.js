@@ -8,6 +8,11 @@ const { runCommand, fileExists } = require('../../codingAgent/tools');
 const { runCodingAgent } = config.aida.codingAgent.provider === 'anthropic'
   ? require('../../codingAgent/providers/anthropic')
   : require('../../codingAgent/providers/openai');
+// AIDA roadmap item 20 — the real Claude Code CLI running on the VPS, used
+// in place of the hand-rolled loop above ONLY when both vpsBridge and
+// vpsCodingAgent are configured and this specific job's sandbox is actually
+// VPS-backed (see run() below).
+const vpsCodingAgentClient = require('../../codingAgent/vpsCodingAgentClient');
 const {
   createBranch, commitAll, pushBranch, openPullRequest,
   mergePullRequest, closePullRequest,
@@ -152,18 +157,27 @@ module.exports = {
       const branchName = `aida/fix-${job.id}`;
       await createBranch(sandbox, branchName);
 
-      await appendEvent(job.id, 'agent_started');
+      // AIDA roadmap item 20 — only ever true when the sandbox itself is
+      // ALREADY VPS-backed (useVps above) AND the separate coding-agent
+      // service is configured. Never a standalone switch: a VPS-backed
+      // sandbox with no coding-agent service configured still runs the
+      // local hand-rolled loop against it exactly as before (tools.js's
+      // vps:// branching already makes that work transparently).
+      const useVpsCodingAgent = useVps && config.aida.vpsCodingAgent.enabled;
+      await appendEvent(job.id, 'agent_started', { engine: useVpsCodingAgent ? 'vps_claude_code_cli' : `local_${config.aida.codingAgent.provider}` });
       const toolLog = [];
-      const agentResult = await runCodingAgent({
-        sandboxDir: sandbox.dir,
-        task: effectiveTask,
-        // Live-verified: 25 was too low for a large existing file (1.5MB+,
-        // past read_file's 200KB cap) — surgically finding/editing one spot
-        // in it via findstr + small scratch Node scripts legitimately takes
-        // more tool calls than a normal small-file edit.
-        maxIterations: 50,
-        onEvent: (e) => toolLog.push(e),
-      });
+      const agentResult = useVpsCodingAgent
+        ? await vpsCodingAgentClient.run(sandbox.sandboxId, effectiveTask)
+        : await runCodingAgent({
+          sandboxDir: sandbox.dir,
+          task: effectiveTask,
+          // Live-verified: 25 was too low for a large existing file (1.5MB+,
+          // past read_file's 200KB cap) — surgically finding/editing one spot
+          // in it via findstr + small scratch Node scripts legitimately takes
+          // more tool calls than a normal small-file edit.
+          maxIterations: 50,
+          onEvent: (e) => toolLog.push(e),
+        });
       await appendEvent(job.id, 'agent_finished', { success: agentResult.success, toolCallCount: agentResult.toolLog.length });
 
       if (!agentResult.success) {

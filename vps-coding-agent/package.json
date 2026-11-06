@@ -1,0 +1,16 @@
+{
+  "name": "aida-vps-coding-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AIDA roadmap item 20 — runs the real Claude Code CLI headlessly on the VPS against a sandbox vps-bridge already cloned, in place of ogtrack-backend's own hand-rolled Anthropic tool-use loop. Standalone service, deployed as its own Docker container on the VPS, NOT part of ogtrack-backend's own npm install/Azure deploy.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^4.21.1"
+  }
+}

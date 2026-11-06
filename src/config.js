@@ -287,6 +287,21 @@ module.exports = {
         const baseUrl = process.env.VPS_BRIDGE_BASE_URL || null;
         return { enabled: !!(secret && baseUrl), secret, baseUrl };
       })(),
+      // AIDA roadmap item 20 — swaps WHO writes the code for a VPS-backed
+      // dev_repo_fix job: instead of this process's own hand-rolled
+      // Anthropic tool-use loop (providers/anthropic.js), the real Claude
+      // Code CLI runs headlessly inside its own container on the VPS,
+      // against the exact same sandbox vps-bridge already cloned (shared via
+      // a Docker volume both containers mount). Only ever consulted when
+      // vpsBridge is ALSO enabled and that specific job's sandbox is
+      // VPS-backed — never a global switch, never touches create_module or
+      // the actionFastLane path (see devFix.js). Its own dedicated secret,
+      // never reused from vpsBridge's.
+      vpsCodingAgent: (() => {
+        const secret = process.env.VPS_CODING_AGENT_SECRET || null;
+        const baseUrl = process.env.VPS_CODING_AGENT_BASE_URL || null;
+        return { enabled: !!(secret && baseUrl), secret, baseUrl };
+      })(),
       // AIDA roadmap item 11 — real web search (src/aida/tools/webResearch.js's
       // search_web tool). Brave was the original pick but its free tier was
       // discontinued since that plan was written — Tavily instead (built for
