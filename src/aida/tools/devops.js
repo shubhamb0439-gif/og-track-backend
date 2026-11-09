@@ -208,6 +208,47 @@ module.exports = [
   },
 
   {
+    name: 'dev_revise_job',
+    description:
+      "Asks AIDA to make ADDITIONAL changes to an 'awaiting_approval' job's existing, still-open pull " +
+      "request(s) — pushes more commits to the SAME branch/PR instead of opening a new one or starting a " +
+      "separate job. Use this whenever the human wants something tweaked, added, or changed about a build " +
+      "that's already sitting in the AIDA Job panel awaiting approval (e.g. 'change the button color', " +
+      "'also add a filter for X') — NOT create_module/dev_repo_fix again, which would start an unrelated " +
+      "second job/PR with no knowledge of the first. The job stays at awaiting_approval afterward either " +
+      "way — still needs dev_approve_job/dev_reject_job exactly as before; nothing merges automatically.",
+    requiredModules: [MASTERADMIN_SENTINEL_MODULE],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string' },
+        instructions: { type: 'string', description: 'What to change/add/fix, in plain language (e.g. "make the submit button green instead of blue").' },
+      },
+      required: ['jobId', 'instructions'],
+    },
+    async handler(context, { jobId, instructions }) {
+      const job = await jobStore.getJob(jobId);
+      if (!job) return { error: `No job found with id "${jobId}".` };
+      if (job.status !== 'awaiting_approval') return { error: `Job ${jobId} is not awaiting approval (status: ${job.status}) — nothing open to revise.` };
+      if (!instructions || !instructions.trim()) return { error: 'instructions is required.' };
+
+      await jobStore.appendEvent(job.id, 'revision_requested_by_user', { requestedBy: context.userId });
+      const final = await jobRunner.reviseJob(job, instructions);
+      const revisionOk = final.status === 'awaiting_approval' && !final.result?.lastRevisionFailed;
+      return {
+        success: revisionOk,
+        status: final.status,
+        message: final.status === 'awaiting_approval'
+          ? (final.result?.lastRevisionFailed
+            ? `The revision attempt failed: ${final.result.lastRevisionError}. The original PR is untouched and still awaiting your approval.`
+            : (final.result?.lastRevisionNote || 'Pushed the requested changes to the same pull request(s) — still awaiting your approval, nothing merged.'))
+          : `Revision ended with status "${final.status}": ${final.errorMessage || ''}`,
+        job: final,
+      };
+    },
+  },
+
+  {
     name: 'dev_approve_job',
     description:
       "Approves an 'awaiting_approval' AIDA job — merges its real PR(s) into main. SAFETY — this is a real, " +

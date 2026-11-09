@@ -4,13 +4,17 @@ const { createSandbox } = require('../../codingAgent/sandbox');
 const { runCommand, listFiles, readFile, downloadFile, fileExists } = require('../../codingAgent/tools');
 const browserless = require('../../codingAgent/browserless');
 const depsCache = require('../../codingAgent/depsCache');
-const { snapshotExistingFiles } = require('../../codingAgent/moduleGuardrails');
+const { snapshotExistingFiles, verifyChangesAllowed } = require('../../codingAgent/moduleGuardrails');
 // Same provider switch as devFix.js — AIDA_CODING_AGENT_PROVIDER=anthropic
 // picks this up automatically, no code change needed beyond this file
 // existing once (see docs/AIDA_PHASE2_MODULE_BUILDER_PLAN.md).
 const { runModuleBuilderAgent } = config.aida.codingAgent.provider === 'anthropic'
   ? require('../../codingAgent/providers/anthropicModuleBuilder')
   : require('../../codingAgent/providers/moduleBuilder');
+// AIDA roadmap item 20's extension to create_module — the real Claude Code
+// CLI running on the VPS, used in place of runModuleBuilderAgent above ONLY
+// when both vpsBridge and vpsCodingAgent are configured (see run() below).
+const vpsCodingAgentClient = require('../../codingAgent/vpsCodingAgentClient');
 const { runSqlTextAgainstPool } = require('../../../utils/provisioning');
 const {
   createBranch, commitAll, pushBranch, openPullRequest,
@@ -206,6 +210,92 @@ adapter). Any form on the page can be non-functional UI only (no real backend to
 requested features say otherwise.`;
 }
 
+// AIDA roadmap item 20's extension to create_module — unlike the local
+// runModuleBuilderAgent path (whose write_file tool mechanically enforces
+// assertModuleWriteAllowed on every call), the real Claude Code CLI writes
+// files with its own built-in tools, with no hook into that enforcement at
+// all. The instruction below is the FIRST layer of defense (ask nicely);
+// moduleGuardrails.js's verifyChangesAllowed (called after commit, before any
+// push — see run() below) is the real, mechanical, can't-be-talked-out-of-it
+// layer that actually matters.
+function vpsGuardrailReminder(insertOnlyFiles) {
+  const exceptions = insertOnlyFiles && insertOnlyFiles.length
+    ? ` The ONLY exception: you may ADD new lines (never change or remove an existing line) to: ${insertOnlyFiles.join(', ')}.`
+    : '';
+  return `\n\nIMPORTANT — a hard rule, mechanically checked after you finish (not just a style preference): you may ONLY create brand-new files for this task. Do NOT modify, rewrite, or delete any file that already exists in this repository.${exceptions} Touching any other existing file will cause this entire change to be automatically rejected before a human ever reviews it — none of your work would be merged.`;
+}
+
+/** Backend-only half of a "module" task, used when the VPS Claude Code CLI builds each repo as its own separate run (it has no shared conversation across two working directories the way the local multi-sandbox agent loop does). */
+function buildBackendTask({ moduleName, slug, features, nextNumber }) {
+  return `Build the BACKEND half of a brand-new OG Track module called "${moduleName}" (module key: "${slug}").
+
+Requested features (implement whatever subset of this is backend-relevant — data model, business logic, API endpoints):
+${formatFeatures(features)}
+
+Create src/routes/${slug}.js implementing these features (follow the style of an existing similar route file — read a couple first). Create the module's schema at ogtrack-sql-schema/tenant/${nextNumber}_module_${slug}.sql (additive-only — read a couple of existing files in that directory first to match table-naming and dbo. schema conventions exactly). Register the module by ADDING lines (never changing existing ones) to src/server.js (a require for the new route file and one app.use('/api/:slug/${slug}', resolveTenant, requireModule('${slug}'), ${slug}Routes) line, matching the existing pattern used by other modules there) and to src/utils/provisioning.js (one new MODULE_TO_SCRIPT entry mapping "${slug}" to the new script filename, and adding that filename to the orderedScripts list in the same file).
+
+Do not write any frontend/UI code — that half is built separately, by a different agent who cannot see your code directly. End your finish summary with the EXACT API endpoint paths, request bodies, and response shapes you implemented, in enough detail that someone building a UI against your API could do so correctly from your summary alone.`;
+}
+
+/** Frontend-only half of a "module" task — backendContract (the real new route file's source, when available) is embedded verbatim so the frontend agent wires up calls that actually match, instead of guessing. */
+function buildFrontendTask({ moduleName, slug, features, sourceUrl, researchSummary, backendContract }) {
+  const contractBlock = backendContract
+    ? `The backend half of this module has ALREADY been built. Here is its real route file, verbatim — wire your API calls to match this EXACTLY (same paths, same request/response shapes). Do not guess or invent a different contract:\n\n\`\`\`javascript\n${backendContract}\n\`\`\`\n\n`
+    : '';
+  return `${buildSourceUrlPreamble(sourceUrl, researchSummary)}${contractBlock}Build the FRONTEND half of a brand-new OG Track module called "${moduleName}" (module key: "${slug}").
+
+Requested features:
+${formatFeatures(features)}
+
+Implement the actual screens/components for these features, and wire up API calls that match the backend contract above exactly. If the frontend needs to register this module in a shared navigation/router file you were not given as an insert-only file, do NOT edit it — describe the exact line(s) needed in your finish summary instead.`;
+}
+
+/** Runs a "page" task's agent on the VPS Claude Code CLI — single sandbox, single call, same shape as devFix.js's own VPS path. */
+async function runPageAgentOnVps({ frontendSandbox, moduleName, slug, features, sourceUrl, researchSummary }) {
+  const task = buildPageTask({ moduleName, slug, features, sourceUrl, researchSummary }) + vpsGuardrailReminder([]);
+  const result = await vpsCodingAgentClient.run(frontendSandbox.sandboxId, task);
+  return { success: result.success, summary: result.summary, toolLog: result.toolLog };
+}
+
+/**
+ * Runs a "module" task's agent on the VPS Claude Code CLI as TWO separate,
+ * sequential CLI calls (backend first, then frontend) — each `claude -p`
+ * invocation is scoped to one working directory, so unlike the local
+ * runModuleBuilderAgent (one shared conversation reasoning over both
+ * sandboxDirs at once), there's no single call that can see both repos.
+ * Backend runs first and its real new route file is read back and handed to
+ * the frontend task verbatim, so the frontend still gets a real contract to
+ * build against instead of an independent guess.
+ */
+async function runModuleAgentOnVps({ job, appendEvent, backendSandbox, frontendSandbox, moduleName, slug, features, nextNumber, sourceUrl, researchSummary, insertOnlyFiles }) {
+  await appendEvent(job.id, 'backend_agent_started');
+  const backendTask = buildBackendTask({ moduleName, slug, features, nextNumber }) + vpsGuardrailReminder(insertOnlyFiles.backend);
+  const backendResult = await vpsCodingAgentClient.run(backendSandbox.sandboxId, backendTask);
+  await appendEvent(job.id, 'backend_agent_finished', { success: backendResult.success });
+
+  if (!backendResult.success) {
+    return { success: false, summary: `Backend half failed:\n${backendResult.summary}`, toolLog: backendResult.toolLog };
+  }
+
+  let backendContract = null;
+  try {
+    backendContract = await readFile(backendSandbox.dir, `src/routes/${slug}.js`);
+  } catch (e) {
+    await appendEvent(job.id, 'backend_contract_read_failed', { error: e.message });
+  }
+
+  await appendEvent(job.id, 'frontend_agent_started');
+  const frontendTask = buildFrontendTask({ moduleName, slug, features, sourceUrl, researchSummary, backendContract }) + vpsGuardrailReminder(insertOnlyFiles.frontend);
+  const frontendResult = await vpsCodingAgentClient.run(frontendSandbox.sandboxId, frontendTask);
+  await appendEvent(job.id, 'frontend_agent_finished', { success: frontendResult.success });
+
+  return {
+    success: backendResult.success && frontendResult.success,
+    summary: `Backend:\n${backendResult.summary}\n\nFrontend:\n${frontendResult.summary}`,
+    toolLog: [...backendResult.toolLog, ...frontendResult.toolLog],
+  };
+}
+
 module.exports = {
   async run(job, { appendEvent, updateStatus }) {
     const { moduleName, features, kind, sourceUrl } = job.payload || {};
@@ -253,6 +343,11 @@ module.exports = {
     // jobs) — every create_module job can use the VPS once it's enabled.
     const useVps = config.aida.vpsBridge.enabled;
     const sandboxOpts = { backend: useVps ? 'vps' : 'local' };
+    // AIDA roadmap item 20's extension to create_module — only ever true when
+    // the sandbox itself is ALREADY VPS-backed (useVps above) AND the
+    // separate coding-agent service is configured. See run() below, right
+    // before the agent runs, for the two-vs-one-call split this requires.
+    const useVpsCodingAgent = useVps && config.aida.vpsCodingAgent.enabled;
 
     let backendSandbox, frontendSandbox;
     try {
@@ -344,26 +439,35 @@ module.exports = {
         if (auto) researchSummary = buildResearchSummary(auto);
       }
 
-      const task = isPage
-        ? buildPageTask({ moduleName, slug, features, sourceUrl, researchSummary })
-        : buildTask({ moduleName, slug, features, nextNumber, sourceUrl, researchSummary });
-
-      await appendEvent(job.id, 'agent_started');
-      const toolLog = [];
-      const agentResult = await runModuleBuilderAgent({
-        sandboxDirs: { backend: needsBackend ? backendSandbox.dir : null, frontend: frontendSandbox.dir },
-        task,
-        existingFiles,
-        insertOnlyFiles: mb.insertOnlyFiles,
-        originalContents,
-        // Raised from 40, then 60, then 80 — wiring BOTH index.html (in-page
-        // view dispatch, past read_file's size cap) AND masteradmin.html
-        // (ALL_MODULES checkbox) is now a hard requirement in the same run
-        // (no more "add this manually" shortcut — see the system prompt's
-        // rule 5), on top of building both repos' actual module code.
-        maxIterations: 100,
-        onEvent: (e) => toolLog.push(e),
-      });
+      await appendEvent(job.id, 'agent_started', { engine: useVpsCodingAgent ? 'vps_claude_code_cli' : `local_${config.aida.codingAgent.provider}` });
+      let agentResult;
+      if (useVpsCodingAgent) {
+        agentResult = isPage
+          ? await runPageAgentOnVps({ frontendSandbox, moduleName, slug, features, sourceUrl, researchSummary })
+          : await runModuleAgentOnVps({
+            job, appendEvent, backendSandbox, frontendSandbox, moduleName, slug, features, nextNumber,
+            sourceUrl, researchSummary, insertOnlyFiles: mb.insertOnlyFiles,
+          });
+      } else {
+        const task = isPage
+          ? buildPageTask({ moduleName, slug, features, sourceUrl, researchSummary })
+          : buildTask({ moduleName, slug, features, nextNumber, sourceUrl, researchSummary });
+        const toolLog = [];
+        agentResult = await runModuleBuilderAgent({
+          sandboxDirs: { backend: needsBackend ? backendSandbox.dir : null, frontend: frontendSandbox.dir },
+          task,
+          existingFiles,
+          insertOnlyFiles: mb.insertOnlyFiles,
+          originalContents,
+          // Raised from 40, then 60, then 80 — wiring BOTH index.html (in-page
+          // view dispatch, past read_file's size cap) AND masteradmin.html
+          // (ALL_MODULES checkbox) is now a hard requirement in the same run
+          // (no more "add this manually" shortcut — see the system prompt's
+          // rule 5), on top of building both repos' actual module code.
+          maxIterations: 100,
+          onEvent: (e) => toolLog.push(e),
+        });
+      }
       await appendEvent(job.id, 'agent_finished', { success: agentResult.success, toolCallCount: agentResult.toolLog.length });
 
       if (!agentResult.success) {
@@ -386,6 +490,42 @@ module.exports = {
         });
         await appendEvent(job.id, 'completed', { changed: false });
         return;
+      }
+
+      // AIDA roadmap item 20's extension to create_module — the VPS Claude
+      // Code CLI has no pre-write hook into assertModuleWriteAllowed (it
+      // writes via its own built-in tools, not moduleBuilder.js's
+      // executeTool), so this is the REAL enforcement for that path: using
+      // the actual `git diff --name-status` list commitAll already returned,
+      // verify nothing outside "new file" / narrowly-allowed insert-only edit
+      // was touched — BEFORE any push or PR. A violation here fails the job
+      // cleanly with nothing ever made public. Never runs for the local
+      // engine (unchanged — already enforced pre-write there).
+      if (useVpsCodingAgent) {
+        try {
+          if (backendCommit.committed) {
+            await verifyChangesAllowed({
+              sandboxDir: backendSandbox.dir, changedPaths: backendCommit.changedPaths,
+              existingFiles: existingFiles.backend, insertOnlyFiles: mb.insertOnlyFiles.backend,
+              originalContents: originalContents.backend,
+            });
+          }
+          if (frontendCommit.committed) {
+            await verifyChangesAllowed({
+              sandboxDir: frontendSandbox.dir, changedPaths: frontendCommit.changedPaths,
+              existingFiles: existingFiles.frontend, insertOnlyFiles: isPage ? [] : mb.insertOnlyFiles.frontend,
+              originalContents: originalContents.frontend,
+            });
+          }
+          await appendEvent(job.id, 'guardrail_check_passed');
+        } catch (e) {
+          await updateStatus(job.id, 'failed', {
+            errorMessage: `The VPS coding agent violated a safety guardrail, so nothing was pushed: ${e.message}`,
+            result: { moduleName, slug, agentSummary: agentResult.summary, toolLog: agentResult.toolLog },
+          });
+          await appendEvent(job.id, 'guardrail_check_failed', { error: e.message });
+          return;
+        }
       }
 
       let backendPr = null, frontendPr = null;
@@ -466,6 +606,14 @@ module.exports = {
           frontendPr: frontendPr && { number: frontendPr.number, url: frontendPr.html_url },
           previewUrls,
           toolLog: agentResult.toolLog,
+          // Persisted so a later revise() can tell "genuinely pre-existing
+          // file" apart from "a file THIS job itself created" — a fresh
+          // snapshot of the re-cloned branch would wrongly include the
+          // latter (it's already committed on the branch by the time a
+          // revision re-clones it), live-tested to cause the VPS Claude
+          // Code CLI to correctly-but-uselessly refuse to touch its own
+          // prior work, citing the new-files-only guardrail.
+          existingFilesList: { backend: [...existingFiles.backend], frontend: [...existingFiles.frontend] },
         },
       });
       await appendEvent(job.id, 'awaiting_approval', { backendPrUrl: backendPr?.html_url, frontendPrUrl: frontendPr?.html_url });
@@ -490,6 +638,182 @@ module.exports = {
       // recorded completed/failed status.
       await backendSandbox?.cleanup().catch((e) => console.error(`[aida] backend sandbox cleanup failed for job ${job.id}:`, e.message));
       await frontendSandbox?.cleanup().catch((e) => console.error(`[aida] frontend sandbox cleanup failed for job ${job.id}:`, e.message));
+    }
+  },
+
+  /**
+   * Called only from an explicit human "revise this" request on an
+   * 'awaiting_approval' create_module job — re-clones whichever of the two
+   * branches already have an open PR (same branch NAME for both repos — see
+   * run() above), runs the agent again with the new instructions, and pushes
+   * more commits to those SAME branches, so the SAME PR(s) update in place
+   * instead of a new job/new PR opening. Leaves the job at 'awaiting_approval'
+   * either way — approve/reject still work exactly as before.
+   */
+  async revise(job, instructions, { appendEvent, updateStatus }) {
+    const { slug, moduleName, backendRepo, frontendRepo, backendPr, frontendPr, branch } = job.result || {};
+    if (!branch || (!backendPr && !frontendPr)) {
+      await updateStatus(job.id, 'failed', { errorMessage: 'Job has no open PR/branch to revise.' });
+      return;
+    }
+    const mb = config.aida.moduleBuilder;
+    const ca = config.aida.codingAgent;
+    const useVps = config.aida.vpsBridge.enabled;
+    const useVpsCodingAgent = useVps && config.aida.vpsCodingAgent.enabled;
+    await appendEvent(job.id, 'revision_requested', { instructions });
+
+    let backendSandbox = null, frontendSandbox = null;
+    try {
+      const sandboxOpts = { backend: useVps ? 'vps' : 'local' };
+      if (backendPr) {
+        const [owner, repoName] = backendRepo.split('/');
+        backendSandbox = await createSandbox(owner, repoName, ca.githubToken, branch, sandboxOpts);
+        await createBranch(backendSandbox, branch);
+      }
+      if (frontendPr) {
+        const [owner, repoName] = frontendRepo.split('/');
+        frontendSandbox = await createSandbox(owner, repoName, ca.githubToken, branch, sandboxOpts);
+        await createBranch(frontendSandbox, branch);
+      }
+      await appendEvent(job.id, 'revision_cloned', { backend: sandboxOpts.backend });
+
+      const installOne = async (sandbox) => {
+        if (!sandbox) return { exitCode: 0, skipped: true };
+        const hasPkg = await fileExists(sandbox.dir, 'package.json');
+        if (!hasPkg) return { exitCode: 0, skipped: true };
+        return runCommand(sandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 });
+      };
+      const [backendInstall, frontendInstall] = await Promise.all([installOne(backendSandbox), installOne(frontendSandbox)]);
+      if (backendInstall.exitCode !== 0 || frontendInstall.exitCode !== 0) {
+        await updateStatus(job.id, 'awaiting_approval', {
+          result: { ...job.result, lastRevisionFailed: true, lastRevisionError: 'npm install failed during revision.' },
+        });
+        await appendEvent(job.id, 'revision_failed', { stage: 'install' });
+        return;
+      }
+
+      // Deliberately NOT a fresh snapshot of the re-cloned branch — that
+      // would already include every file THIS job itself created in its own
+      // prior run (committed on the branch by now), wrongly flagging them as
+      // "pre-existing" and blocking the agent from touching its own work.
+      // Falls back to a fresh (branch) snapshot only for a job that reached
+      // awaiting_approval before this field existed.
+      const existingFiles = job.result?.existingFilesList
+        ? {
+          backend: new Set(job.result.existingFilesList.backend || []),
+          frontend: new Set(job.result.existingFilesList.frontend || []),
+        }
+        : {
+          backend: backendSandbox ? await snapshotExistingFiles(backendSandbox.dir) : new Set(),
+          frontend: frontendSandbox ? await snapshotExistingFiles(frontendSandbox.dir) : new Set(),
+        };
+      const originalContents = { backend: new Map(), frontend: new Map() };
+      if (backendSandbox) {
+        for (const f of mb.insertOnlyFiles.backend) {
+          try { originalContents.backend.set(f, await readFile(backendSandbox.dir, f)); } catch { /* may not exist in this checkout */ }
+        }
+      }
+      if (frontendSandbox) {
+        for (const f of mb.insertOnlyFiles.frontend) {
+          try { originalContents.frontend.set(f, await readFile(frontendSandbox.dir, f)); } catch { /* may not exist in this checkout */ }
+        }
+      }
+
+      // Must repeat exactly what was built last time (file names included) —
+      // a fresh VPS CLI call has no memory of the prior run at all; without
+      // this, live-tested, the agent has no idea which file to edit and
+      // correctly (but uselessly) reports "nothing to change" every time.
+      const revisionTaskText = `You previously built the "${moduleName}" module/page across one or two repositories. Here is exactly what you built, from your own prior summary:\n\n${job.result?.agentSummary || '(no summary recorded)'}\n\nA human reviewing your pull request has now asked for the following ADDITIONAL changes, to be made ON TOP of what's already there — do not rebuild from scratch or revert prior work unless specifically asked:\n\n${instructions}\n\nIMPORTANT — the "only create new files, never modify an existing one" rule below does NOT apply to anything YOU just created in the summary above: freely edit your own prior work in THIS repository to satisfy this request. That rule only ever meant files that existed in this repository before your very first build (i.e. real pre-existing application code you must never touch).\n\nIf nothing in THIS repository needs to change for this request, make no changes and say so plainly in your finish summary.`;
+
+      await appendEvent(job.id, 'revision_agent_started', { engine: useVpsCodingAgent ? 'vps_claude_code_cli' : `local_${ca.provider}` });
+      let agentResult;
+      if (useVpsCodingAgent) {
+        const results = [];
+        if (backendSandbox) results.push(await vpsCodingAgentClient.run(backendSandbox.sandboxId, revisionTaskText + vpsGuardrailReminder(mb.insertOnlyFiles.backend)));
+        if (frontendSandbox) results.push(await vpsCodingAgentClient.run(frontendSandbox.sandboxId, revisionTaskText + vpsGuardrailReminder(mb.insertOnlyFiles.frontend)));
+        agentResult = {
+          success: results.every((r) => r.success),
+          summary: results.map((r) => r.summary).join('\n\n'),
+          toolLog: results.flatMap((r) => r.toolLog),
+        };
+      } else {
+        agentResult = await runModuleBuilderAgent({
+          sandboxDirs: { backend: backendSandbox?.dir || null, frontend: frontendSandbox?.dir || null },
+          task: revisionTaskText,
+          existingFiles, insertOnlyFiles: mb.insertOnlyFiles, originalContents,
+          maxIterations: 60,
+          onEvent: () => {},
+        });
+      }
+      await appendEvent(job.id, 'revision_agent_finished', { success: agentResult.success, summary: agentResult.summary });
+
+      if (!agentResult.success) {
+        await updateStatus(job.id, 'awaiting_approval', {
+          result: { ...job.result, lastRevisionFailed: true, lastRevisionError: agentResult.summary },
+        });
+        await appendEvent(job.id, 'revision_failed', { stage: 'agent' });
+        return;
+      }
+
+      const [backendCommit, frontendCommit] = await Promise.all([
+        backendSandbox ? commitAll(backendSandbox, `AIDA revision: ${instructions.slice(0, 60).replace(/\s+/g, ' ')}`) : Promise.resolve({ committed: false }),
+        frontendSandbox ? commitAll(frontendSandbox, `AIDA revision: ${instructions.slice(0, 60).replace(/\s+/g, ' ')}`) : Promise.resolve({ committed: false }),
+      ]);
+
+      if (!backendCommit.committed && !frontendCommit.committed) {
+        await updateStatus(job.id, 'awaiting_approval', {
+          result: { ...job.result, lastRevisionFailed: false, lastRevisionNote: 'The agent made no file changes for this revision request.' },
+        });
+        await appendEvent(job.id, 'revision_no_changes');
+        return;
+      }
+
+      if (useVpsCodingAgent) {
+        try {
+          if (backendCommit.committed) {
+            await verifyChangesAllowed({
+              sandboxDir: backendSandbox.dir, changedPaths: backendCommit.changedPaths,
+              existingFiles: existingFiles.backend, insertOnlyFiles: mb.insertOnlyFiles.backend,
+              originalContents: originalContents.backend,
+            });
+          }
+          if (frontendCommit.committed) {
+            await verifyChangesAllowed({
+              sandboxDir: frontendSandbox.dir, changedPaths: frontendCommit.changedPaths,
+              existingFiles: existingFiles.frontend, insertOnlyFiles: mb.insertOnlyFiles.frontend,
+              originalContents: originalContents.frontend,
+            });
+          }
+        } catch (e) {
+          await updateStatus(job.id, 'awaiting_approval', {
+            result: { ...job.result, lastRevisionFailed: true, lastRevisionError: `Guardrail violation — nothing pushed: ${e.message}` },
+          });
+          await appendEvent(job.id, 'revision_guardrail_failed', { error: e.message });
+          return;
+        }
+      }
+
+      if (backendCommit.committed) { await pushBranch(backendSandbox); await appendEvent(job.id, 'revision_backend_pushed'); }
+      if (frontendCommit.committed) { await pushBranch(frontendSandbox); await appendEvent(job.id, 'revision_frontend_pushed'); }
+
+      await updateStatus(job.id, 'awaiting_approval', {
+        result: {
+          ...job.result,
+          agentSummary: `${job.result.agentSummary}\n\n--- Revision (${new Date().toISOString()}) ---\nRequested: ${instructions}\n\n${agentResult.summary}`,
+          revisionCount: (job.result.revisionCount || 0) + 1,
+          lastRevisionFailed: false,
+        },
+      });
+      await appendEvent(job.id, 'revision_awaiting_approval');
+    } catch (e) {
+      const safeMessage = ca.githubToken ? e.message.split(ca.githubToken).join('***') : e.message;
+      await updateStatus(job.id, 'awaiting_approval', {
+        result: { ...job.result, lastRevisionFailed: true, lastRevisionError: safeMessage },
+      });
+      await appendEvent(job.id, 'revision_failed', { error: safeMessage });
+    } finally {
+      await backendSandbox?.cleanup().catch((e) => console.error(`[aida] job ${job.id}: revision backend cleanup failed:`, e.message));
+      await frontendSandbox?.cleanup().catch((e) => console.error(`[aida] job ${job.id}: revision frontend cleanup failed:`, e.message));
     }
   },
 

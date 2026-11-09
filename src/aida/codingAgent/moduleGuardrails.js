@@ -1,5 +1,5 @@
 const path = require('path');
-const { listFiles } = require('./tools');
+const { listFiles, readFile } = require('./tools');
 
 /**
  * Write-path restrictions for the phase-2 "create a whole module" agent —
@@ -94,4 +94,37 @@ function assertInsertOnlyEdit(oldContent, newContent, relPath) {
   }
 }
 
-module.exports = { snapshotExistingFiles, assertModuleWriteAllowed, assertInsertOnlyEdit, normalizeRelPath };
+/**
+ * Post-hoc equivalent of assertModuleWriteAllowed, for a run where the real
+ * VPS Claude Code CLI did the writing (AIDA roadmap item 20's extension to
+ * create_module) — that engine has no pre-write hook into this file's
+ * enforcement above, since it writes via its own built-in tools, not
+ * moduleBuilder.js's executeTool. Called once per committed sandbox, using
+ * the real `git diff --name-status` list commitAll already returns for a
+ * VPS-backed sandbox, BEFORE pushBranch/openPullRequest — throws on any
+ * violation, so the caller can fail the job cleanly with nothing ever
+ * pushed, instead of discovering the violation after a PR is already open.
+ */
+async function verifyChangesAllowed({ sandboxDir, changedPaths, existingFiles, insertOnlyFiles = [], originalContents = new Map() }) {
+  for (const relPath of changedPaths || []) {
+    const normalized = normalizeRelPath(relPath);
+    if (!existingFiles.has(normalized)) continue; // a genuinely new file — always fine
+
+    if (!insertOnlyFiles.includes(normalized)) {
+      throw new Error(
+        `modified "${normalized}", which already existed before this task started — the agent may only ` +
+        `create new files (plus narrowly-allowed insert-only edits to a specific small set of files).`
+      );
+    }
+
+    let currentContent;
+    try {
+      currentContent = await readFile(sandboxDir, normalized);
+    } catch (e) {
+      throw new Error(`deleted or made unreadable the insert-only file "${normalized}": ${e.message}`);
+    }
+    assertInsertOnlyEdit(originalContents.get(normalized) ?? '', currentContent ?? '', normalized);
+  }
+}
+
+module.exports = { snapshotExistingFiles, assertModuleWriteAllowed, assertInsertOnlyEdit, verifyChangesAllowed, normalizeRelPath };

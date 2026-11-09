@@ -311,6 +311,105 @@ module.exports = {
     }
   },
 
+  /**
+   * Called only from an explicit human "revise this" request on an
+   * 'awaiting_approval' dev_repo_fix job (see tools/devops.js's
+   * dev_revise_job) — re-clones the job's EXISTING PR branch (not main),
+   * runs the coding agent again with the new instructions, and pushes more
+   * commits to that SAME branch, so the SAME PR updates in place instead of
+   * a second one opening. Leaves the job at 'awaiting_approval' either way
+   * (success or a no-op) — approve/reject still work exactly as before,
+   * completely unchanged; this never merges or closes anything itself.
+   */
+  async revise(job, instructions, { appendEvent, updateStatus }) {
+    const { repo, branch, prNumber } = job.result || {};
+    if (!repo || !branch || !prNumber) {
+      await updateStatus(job.id, 'failed', { errorMessage: 'Job has no open PR/branch to revise.' });
+      return;
+    }
+    const [owner, repoName] = repo.split('/');
+    const ca = config.aida.codingAgent;
+    await appendEvent(job.id, 'revision_requested', { instructions });
+
+    let sandbox;
+    try {
+      // Same VPS gate as run() above — a fast-lane job never reaches here
+      // anyway (actionFastLane jobs auto-merge or fall back to a normal
+      // awaiting_approval dev_repo_fix-shaped job, which IS revisable).
+      const useVps = config.aida.vpsBridge.enabled && job.payload?.actionFastLane !== true;
+      sandbox = await createSandbox(owner, repoName, ca.githubToken, branch, { backend: useVps ? 'vps' : 'local' });
+      createBranch(sandbox, branch); // push target is the SAME existing branch, never a new one
+      await appendEvent(job.id, 'revision_cloned', { branch, backend: sandbox.backend });
+
+      const hasPackageJson = await fileExists(sandbox.dir, 'package.json');
+      const install = hasPackageJson
+        ? await runCommand(sandbox.dir, 'npm', ['install', '--no-audit', '--no-fund'], { timeoutMs: 180_000 })
+        : { exitCode: 0, skipped: true };
+      if (install.exitCode !== 0) {
+        await updateStatus(job.id, 'awaiting_approval', {
+          result: { ...job.result, lastRevisionFailed: true, lastRevisionError: `npm install failed during revision:\n${install.stderr.slice(0, 500)}` },
+        });
+        await appendEvent(job.id, 'revision_failed', { stage: 'install' });
+        return;
+      }
+
+      const revisionTask = `You previously worked on this task: "${job.payload?.task || DEFAULT_TASK}" and opened a pull request with this summary:\n\n${job.result?.agentSummary || '(no summary recorded)'}\n\nThe human reviewing your pull request has now asked for the following ADDITIONAL changes, to be made ON TOP of what's already there — do not redo or revert your previous work unless the instructions below specifically ask you to:\n\n${instructions}\n\nIf nothing further is actually needed, make no changes and say so plainly in your finish summary.`;
+
+      const useVpsCodingAgent = sandbox.backend === 'vps' && config.aida.vpsCodingAgent.enabled;
+      await appendEvent(job.id, 'revision_agent_started', { engine: useVpsCodingAgent ? 'vps_claude_code_cli' : `local_${ca.provider}` });
+      const agentResult = useVpsCodingAgent
+        ? await vpsCodingAgentClient.run(sandbox.sandboxId, revisionTask)
+        : await runCodingAgent({ sandboxDir: sandbox.dir, task: revisionTask, maxIterations: 50, onEvent: () => {} });
+      await appendEvent(job.id, 'revision_agent_finished', { success: agentResult.success, summary: agentResult.summary });
+
+      if (!agentResult.success) {
+        await updateStatus(job.id, 'awaiting_approval', {
+          result: { ...job.result, lastRevisionFailed: true, lastRevisionError: agentResult.summary },
+        });
+        await appendEvent(job.id, 'revision_failed', { stage: 'agent' });
+        return;
+      }
+
+      const commitResult = await commitAll(sandbox, `AIDA revision: ${instructions.slice(0, 72).replace(/\s+/g, ' ')}`);
+      if (!commitResult.committed) {
+        await updateStatus(job.id, 'awaiting_approval', {
+          result: { ...job.result, lastRevisionFailed: false, lastRevisionNote: 'The agent made no file changes for this revision request.' },
+        });
+        await appendEvent(job.id, 'revision_no_changes');
+        return;
+      }
+
+      let testGate = job.result?.testGate || { ran: false, passed: null };
+      if (hasPackageJson) {
+        const testRun = await runCommand(sandbox.dir, 'npm', ['test'], { timeoutMs: 180_000 });
+        testGate = { ran: true, passed: testRun.exitCode === 0, exitCode: testRun.exitCode };
+        await appendEvent(job.id, 'revision_tests_run', testGate);
+      }
+
+      await pushBranch(sandbox);
+      await appendEvent(job.id, 'revision_pushed', { branch });
+
+      await updateStatus(job.id, 'awaiting_approval', {
+        result: {
+          ...job.result,
+          agentSummary: `${job.result.agentSummary}\n\n--- Revision (${new Date().toISOString()}) ---\nRequested: ${instructions}\n\n${agentResult.summary}`,
+          testGate,
+          revisionCount: (job.result.revisionCount || 0) + 1,
+          lastRevisionFailed: false,
+        },
+      });
+      await appendEvent(job.id, 'revision_awaiting_approval', { prUrl: job.result.prUrl });
+    } catch (e) {
+      const safeMessage = ca.githubToken ? e.message.split(ca.githubToken).join('***') : e.message;
+      await updateStatus(job.id, 'awaiting_approval', {
+        result: { ...job.result, lastRevisionFailed: true, lastRevisionError: safeMessage },
+      });
+      await appendEvent(job.id, 'revision_failed', { error: safeMessage });
+    } finally {
+      await sandbox?.cleanup().catch((e) => console.error(`[aida] job ${job.id}: revision sandbox cleanup failed:`, e.message));
+    }
+  },
+
   /** Called only when a human clicks Reject on an 'awaiting_approval' dev_repo_fix job — closes the real PR without merging. */
   async onReject(job, { appendEvent }) {
     const { repo, prNumber } = job.result || {};

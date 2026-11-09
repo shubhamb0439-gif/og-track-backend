@@ -132,6 +132,40 @@ async function runOnReject(job) {
   }
 }
 
+/**
+ * Called by the revise endpoint on an 'awaiting_approval' job — asks the
+ * SAME job kind to push additional changes onto its existing, still-open
+ * PR(s), rather than opening a new job/new PR. The job's own status stays
+ * 'awaiting_approval' throughout (the kind's revise() sets it back itself);
+ * this never calls jobStore.updateJobStatus to 'running' first, since a
+ * revision is a quick, additive follow-up to an already-reviewable PR, not a
+ * fresh build — see devFix.js/createModule.js's own revise() for the real
+ * work (re-clone the EXISTING branch, not main; run the agent again; commit
+ * and push to that SAME branch so the SAME PR updates).
+ */
+async function reviseJob(job, instructions) {
+  const kind = getJobKind(job.kind);
+  if (!kind || !kind.revise) {
+    const failed = await jobStore.updateJobStatus(job.id, 'failed', { errorMessage: `Job kind "${job.kind}" does not support revisions.` });
+    emitJobUpdate(failed);
+    await maybeNotifyCompletion(job.id);
+    return failed;
+  }
+  try {
+    await kind.revise(job, instructions, helpers);
+    const final = await jobStore.getJob(job.id);
+    emitJobUpdate(final);
+    await maybeNotifyCompletion(job.id);
+    return final;
+  } catch (e) {
+    console.error(`[aida-jobs] job ${job.id} (${job.kind}) failed to revise:`, e);
+    const failed = await jobStore.updateJobStatus(job.id, 'failed', { errorMessage: e.message });
+    emitJobUpdate(failed);
+    await maybeNotifyCompletion(job.id);
+    return failed;
+  }
+}
+
 async function poll() {
   if (polling) return;
   polling = true;
@@ -184,4 +218,4 @@ function start(ioInstance) {
   previewPollTimer.unref?.();
 }
 
-module.exports = { start, resumeApproved, runOnReject, emitJobUpdate, roomForJob, getIo };
+module.exports = { start, resumeApproved, runOnReject, reviseJob, emitJobUpdate, roomForJob, getIo };

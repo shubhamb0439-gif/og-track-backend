@@ -67,10 +67,32 @@ router.post('/run', (req, res) => {
   // `task` is passed as a single discrete argv element, so its own content
   // (quotes, newlines, anything) needs no escaping and carries no
   // shell-injection surface.
+  //
+  // Live-tested WITHOUT any permission flag first and found a real gap —
+  // headless `-p` mode has no human present to answer its file-write
+  // permission prompt, so every write_file/edit call the CLI wanted to make
+  // was silently blocked (the run reported back gracefully, "changed": false,
+  // rather than hanging or crashing — but nothing was ever actually
+  // written). `--dangerously-skip-permissions` was tried next and rejected
+  // outright by the CLI itself ("cannot be used with root/sudo privileges
+  // for security reasons" — this container runs as root, see Dockerfile).
+  // `--permission-mode acceptEdits` is the narrower, root-safe fix: it
+  // auto-approves file Read/Write/Edit tool calls specifically (what this
+  // pipeline actually needs — the real test gate runs separately, outside
+  // the CLI, via devFix.js's own runCommand('npm test') call afterward), and
+  // `--permission-prompts none` means anything else that WOULD need a human
+  // (e.g. an unexpected Bash call) is cleanly auto-denied instead of hanging
+  // forever waiting for an answer that will never come. Safe here
+  // specifically because this sandbox is a disposable git clone with a
+  // dummy .env (see ogtrack-backend's sandbox.js's DUMMY_ENV) and no real
+  // credentials. Explicitly confirmed with the user before adding this
+  // (2026-11-09).
   execFile('claude', [
     '-p', task,
     '--output-format', 'json',
     '--model', MODEL,
+    '--permission-mode', 'acceptEdits',
+    '--permission-prompts', 'none',
   ], {
     cwd: fs.realpathSync(dir),
     timeout: TIMEOUT_MS,
