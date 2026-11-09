@@ -795,4 +795,14 @@ module.exports = {
   sitara: {
     staleOrderDays: Number(process.env.SITARA_STALE_ORDER_DAYS || 3),
   },
+  // Daily birthday-announcement email (src/birthdayEmailNotifier.js) — for
+  // every active company, whenever a user's dbo.users.date_of_birth matches
+  // today, every active user in that SAME company (not cross-tenant) gets an
+  // email announcing it. Checked hourly; the real once-a-year guard is each
+  // matched user's own last_birthday_email_year column (patch_23), not this
+  // interval — same "poll often, act rarely" shape as every other reconciliation
+  // poller in this file.
+  birthdayEmail: {
+    checkIntervalMs: parseInt(process.env.BIRTHDAY_EMAIL_CHECK_INTERVAL_MS || '', 10) || 60 * 60 * 1000,
+  },
 };

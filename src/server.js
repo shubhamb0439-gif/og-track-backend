@@ -98,6 +98,11 @@ require('./sitaraWeeklyReconciliation').start();
 require('./sitaraMonthlyReconciliation').start();
 require('./aida/flows/flowRunner').start();
 
+// Daily birthday-announcement email, every active company — whenever a
+// user's registered date_of_birth matches today, every active user in that
+// same company gets an email about it. No-op if ACS email isn't configured.
+require('./birthdayEmailNotifier').start();
+
 // ── Socket.io: per-tenant rooms ──────────────────────────────────────────────
 // Every client joins a room named after its company slug. All real-time
 // emits in the routes target io.to(slug), so OGTrack events never reach Cajo
