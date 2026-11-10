@@ -3372,3 +3372,85 @@ into that tenant's Messages module, unrelated to this event; nothing new needed 
 **Verification:** ask AIDA in chat to build something small (a test page is fine), note the job id it
 gives you, then either watch the open chat tab for the message to appear live once the job finishes, or
 reload the page afterward and confirm the message shows up in that conversation's history either way.
+
+---
+
+## 60. CAJO Inventory — "Inward Outward" (manual issue-to-customer) + total stock value tile
+
+**Status: backend built, test suite passes (79/79). Not yet live-tested against a real tenant DB —
+the new SQL patch (`patch_24_inv_stock_issues_customer.sql`) needs to be run against CAJO's real
+tenant database before these endpoints will work there (new tenants get it automatically via
+provisioning; existing ones, like CAJO, need it applied by hand first — same situation as other
+recent schema patches in this codebase).**
+
+**The problem this solves:** when a manufactured product (e.g. a laser) has a part fail after
+delivery, a replacement part today has no clean way to leave inventory — someone has to either
+fudge it through a manual stock adjustment (which has no concept of "who it went to") or skip
+recording it at all, leaving real stock figures wrong. This adds a proper "send this item to this
+customer, deduct it from stock" action, with a real history to look back on.
+
+**1. New section — "Inward Outward" (placed under Purchase Order in the Inventory nav, per the
+request, even though technically it's an outward/issue action, not a purchase):**
+
+A simple form: pick an inventory item (reuse whatever item-picker component the rest of
+Inventory already uses — same data as `GET /api/:slug/inventory/items`), pick a customer (reuse
+the CRM module's existing customer-picker, same data as `GET /api/:slug/crm/customers` or
+wherever that list already comes from elsewhere in the app), enter a quantity, and an optional
+notes/details field. On submit:
+
+```
+POST /api/:slug/inventory/items/:itemId/issue
+  body: { quantity, customerId, details?, issueDate? }
+  -> { issueId, consumed: [...], item: { ...updated item, stock: <new lower stock> } }
+```
+
+This is the SAME endpoint that already existed for plain internal-consumption stock issues —
+`customerId` is simply a new optional field on it. When provided, the item's `stock` is reduced
+immediately (FIFO against existing stock lots, identical to every other stock-deduction path in
+this module), and the issue is recorded against that customer. A 400 comes back if the chosen
+customer id doesn't exist, or if quantity exceeds what FIFO consumption can cover — show that
+error inline on the form.
+
+**2. History view for this section** (so "what did we send out, to whom, and when" is actually
+answerable later — there was no way to see this before):
+
+```
+GET /api/:slug/inventory/issues?customerId=&itemId=&dateFrom=&dateTo=
+  -> [ { id, itemId, itemName, itemCode, quantity, issueDate, details,
+         customerId, customerName, createdBy, createdAt }, ... ]
+  Sorted newest first. All query params optional — omit any/all for the full list.
+  customerName is a point-in-time snapshot (taken when the issue was created), so it still
+  shows correctly even if that customer is later renamed.
+```
+
+Render as a simple table (Date / Item / Quantity / Customer / Details) under the Inward Outward
+form — filterable by the same customerId/itemId/date-range params above, however you want to
+expose that (a customer dropdown + date pickers is enough, no need for anything fancier). Rows
+with no `customerId` (i.e. older/plain internal-consumption issues, from before this change) are
+real too — just show `customerName` as blank/"—" for those rather than hiding them.
+
+**3. Inventory page — total stock value tile at the top:**
+
+```
+GET /api/:slug/inventory/items/summary
+  -> { totalItems: <count>, totalStockValue: <number>, asOf: <timestamp> }
+```
+
+`totalStockValue` is the sum, across every item, of `stock × avgCost` (the same weighted-average
+cost already shown per-item elsewhere in Inventory — there's no separate "sale price" field on an
+item in this module, so this is a cost-basis valuation, not a sale-value one; worth labeling the
+tile something like "Total Stock Value (at cost)" rather than implying it's sale value). Call this
+once when the Inventory page loads (and again after any stock-changing action, same refresh
+trigger you'd already use to re-fetch `GET /items`) and show it as a prominent summary tile/card
+at the top of the page — a big number, similar treatment to any other summary stat the app already
+uses elsewhere (e.g. a dashboard KPI tile), not buried in a table.
+
+**Scope note:** the "Inward Outward" form reuses the existing issue endpoint rather than being a
+wholly separate backend feature — the only thing that changed under the hood is that a customer
+can now optionally be attached to an issue. A plain, no-customer issue (if that UI exists
+elsewhere, e.g. for internal consumption) keeps working exactly as before.
+
+**Verification:** once the SQL patch has been applied to CAJO's tenant DB, submit a real
+Inward/Outward entry for a real item + real customer, confirm the item's stock visibly drops by
+that quantity, confirm it shows up in the history list filtered by that customer, and confirm the
+Inventory page's total-value tile recalculates to reflect the lower stock.

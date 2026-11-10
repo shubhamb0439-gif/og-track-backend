@@ -204,6 +204,20 @@ router.get('/items', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Total value of everything on hand — sum of (stock × avgCost) across every
+// item, for the summary tile at the top of the Inventory page. avgCost is
+// the weighted-average cost already maintained on each item (see
+// recomputeItemStock in utils/stockLots.js) rather than sale price, since
+// this module has no per-item sale price — that only exists per-sale-line.
+router.get('/items/summary', async (req, res) => {
+  try {
+    const rows = await req.db('inv_items').select('stock', 'avg_cost');
+    let totalStockValue = 0;
+    for (const r of rows) totalStockValue += Number(r.stock || 0) * Number(r.avg_cost || 0);
+    res.json({ totalItems: rows.length, totalStockValue, asOf: new Date() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get('/items/:id', async (req, res) => {
   try {
     const row = await req.db('inv_items').where({ id: req.params.id }).first();
@@ -373,17 +387,31 @@ router.post('/items/:id/adjust-stock', async (req, res) => {
 
 router.post('/items/:id/issue', async (req, res) => {
   try {
-    const { quantity, details, issueDate } = req.body;
+    const { quantity, details, issueDate, customerId } = req.body;
     if (quantity == null || Number(quantity) <= 0) {
       return res.status(400).json({ error: 'quantity is required and must be positive' });
     }
     const item = await req.db('inv_items').where({ id: req.params.id }).first();
     if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    // customerId is optional — this same endpoint covers both a plain
+    // internal-consumption issue and the "Inward Outward" manual
+    // replacement-part-to-customer case. Snapshotting the name (not just the
+    // id) keeps the issue history readable even if the customer is later
+    // renamed/deleted.
+    let customerName = null;
+    if (customerId) {
+      const customer = await req.db('customers').where({ id: customerId }).first();
+      if (!customer) return res.status(400).json({ error: 'Customer not found' });
+      customerName = customer.name;
+    }
+
     const consumed = await consumeStockFIFO(req.db, req.params.id, Number(quantity));
     const issueId = 'iss_' + Date.now();
     await req.db('inv_stock_issues').insert({
       id: issueId, item_id: req.params.id, quantity,
       issue_date: issueDate || new Date(), details: details || null,
+      customer_id: customerId || null, customer_name: customerName,
       created_by: req.user?.userId || null,
     });
     for (const c of consumed) {
@@ -397,6 +425,31 @@ router.post('/items/:id/issue', async (req, res) => {
     req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
     res.json({ issueId, consumed, item: mapItem(saved) });
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Issue history — covers both plain internal-consumption issues and
+// customer-attributed "Inward Outward" issues (customerId present). No
+// GET existed on this table before; filters mirror the common history-view
+// needs (by item, by customer, by date range).
+router.get('/issues', async (req, res) => {
+  try {
+    let q = req.db('inv_stock_issues');
+    if (req.query.itemId) q = q.where({ item_id: req.query.itemId });
+    if (req.query.customerId) q = q.where({ customer_id: req.query.customerId });
+    if (req.query.dateFrom) q = q.where('issue_date', '>=', req.query.dateFrom);
+    if (req.query.dateTo) q = q.where('issue_date', '<=', req.query.dateTo);
+    const rows = await q.orderBy('issue_date', 'desc').orderBy('created_at', 'desc');
+    const itemIds = [...new Set(rows.map(r => r.item_id))];
+    const items = itemIds.length ? await req.db('inv_items').whereIn('id', itemIds) : [];
+    const itemById = new Map(items.map(i => [i.id, i]));
+    res.json(rows.map(r => ({
+      id: r.id, itemId: r.item_id, itemName: itemById.get(r.item_id)?.name || null,
+      itemCode: itemById.get(r.item_id)?.item_code || null,
+      quantity: Number(r.quantity), issueDate: r.issue_date, details: r.details,
+      customerId: r.customer_id, customerName: r.customer_name,
+      createdBy: r.created_by, createdAt: r.created_at,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Purchases ─────────────────────────────────────────────────────────────────
