@@ -318,7 +318,7 @@ router.delete('/items/:id', async (req, res) => {
     // Real, received stock is meaningful history — block on that.
     const receivedLots = await req.db('inv_stock_lots').where({ item_id: req.params.id }).andWhere('quantity_received', '>', 0).first();
     if (receivedLots) {
-      const sourceLabel = { purchase: 'a purchase order', assembly: 'a manufacturing assembly', manual: 'a manual stock adjustment' }[receivedLots.source] || 'stock history';
+      const sourceLabel = { purchase: 'a purchase order', assembly: 'a manufacturing assembly', manual: 'a manual stock adjustment', customer_return: 'a customer return (Inward)' }[receivedLots.source] || 'stock history';
       return res.status(400).json({ error: `This item still has received stock from ${sourceLabel} (lot ${receivedLots.lot_ref || receivedLots.id}) and cannot be deleted. Consider archiving it instead.` });
     }
 
@@ -332,6 +332,7 @@ router.delete('/items/:id', async (req, res) => {
     }
     await req.db('inv_stock_lots').where({ item_id: req.params.id }).delete();
     await req.db('inv_stock_issues').where({ item_id: req.params.id }).delete();
+    await req.db('inv_stock_returns').where({ item_id: req.params.id }).delete();
     await req.db('inv_stock_adjustments').where({ item_id: req.params.id }).delete();
     await req.db('inv_items').where({ id: req.params.id }).delete();
     req.io.to(req.company.slug).emit('inv:item_deleted', { id: req.params.id });
@@ -385,6 +386,11 @@ router.post('/items/:id/adjust-stock', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// "Inward Outward" — OUTWARD side: stock LEAVING for a customer (e.g. a
+// manual replacement part sent out), deducted immediately. customerId is
+// optional so this endpoint still covers the older plain internal-
+// consumption issue case unchanged. See /items/:id/receive-from-customer
+// just below for the separate INWARD (stock coming back) side.
 router.post('/items/:id/issue', async (req, res) => {
   try {
     const { quantity, details, issueDate, customerId } = req.body;
@@ -446,6 +452,70 @@ router.get('/issues', async (req, res) => {
       id: r.id, itemId: r.item_id, itemName: itemById.get(r.item_id)?.name || null,
       itemCode: itemById.get(r.item_id)?.item_code || null,
       quantity: Number(r.quantity), issueDate: r.issue_date, details: r.details,
+      customerId: r.customer_id, customerName: r.customer_name,
+      createdBy: r.created_by, createdAt: r.created_at,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// "Inward Outward" — INWARD side: stock coming BACK from a customer (e.g. a
+// returned/replaced part), added back to real stock immediately. A separate
+// endpoint/table from Outward's /issue+inv_stock_issues on purpose — these
+// are two distinct forms in the UI, not one form with a signed quantity.
+// Creates a real new stock lot (source: 'customer_return') so the returned
+// quantity becomes normal, FIFO-consumable stock again, not a separate pool.
+router.post('/items/:id/receive-from-customer', async (req, res) => {
+  try {
+    const { quantity, details, returnDate, customerId, unitCost } = req.body;
+    if (quantity == null || Number(quantity) <= 0) {
+      return res.status(400).json({ error: 'quantity is required and must be positive' });
+    }
+    const item = await req.db('inv_items').where({ id: req.params.id }).first();
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    let customerName = null;
+    if (customerId) {
+      const customer = await req.db('customers').where({ id: customerId }).first();
+      if (!customer) return res.status(400).json({ error: 'Customer not found' });
+      customerName = customer.name;
+    }
+
+    const lotId = await createLot(req.db, {
+      itemId: req.params.id, quantity: Number(quantity),
+      unitCost: unitCost != null ? Number(unitCost) : (item.avg_cost || 0),
+      receivedDate: returnDate || new Date(), source: 'customer_return',
+      notes: details || null,
+    });
+    const returnId = 'ret_' + Date.now();
+    await req.db('inv_stock_returns').insert({
+      id: returnId, item_id: req.params.id, lot_id: lotId, quantity,
+      return_date: returnDate || new Date(), details: details || null,
+      customer_id: customerId || null, customer_name: customerName,
+      created_by: req.user?.userId || null,
+    });
+    await recomputeItemStock(req.db, req.params.id);
+    const saved = await req.db('inv_items').where({ id: req.params.id }).first();
+    req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+    res.json({ returnId, lotId, item: mapItem(saved) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Inward (customer-return) history — same filter shape as /issues (Outward).
+router.get('/returns', async (req, res) => {
+  try {
+    let q = req.db('inv_stock_returns');
+    if (req.query.itemId) q = q.where({ item_id: req.query.itemId });
+    if (req.query.customerId) q = q.where({ customer_id: req.query.customerId });
+    if (req.query.dateFrom) q = q.where('return_date', '>=', req.query.dateFrom);
+    if (req.query.dateTo) q = q.where('return_date', '<=', req.query.dateTo);
+    const rows = await q.orderBy('return_date', 'desc').orderBy('created_at', 'desc');
+    const itemIds = [...new Set(rows.map(r => r.item_id))];
+    const items = itemIds.length ? await req.db('inv_items').whereIn('id', itemIds) : [];
+    const itemById = new Map(items.map(i => [i.id, i]));
+    res.json(rows.map(r => ({
+      id: r.id, itemId: r.item_id, itemName: itemById.get(r.item_id)?.name || null,
+      itemCode: itemById.get(r.item_id)?.item_code || null,
+      quantity: Number(r.quantity), returnDate: r.return_date, details: r.details,
       customerId: r.customer_id, customerName: r.customer_name,
       createdBy: r.created_by, createdAt: r.created_at,
     })));

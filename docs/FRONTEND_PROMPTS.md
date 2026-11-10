@@ -3375,61 +3375,85 @@ reload the page afterward and confirm the message shows up in that conversation'
 
 ---
 
-## 60. CAJO Inventory — "Inward Outward" (manual issue-to-customer) + total stock value tile
+## 60. CAJO Inventory — "Inward Outward" (two separate modals: send to / receive from a customer) + total stock value tile
 
-**Status: backend built, test suite passes (79/79). Not yet live-tested against a real tenant DB —
-the new SQL patch (`patch_24_inv_stock_issues_customer.sql`) needs to be run against CAJO's real
-tenant database before these endpoints will work there (new tenants get it automatically via
-provisioning; existing ones, like CAJO, need it applied by hand first — same situation as other
-recent schema patches in this codebase).**
+**Status: backend built and live-applied to CAJO's real tenant database (cajo_erp) — both SQL
+patches (`patch_24_inv_stock_issues_customer.sql`, `patch_25_inv_stock_returns.sql`) have already
+been run against it, confirmed via direct schema checks. Test suite passes (79/79). Revised from an
+earlier single-form design, per explicit follow-up: Inward and Outward are two separate
+modals/forms, not one form with a signed quantity.**
 
 **The problem this solves:** when a manufactured product (e.g. a laser) has a part fail after
 delivery, a replacement part today has no clean way to leave inventory — someone has to either
 fudge it through a manual stock adjustment (which has no concept of "who it went to") or skip
-recording it at all, leaving real stock figures wrong. This adds a proper "send this item to this
-customer, deduct it from stock" action, with a real history to look back on.
+recording it at all, leaving real stock figures wrong. This adds two proper actions — send a part
+to a customer (deducts stock) and receive a part back from a customer (adds stock back) — each
+with its own history to look back on.
 
-**1. New section — "Inward Outward" (placed under Purchase Order in the Inventory nav, per the
-request, even though technically it's an outward/issue action, not a purchase):**
+**New section — "Inward Outward" (placed under Purchase Order in the Inventory nav, per the
+request). Two separate modals/buttons inside it: "Outward" and "Inward" — do not merge them into
+one form, they hit different endpoints and mean different things.**
 
-A simple form: pick an inventory item (reuse whatever item-picker component the rest of
-Inventory already uses — same data as `GET /api/:slug/inventory/items`), pick a customer (reuse
-the CRM module's existing customer-picker, same data as `GET /api/:slug/crm/customers` or
-wherever that list already comes from elsewhere in the app), enter a quantity, and an optional
-notes/details field. On submit:
+### Outward — stock leaving for a customer
+
+Pick an inventory item (same data as `GET /api/:slug/inventory/items`), pick a customer (reuse
+the CRM module's existing customer-picker — same data as `GET /api/:slug/crm/customers` or
+wherever that list already comes from elsewhere in the app), enter a quantity, optional
+notes/details. On submit:
 
 ```
 POST /api/:slug/inventory/items/:itemId/issue
   body: { quantity, customerId, details?, issueDate? }
-  -> { issueId, consumed: [...], item: { ...updated item, stock: <new lower stock> } }
+  -> { issueId, consumed: [...], item: { ...updated item, stock: <new LOWER stock> } }
 ```
 
-This is the SAME endpoint that already existed for plain internal-consumption stock issues —
-`customerId` is simply a new optional field on it. When provided, the item's `stock` is reduced
-immediately (FIFO against existing stock lots, identical to every other stock-deduction path in
-this module), and the issue is recorded against that customer. A 400 comes back if the chosen
-customer id doesn't exist, or if quantity exceeds what FIFO consumption can cover — show that
-error inline on the form.
+This is the same endpoint that already existed for plain internal-consumption stock issues —
+`customerId` is just an optional field on it. The item's `stock` is reduced immediately (FIFO
+against existing stock lots). A 400 comes back if the customer id doesn't exist, or if quantity
+exceeds what's actually in stock — show that inline.
 
-**2. History view for this section** (so "what did we send out, to whom, and when" is actually
-answerable later — there was no way to see this before):
-
+Outward history:
 ```
 GET /api/:slug/inventory/issues?customerId=&itemId=&dateFrom=&dateTo=
   -> [ { id, itemId, itemName, itemCode, quantity, issueDate, details,
          customerId, customerName, createdBy, createdAt }, ... ]
-  Sorted newest first. All query params optional — omit any/all for the full list.
-  customerName is a point-in-time snapshot (taken when the issue was created), so it still
-  shows correctly even if that customer is later renamed.
+  Sorted newest first. All query params optional. customerName is a point-in-time snapshot,
+  so it still shows correctly even if that customer is later renamed. Rows with no customerId
+  (older/plain internal-consumption issues, from before this feature) are real too — show
+  customerName as blank/"—" for those rather than hiding them.
 ```
 
-Render as a simple table (Date / Item / Quantity / Customer / Details) under the Inward Outward
-form — filterable by the same customerId/itemId/date-range params above, however you want to
-expose that (a customer dropdown + date pickers is enough, no need for anything fancier). Rows
-with no `customerId` (i.e. older/plain internal-consumption issues, from before this change) are
-real too — just show `customerName` as blank/"—" for those rather than hiding them.
+### Inward — stock coming back from a customer
 
-**3. Inventory page — total stock value tile at the top:**
+A separate modal/form: pick an item, pick a customer, enter a quantity, optional notes/details
+and an optional unit cost override (defaults to the item's current average cost if omitted — most
+of the time you can just leave this blank). On submit:
+
+```
+POST /api/:slug/inventory/items/:itemId/receive-from-customer
+  body: { quantity, customerId, details?, returnDate?, unitCost? }
+  -> { returnId, lotId, item: { ...updated item, stock: <new HIGHER stock> } }
+```
+
+This ADDS to stock immediately (a real new stock lot is created, same mechanism as any other
+stock addition) — the returned quantity becomes normal stock again, available for a future
+Outward/sale/assembly like anything else, not held in a separate pool. `customerId` is optional
+here too, same reasoning as Outward.
+
+Inward history (its own separate list, not merged with Outward's):
+```
+GET /api/:slug/inventory/returns?customerId=&itemId=&dateFrom=&dateTo=
+  -> [ { id, itemId, itemName, itemCode, quantity, returnDate, details,
+         customerId, customerName, createdBy, createdAt }, ... ]
+  Same shape/sorting/filter conventions as /issues above.
+```
+
+**UI suggestion:** two buttons ("Record Outward" / "Record Inward") opening their own modal, and
+either two separate history tables (Outward History / Inward History) or one combined table with
+a Direction column (Outward/Inward) pulling from both endpoints — whichever reads more clearly;
+both endpoints already return distinct, clearly-labeled data either way.
+
+**Inventory page — total stock value tile at the top:**
 
 ```
 GET /api/:slug/inventory/items/summary
@@ -3443,14 +3467,10 @@ tile something like "Total Stock Value (at cost)" rather than implying it's sale
 once when the Inventory page loads (and again after any stock-changing action, same refresh
 trigger you'd already use to re-fetch `GET /items`) and show it as a prominent summary tile/card
 at the top of the page — a big number, similar treatment to any other summary stat the app already
-uses elsewhere (e.g. a dashboard KPI tile), not buried in a table.
+uses elsewhere (e.g. a dashboard KPI tile), not buried in a table. An Inward return raises this
+number, an Outward issue lowers it, same as the per-item stock figures already do.
 
-**Scope note:** the "Inward Outward" form reuses the existing issue endpoint rather than being a
-wholly separate backend feature — the only thing that changed under the hood is that a customer
-can now optionally be attached to an issue. A plain, no-customer issue (if that UI exists
-elsewhere, e.g. for internal consumption) keeps working exactly as before.
-
-**Verification:** once the SQL patch has been applied to CAJO's tenant DB, submit a real
-Inward/Outward entry for a real item + real customer, confirm the item's stock visibly drops by
-that quantity, confirm it shows up in the history list filtered by that customer, and confirm the
-Inventory page's total-value tile recalculates to reflect the lower stock.
+**Verification:** submit a real Outward entry for a real item + customer, confirm stock drops and
+it shows up in `/issues`; separately submit a real Inward entry, confirm stock rises and it shows
+up in `/returns` (a different list from Outward's); confirm the Inventory page's total-value tile
+recalculates correctly after each action.
