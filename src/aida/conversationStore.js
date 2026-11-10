@@ -82,4 +82,22 @@ async function appendTurn(conversationId, userMessage, assistantMessage) {
   await coreDb('ai_conversations').where({ id: conversationId }).update(updates);
 }
 
-module.exports = { createConversation, getOrCreateActive, getConversation, listConversations, getMessages, appendTurn };
+/**
+ * Appends a standalone assistant message with no paired user turn — for
+ * background code (a job finishing, a preview link resolving) that needs to
+ * push something into the chat transcript outside of a live request/reply
+ * turn. Same durability/real-time semantics as appendTurn, just one row
+ * instead of two.
+ */
+async function appendAssistantMessage(conversationId, content) {
+  const now = new Date();
+  await coreDb('ai_conversation_messages').insert({
+    id: newId('convmsg'), conversation_id: conversationId, role: 'assistant', content, created_at: now,
+  });
+  await coreDb('ai_conversations').where({ id: conversationId }).update({ updated_at: now, last_message_at: now });
+}
+
+module.exports = {
+  createConversation, getOrCreateActive, getConversation, listConversations, getMessages, appendTurn,
+  appendAssistantMessage,
+};

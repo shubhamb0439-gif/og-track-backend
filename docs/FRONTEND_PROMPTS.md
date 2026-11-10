@@ -3312,3 +3312,63 @@ just returns a 503 (confirmed live for a real company slug).
 Microsoft account whose email matches an existing active user at that company, confirm it lands back
 in THAT company's app, logged in. Separately try a Microsoft account whose email doesn't match anyone
 at that company and confirm it shows the "no matching account" message rather than creating one.
+
+---
+
+## 59. AIDA chat should show a job's result on its own, without being asked (new socket event)
+
+**Status: backend built and live-verified 2026-11-10 — needs one small frontend listener to actually
+show up live; without it, the message still appears on a reload (see why below).**
+
+**The bug this fixes:** ask AIDA (in its own chat, not WhatsApp) to build something — it creates a job,
+gives you the job id, and that's the last you hear from it. Once the job actually finishes (PR opened,
+preview link resolved), nothing new ever showed up in the chat — you had to go ask "what's the status"
+or open the separate Jobs panel. WhatsApp already gets a proactive "🔗 preview ready" message the moment
+this happens; AIDA's own chat never did, because nothing on the backend ever wrote a follow-up message
+into the chat transcript for it — only a raw `aida:job` event (meant for the Jobs panel, not the chat
+feed) fired. That's now fixed server-side.
+
+**What changed, concretely:** the moment a masteradmin-created job (`dev_repo_fix`, `create_module`,
+etc.) lands at `awaiting_approval` with a real link to show (a PR, a live preview URL), the backend now:
+1. Writes a real, persisted assistant message into that admin's own AIDA conversation (same table/API
+   `GET /api/masteradmin/aida/conversations/:id/messages` already reads) — so it's there permanently,
+   survives a reload, and needs no new endpoint to read.
+2. Emits a NEW socket event, `aida:chatMessage`, to the same `masteradmin:<userId>` room the existing
+   `aida:job` event already uses — fired live, the moment it happens, same room-join you already have.
+
+**Event payload:**
+```
+socket.on("aida:chatMessage", (msg) => {
+  // msg = {
+  //   conversationId: "conv_...",
+  //   role: "assistant",
+  //   content: "🔗 \"My New Page\" is ready for review — Frontend: https://...\n(job job_...)",
+  //   createdAt: "2026-11-10T04:22:50.586Z",
+  // }
+});
+```
+
+**What to build:**
+1. Listen for `aida:chatMessage` on the socket connection you already hold open for `aida:job`/other
+   real-time AIDA events (no new connection/room-join needed).
+2. If `msg.conversationId` matches whichever conversation is CURRENTLY open on screen, append it to the
+   visible message list immediately, styled exactly like any other AIDA assistant reply (it's plain
+   text — the preview/PR link inside `content` should render the same way a link in a normal AIDA reply
+   already does, whatever that existing handling is).
+3. If it's for a DIFFERENT conversation than the one currently open (the admin switched chats, or has
+   this one open on another device), it's up to you how visible to make it — at minimum, make sure that
+   conversation moves to the top of the conversation list (its `last_message_at` is already bumped
+   server-side, so `GET /conversations` already sorts it there — just re-fetch or re-sort that list on
+   receiving the event) and/or show a small unread indicator on it, same as you'd handle an unread
+   message in any chat-list UI.
+4. No action needed for the "page was just reloaded, nobody's listening to the socket yet" case — the
+   message is already a normal row in that conversation's history, so it shows up automatically next
+   time `GET /conversations/:id/messages` is called for it, exactly like any other past message.
+
+**Scope note:** this only fires for jobs created directly in masteradmin's own AIDA chat — a
+tenant-created job (e.g. `user_reported_issue_build`) already has its own, separate notification path
+into that tenant's Messages module, unrelated to this event; nothing new needed there.
+
+**Verification:** ask AIDA in chat to build something small (a test page is fine), note the job id it
+gives you, then either watch the open chat tab for the message to appear live once the job finishes, or
+reload the page afterward and confirm the message shows up in that conversation's history either way.

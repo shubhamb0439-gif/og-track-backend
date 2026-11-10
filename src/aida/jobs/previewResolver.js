@@ -3,6 +3,7 @@ const jobStore = require('./jobStore');
 const { getSwaPreviewUrl } = require('../codingAgent/github');
 const { sendWhatsAppMessage } = require('../whatsapp');
 const { notifyCompanyMessage } = require('./notifyCompanyMessage');
+const conversationStore = require('../conversationStore');
 
 /**
  * The frontend repo's Azure Static Web Apps preview URL isn't known at
@@ -22,10 +23,8 @@ async function fetchUrl(repo, prNumber, jobId) {
   }
 }
 
-/** Texts every allowed WhatsApp number the moment a preview link resolves — the whole reason this poller exists, rather than making someone come back and check. No-op if WhatsApp isn't configured. */
-async function notifyPreviewReady(job) {
-  if (!config.whatsapp.enabled || !config.whatsapp.allowedNumbers.length) return;
-
+/** Shared by every notify-on-ready channel below — never duplicate the label/links derivation per channel. */
+function buildPreviewMessage(job) {
   let label, links;
   if (job.kind === 'create_module') {
     label = `"${job.result.moduleName}"`;
@@ -37,9 +36,45 @@ async function notifyPreviewReady(job) {
     label = (job.result.task || '').slice(0, 80).replace(/\s+/g, ' ');
     links = job.result.previewUrl;
   }
-  if (!links) return; // nothing to actually show — shouldn't happen given the callers, but never send an empty link
+  return { label, links };
+}
 
-  await Promise.all(config.whatsapp.allowedNumbers.map((n) => sendWhatsAppMessage(n, `🔗 AIDA preview ready — ${label}\n${links}`)));
+/** Texts every allowed WhatsApp number the moment a preview link resolves — the whole reason this poller exists, rather than making someone come back and check. No-op if WhatsApp isn't configured. */
+async function notifyPreviewReady(job) {
+  if (config.whatsapp.enabled && config.whatsapp.allowedNumbers.length) {
+    const { label, links } = buildPreviewMessage(job);
+    if (links) {
+      await Promise.all(config.whatsapp.allowedNumbers.map((n) => sendWhatsAppMessage(n, `🔗 AIDA preview ready — ${label}\n${links}`)));
+    }
+  }
+  // Tenant-created jobs already get the equivalent push via
+  // notifyCompanyMessage (the Messages module) — this is specifically the
+  // gap that existed for masteradmin's OWN AIDA chat: nothing ever wrote a
+  // follow-up message into conversationStore when a job finished, so even a
+  // perfect frontend had nothing to render and a reload showed nothing.
+  if (!job.companySlug) {
+    await notifyMasterAdminAidaChat(job).catch((e) => console.error(`[aida] preview-ready chat notify failed for job ${job.id}:`, e.message));
+  }
+}
+
+/** Posts a real, persisted assistant message into the job creator's own AIDA conversation (their most recently active one — jobs aren't tied to a specific conversation id today) and pushes it live over the same socket the Jobs panel already uses, so an open chat tab updates immediately and a reload shows it too. */
+async function notifyMasterAdminAidaChat(job) {
+  const { label, links } = buildPreviewMessage(job);
+  if (!links) return;
+
+  const content = `🔗 ${label} is ready for review — ${links}\n(job ${job.id})`;
+  const conversation = await conversationStore.getOrCreateActive(job.createdByUserId);
+  await conversationStore.appendAssistantMessage(conversation.id, content);
+
+  // Lazy require — avoids a load-order cycle with jobRunner.js (same reason
+  // tryResolvePreviewUrl below lazy-requires it).
+  const { getIo } = require('./jobRunner');
+  const io = getIo();
+  if (io) {
+    io.to(`masteradmin:${job.createdByUserId}`).emit('aida:chatMessage', {
+      conversationId: conversation.id, role: 'assistant', content, createdAt: new Date().toISOString(),
+    });
+  }
 }
 
 /**
