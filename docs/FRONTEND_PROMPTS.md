@@ -3377,11 +3377,13 @@ reload the page afterward and confirm the message shows up in that conversation'
 
 ## 60. CAJO Inventory — "Inward Outward" (two separate modals: send to / receive from a customer) + total stock value tile
 
-**Status: backend built and live-applied to CAJO's real tenant database (cajo_erp) — both SQL
-patches (`patch_24_inv_stock_issues_customer.sql`, `patch_25_inv_stock_returns.sql`) have already
-been run against it, confirmed via direct schema checks. Test suite passes (79/79). Revised from an
-earlier single-form design, per explicit follow-up: Inward and Outward are two separate
-modals/forms, not one form with a signed quantity.**
+**Status: backend built and live-applied to CAJO's real tenant database (cajo_erp) — all three SQL
+patches (`patch_24_inv_stock_issues_customer.sql`, `patch_25_inv_stock_returns.sql`,
+`patch_26_inv_stock_issues_returns_batch.sql`) have already been run against it, confirmed via
+direct schema checks. Test suite passes (79/79). Revised twice, per explicit follow-up: (1) Inward
+and Outward are two separate modals/forms, not one form with a signed quantity; (2) both modals now
+support MULTIPLE items in one submission, not just one item at a time, and the Inward modal has no
+unit-cost field at all.**
 
 **The problem this solves:** when a manufactured product (e.g. a laser) has a part fail after
 delivery, a replacement part today has no clean way to leave inventory — someone has to either
@@ -3394,64 +3396,79 @@ with its own history to look back on.
 request). Two separate modals/buttons inside it: "Outward" and "Inward" — do not merge them into
 one form, they hit different endpoints and mean different things.**
 
-### Outward — stock leaving for a customer
+### Outward — stock leaving for a customer (now supports multiple items per submission)
 
-Pick an inventory item (same data as `GET /api/:slug/inventory/items`), pick a customer (reuse
-the CRM module's existing customer-picker — same data as `GET /api/:slug/crm/customers` or
-wherever that list already comes from elsewhere in the app), enter a quantity, optional
-notes/details. On submit:
+Pick a customer ONCE (reuse the CRM module's existing customer-picker — same data as
+`GET /api/:slug/crm/customers` or wherever that list already comes from elsewhere in the app),
+then add one or more item rows — each row picks an item (same data as
+`GET /api/:slug/inventory/items`) and a quantity. A "+ Add item" button adds another row; each row
+gets its own remove button. One shared optional notes/details field and one shared optional date
+for the whole submission (not per-row). On submit:
 
 ```
-POST /api/:slug/inventory/items/:itemId/issue
-  body: { quantity, customerId, details?, issueDate? }
-  -> { issueId, consumed: [...], item: { ...updated item, stock: <new LOWER stock> } }
+POST /api/:slug/inventory/items/issue-batch
+  body: { customerId, issueDate?, details?, lines: [{ itemId, quantity }, ...] }
+  -> { batchId, results: [{ issueId, itemId, consumed: [...], item: { ...updated item, stock: <new LOWER stock> } }, ...] }
 ```
 
-This is the same endpoint that already existed for plain internal-consumption stock issues —
-`customerId` is just an optional field on it. The item's `stock` is reduced immediately (FIFO
-against existing stock lots). A 400 comes back if the customer id doesn't exist, or if quantity
-exceeds what's actually in stock — show that inline.
+Each line is deducted independently (FIFO against that item's own stock lots) but all of them
+share one `batchId`, so the history view can show "this one Outward transaction covered 3 items."
+The WHOLE submission is validated up front (every item must exist, every quantity must be
+positive, the customer id must exist if given) before anything is touched — if any line is
+invalid, nothing in the batch is applied; show the 400 error inline rather than partially
+submitting. The old single-item endpoint (`POST /items/:itemId/issue`) still exists and still
+works unchanged, for anything else in the app still using it — this new batch endpoint is what the
+Outward modal itself should call now.
 
 Outward history:
 ```
 GET /api/:slug/inventory/issues?customerId=&itemId=&dateFrom=&dateTo=
-  -> [ { id, itemId, itemName, itemCode, quantity, issueDate, details,
+  -> [ { id, batchId, itemId, itemName, itemCode, quantity, issueDate, details,
          customerId, customerName, createdBy, createdAt }, ... ]
   Sorted newest first. All query params optional. customerName is a point-in-time snapshot,
   so it still shows correctly even if that customer is later renamed. Rows with no customerId
   (older/plain internal-consumption issues, from before this feature) are real too — show
-  customerName as blank/"—" for those rather than hiding them.
+  customerName as blank/"—" for those rather than hiding them. Rows sharing the same batchId came
+  from one multi-item submission — group them under one entry in the history table (e.g. an
+  expandable row listing each item) rather than showing N unrelated-looking single-item rows;
+  batchId is null for older/legacy single-item rows, which just display as their own single row.
 ```
 
-### Inward — stock coming back from a customer
+### Inward — stock coming back from a customer (now supports multiple items per submission)
 
-A separate modal/form: pick an item, pick a customer, enter a quantity, optional notes/details
-and an optional unit cost override (defaults to the item's current average cost if omitted — most
-of the time you can just leave this blank). On submit:
+Same shape as Outward: pick a customer once, add one or more item rows (item + quantity each),
+one shared optional notes/details field and date for the whole submission. **No unit-cost field
+anywhere in this form** — every line is valued at that item's own current average cost
+automatically, the backend never asks for or accepts an override. On submit:
 
 ```
-POST /api/:slug/inventory/items/:itemId/receive-from-customer
-  body: { quantity, customerId, details?, returnDate?, unitCost? }
-  -> { returnId, lotId, item: { ...updated item, stock: <new HIGHER stock> } }
+POST /api/:slug/inventory/items/receive-from-customer-batch
+  body: { customerId, returnDate?, details?, lines: [{ itemId, quantity }, ...] }
+  -> { batchId, results: [{ returnId, lotId, itemId, item: { ...updated item, stock: <new HIGHER stock> } }, ...] }
 ```
 
-This ADDS to stock immediately (a real new stock lot is created, same mechanism as any other
-stock addition) — the returned quantity becomes normal stock again, available for a future
-Outward/sale/assembly like anything else, not held in a separate pool. `customerId` is optional
-here too, same reasoning as Outward.
+Same batch semantics as Outward's batch endpoint above (shared `batchId`, whole submission
+validated before anything is applied). Each line ADDS to stock immediately (a real new stock lot
+per line) — the returned quantity becomes normal stock again, available for a future
+Outward/sale/assembly like anything else, not held in a separate pool. The old single-item endpoint
+(`POST /items/:itemId/receive-from-customer`) still exists unchanged — this new batch endpoint is
+what the Inward modal itself should call now.
 
 Inward history (its own separate list, not merged with Outward's):
 ```
 GET /api/:slug/inventory/returns?customerId=&itemId=&dateFrom=&dateTo=
-  -> [ { id, itemId, itemName, itemCode, quantity, returnDate, details,
+  -> [ { id, batchId, itemId, itemName, itemCode, quantity, returnDate, details,
          customerId, customerName, createdBy, createdAt }, ... ]
-  Same shape/sorting/filter conventions as /issues above.
+  Same shape/sorting/filter/batch-grouping conventions as /issues above.
 ```
 
-**UI suggestion:** two buttons ("Record Outward" / "Record Inward") opening their own modal, and
-either two separate history tables (Outward History / Inward History) or one combined table with
-a Direction column (Outward/Inward) pulling from both endpoints — whichever reads more clearly;
-both endpoints already return distinct, clearly-labeled data either way.
+**UI suggestion:** two buttons ("Record Outward" / "Record Inward") opening their own modal. Inside
+each modal, an "add item" row-list (item picker + quantity, with a way to add/remove rows) above
+the shared customer/date/notes fields — like a simple line-item form, not a single-row form.
+Either two separate history tables (Outward History / Inward History) or one combined table with a
+Direction column (Outward/Inward) pulling from both endpoints — whichever reads more clearly; both
+endpoints already return distinct, clearly-labeled data either way, with batchId telling you which
+rows belong to the same submission.
 
 **Inventory page — total stock value tile at the top:**
 
@@ -3470,7 +3487,85 @@ at the top of the page — a big number, similar treatment to any other summary 
 uses elsewhere (e.g. a dashboard KPI tile), not buried in a table. An Inward return raises this
 number, an Outward issue lowers it, same as the per-item stock figures already do.
 
-**Verification:** submit a real Outward entry for a real item + customer, confirm stock drops and
-it shows up in `/issues`; separately submit a real Inward entry, confirm stock rises and it shows
-up in `/returns` (a different list from Outward's); confirm the Inventory page's total-value tile
+**Verification:** submit a real Outward batch with 2+ items for one customer, confirm all items'
+stock drops and all lines show up in `/issues` sharing one `batchId`; separately submit a real
+Inward batch, confirm stock rises on every line and they show up in `/returns` sharing their own
+`batchId` (a different list from Outward's); confirm the Inventory page's total-value tile
 recalculates correctly after each action.
+
+## 61. CAJO Purchase Order — Vendor list: "Total Value" column replacing Contact, per-line "Total Value" rename, and a currency-conversion button
+
+**Status: backend built and live (no new DB patch needed — both changes are computed, read-only
+fields added to existing endpoints). Test suite passes (79/79).**
+
+**The problem this solves:** the Vendors list currently shows a "Contact" column that's just a
+dash for every row (never populated), while the real useful number — how much has actually been
+spent with each vendor — isn't shown anywhere at the list level. Separately, a Purchase History
+line's "Total Lead Time" column was actually showing a MONEY figure (e.g. "INR 58,000" for 100
+units at INR 580), not a lead time at all — a mislabeled column, not a real lead-time total.
+Finally, POs are genuinely placed in a mix of currencies (INR/USD/EUR) today and that's staying —
+but there's no way to view everything converted into one currency at a glance.
+
+### Vendor list — replace "Contact" with "Total Value"
+
+```
+GET /api/:slug/inventory/vendors
+  -> [ { id, vendorCode, name, legalName, vendorGroup, contactName, email, phone, address,
+         currency, ratingPrice, ratingQuality, ratingLeadTime, ratingAverage, notes,
+         totalValue, totalValueCurrency, createdAt, updatedAt }, ... ]
+```
+
+`totalValue` is new — the sum, across EVERY purchase order ever placed with that vendor, of each
+line's `(unitCost × quantityOrdered) + freightCost + importCharges`, with every PO's amount first
+converted to `totalValueCurrency` (always `"INR"` right now) using that PO's own real historical
+exchange rate as of its order date — so a vendor billed partly in USD and partly in EUR still gets
+one correct, apples-to-apples total, not raw numbers added across currencies. In the Vendors table,
+drop the "Contact" column entirely and show `totalValue` in its place (formatted as currency, e.g.
+"₹62,500") — `contactName`/`email`/`phone` are still in the API response if needed elsewhere (e.g.
+a vendor detail panel), just not as a list column anymore.
+
+### Purchase History — rename the per-line "Total Lead Time" column to "Total Value"
+
+```
+GET /api/:slug/inventory/purchases/:id
+  -> { ...purchase, items: [{ id, purchaseId, itemId, vendorItemCode, quantityOrdered,
+         quantityReceived, unitCost, freightCost, importCharges, leadTimeDays,
+         effectiveUnitCost, totalValue }, ...] }
+```
+
+`totalValue` is new on each purchase-item line — `(unitCost × quantityOrdered) + freightCost +
+importCharges`, in that PO's own currency (NOT yet converted — this one field is still in whatever
+currency the PO itself was placed in; the currency-conversion button below is what lets you view it
+in a different one). **Rename the column header from "Total Lead Time" to "Total Value"** and bind
+it to this new field instead of whatever was computed client-side before — `leadTimeDays` is a
+real, separate field (an actual day count) that's unrelated and unaffected by this rename.
+
+### Currency-conversion button (display-only — never changes stored data)
+
+A single new control at the top of the Vendors / Purchase History pages — a dropdown or button
+labeled "Show in: [INR ▾]" with a short list of currencies (at minimum INR/USD/EUR, matching what's
+actually used in this tenant's data). On selection:
+
+```
+GET /api/:slug/inventory/fx-rates?to=USD
+  -> { to: "USD", rates: { INR: 0.012, EUR: 1.05, USD: 1 }, asOf: "2026-11-11T10:00:00.000Z" }
+```
+
+`rates` has one entry per currency actually in use across this tenant's vendors/POs (plus the
+target currency itself) — each one is "multiply an amount in that currency by this number to get
+it in `to`." To convert anything on screen: take the amount's OWN currency (a vendor's `currency`
+field for vendor-level figures — remember `totalValue` is always in INR, so always use
+`rates['INR']` for it — or a PO's `currency` field for a purchase-line's `unitCost`/`totalValue`/
+`effectiveUnitCost`), multiply by `rates[thatCurrency]`, and show the result labeled with the
+selected target currency. This is purely a view-time conversion — it never calls any POST/PATCH
+endpoint and never changes what's actually stored; switching the dropdown back to a vendor/PO's
+own original currency should just show the original, un-converted numbers again (no re-fetch
+needed if you cache the last `/fx-rates` response per target currency). If a particular currency
+comes back `null` in `rates` (a real exchange-rate lookup failure), show that row's amount in its
+own original currency rather than guessing a conversion — don't silently display a wrong number.
+
+**Verification:** load the Vendors list, confirm "Contact" is gone and "Total Value" shows a real
+number for a vendor with purchase history (and 0 for one with none); open a Purchase History entry
+and confirm the column now reads "Total Value" with the same number that used to show under "Total
+Lead Time"; pick a target currency from the new button and confirm displayed amounts actually
+change by the right factor, then switch back and confirm they return to the original figures.

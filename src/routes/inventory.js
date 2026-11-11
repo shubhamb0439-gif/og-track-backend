@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { recomputeItemStock, consumeStockFIFO, createLot } = require('../utils/stockLots');
-const { getHistoricalRate, BASE_CURRENCY } = require('../utils/currencyConvert');
+const { getHistoricalRate, getLatestRate, BASE_CURRENCY } = require('../utils/currencyConvert');
 
 // ── Row mappers ────────────────────────────────────────────────────────────────
 const mapVendor = (r) => r && ({
@@ -67,6 +67,12 @@ const mapPurchaseItem = (r) => r && ({
         + Number(r.freight_cost || 0) + Number(r.import_charges || 0))
       / Number(r.quantity_ordered)
     : Number(r.unit_cost || 0),
+  // Line total (unitCost*qty + freight + import), in the purchase's own
+  // currency — this is the real figure the "Total Lead Time" column was
+  // actually showing (a naming bug, nothing to do with lead_time_days);
+  // exposed explicitly so the frontend doesn't have to re-derive it.
+  totalValue: Math.round((Number(r.unit_cost || 0) * Number(r.quantity_ordered || 0)
+    + Number(r.freight_cost || 0) + Number(r.import_charges || 0)) * 100) / 100,
 });
 
 const mapSerialUnit = (r) => r && ({
@@ -98,10 +104,76 @@ async function createSerialUnitsForLot(db, { itemId, lotId, purchaseItemId, quan
 
 // ── Vendors ───────────────────────────────────────────────────────────────────
 
+// Vendor list, each gaining a real `totalValue` — the sum, across every PO
+// line ever placed with that vendor, of (unitCost*qty + freight + import),
+// converted to BASE_CURRENCY (INR) using that PO's own historical order-date
+// rate (same real-conversion approach already used when stock is actually
+// received — see utils/currencyConvert.js's own incident writeup). Vendors
+// are genuinely billed in a mix of currencies here, so summing raw numbers
+// across POs without converting first would silently add USD to EUR to INR.
+// A PO whose historical rate can't be fetched is skipped from the sum
+// (rather than guessed) and doesn't block the rest of the list from loading.
 router.get('/vendors', async (req, res) => {
   try {
     const rows = await req.db('inv_vendors').orderBy('name', 'asc');
-    res.json(rows.map(mapVendor));
+    const vendors = rows.map(mapVendor);
+
+    const purchases = await req.db('inv_purchases');
+    const purchaseIds = purchases.map(p => p.id);
+    const lines = purchaseIds.length
+      ? await req.db('inv_purchase_items').whereIn('purchase_id', purchaseIds)
+      : [];
+    const linesByPurchase = new Map();
+    for (const line of lines) {
+      if (!linesByPurchase.has(line.purchase_id)) linesByPurchase.set(line.purchase_id, []);
+      linesByPurchase.get(line.purchase_id).push(line);
+    }
+
+    const totalsByVendor = new Map();
+    for (const purchase of purchases) {
+      const poLines = linesByPurchase.get(purchase.id) || [];
+      if (!poLines.length) continue;
+      let rate;
+      try { rate = await getHistoricalRate(purchase.currency, new Date(purchase.order_date)); }
+      catch { continue; } // couldn't price this PO — skip it rather than guess, don't fail the whole list
+      let subtotal = 0;
+      for (const line of poLines) {
+        subtotal += (Number(line.unit_cost || 0) * Number(line.quantity_ordered || 0)
+          + Number(line.freight_cost || 0) + Number(line.import_charges || 0)) * rate;
+      }
+      totalsByVendor.set(purchase.vendor_id, (totalsByVendor.get(purchase.vendor_id) || 0) + subtotal);
+    }
+    for (const v of vendors) {
+      const total = totalsByVendor.get(v.id) || 0;
+      v.totalValue = Math.round(total * 100) / 100;
+      v.totalValueCurrency = BASE_CURRENCY;
+    }
+    res.json(vendors);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Live display-only currency conversion — does NOT touch any stored amount.
+// Returns a "multiply by this" rate, into `to`, for every currency actually
+// in use on this tenant's vendors/purchases (plus INR and `to` itself), so
+// the frontend's currency-toggle button can convert whatever's on screen
+// (already in each row's own real currency) without the user juggling rates
+// by hand. Vendors' totalValue (above) is always already in INR — convert
+// it with rates[BASE_CURRENCY] same as any other INR amount.
+router.get('/fx-rates', async (req, res) => {
+  try {
+    const to = (req.query.to || BASE_CURRENCY).toUpperCase();
+    const vendorCurrencies = await req.db('inv_vendors').distinct('currency');
+    const purchaseCurrencies = await req.db('inv_purchases').distinct('currency');
+    const currencies = new Set([BASE_CURRENCY, to]);
+    for (const r of vendorCurrencies) if (r.currency) currencies.add(String(r.currency).toUpperCase());
+    for (const r of purchaseCurrencies) if (r.currency) currencies.add(String(r.currency).toUpperCase());
+
+    const rates = {};
+    for (const cur of currencies) {
+      try { rates[cur] = await getLatestRate(cur, to); }
+      catch { rates[cur] = null; } // couldn't price this currency right now — frontend should leave those amounts in their original currency, not guess
+    }
+    res.json({ to, rates, asOf: new Date() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -449,13 +521,68 @@ router.get('/issues', async (req, res) => {
     const items = itemIds.length ? await req.db('inv_items').whereIn('id', itemIds) : [];
     const itemById = new Map(items.map(i => [i.id, i]));
     res.json(rows.map(r => ({
-      id: r.id, itemId: r.item_id, itemName: itemById.get(r.item_id)?.name || null,
+      id: r.id, batchId: r.batch_id, itemId: r.item_id, itemName: itemById.get(r.item_id)?.name || null,
       itemCode: itemById.get(r.item_id)?.item_code || null,
       quantity: Number(r.quantity), issueDate: r.issue_date, details: r.details,
       customerId: r.customer_id, customerName: r.customer_name,
       createdBy: r.created_by, createdAt: r.created_at,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Outward, multi-item: one customer, one submission, several items in one
+// go — each line still consumes stock independently (FIFO against that
+// item's own lots) and gets its own inv_stock_issues row, but all the rows
+// from one submission share a batch_id so the history view can group them
+// as a single transaction. Fails the WHOLE batch before touching any stock
+// if any line is invalid (bad item/qty) or the customer id doesn't exist —
+// never partially issues some lines and not others.
+router.post('/items/issue-batch', async (req, res) => {
+  try {
+    const { customerId, issueDate, details, lines } = req.body;
+    if (!Array.isArray(lines) || !lines.length) {
+      return res.status(400).json({ error: 'At least one line item is required' });
+    }
+    for (const line of lines) {
+      if (!line.itemId || line.quantity == null || Number(line.quantity) <= 0) {
+        return res.status(400).json({ error: 'Each line needs a valid itemId and a positive quantity' });
+      }
+    }
+    let customerName = null;
+    if (customerId) {
+      const customer = await req.db('customers').where({ id: customerId }).first();
+      if (!customer) return res.status(400).json({ error: 'Customer not found' });
+      customerName = customer.name;
+    }
+    for (const line of lines) {
+      const item = await req.db('inv_items').where({ id: line.itemId }).first();
+      if (!item) return res.status(400).json({ error: `Item not found: ${line.itemId}` });
+    }
+
+    const batchId = 'issb_' + Date.now();
+    const results = [];
+    for (const line of lines) {
+      const consumed = await consumeStockFIFO(req.db, line.itemId, Number(line.quantity));
+      const issueId = 'iss_' + Date.now() + Math.random().toString(36).slice(2, 6);
+      await req.db('inv_stock_issues').insert({
+        id: issueId, batch_id: batchId, item_id: line.itemId, quantity: line.quantity,
+        issue_date: issueDate || new Date(), details: details || null,
+        customer_id: customerId || null, customer_name: customerName,
+        created_by: req.user?.userId || null,
+      });
+      for (const c of consumed) {
+        await req.db('inv_stock_issue_lots').insert({
+          id: 'isl_' + Date.now() + Math.random().toString(36).slice(2, 6),
+          issue_id: issueId, lot_id: c.lotId, quantity: c.quantityConsumed,
+        });
+      }
+      await recomputeItemStock(req.db, line.itemId);
+      const saved = await req.db('inv_items').where({ id: line.itemId }).first();
+      req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+      results.push({ issueId, itemId: line.itemId, consumed, item: mapItem(saved) });
+    }
+    res.json({ batchId, results });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // "Inward Outward" — INWARD side: stock coming BACK from a customer (e.g. a
@@ -500,6 +627,61 @@ router.post('/items/:id/receive-from-customer', async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// Inward, multi-item: same shape as Outward's /items/issue-batch above — one
+// customer, one submission, several items, each getting its own real stock
+// lot + inv_stock_returns row, all sharing one batch_id. No unitCost field
+// here either (same as the single-item endpoint above) — every line is
+// valued at that item's own current average cost automatically.
+router.post('/items/receive-from-customer-batch', async (req, res) => {
+  try {
+    const { customerId, returnDate, details, lines } = req.body;
+    if (!Array.isArray(lines) || !lines.length) {
+      return res.status(400).json({ error: 'At least one line item is required' });
+    }
+    for (const line of lines) {
+      if (!line.itemId || line.quantity == null || Number(line.quantity) <= 0) {
+        return res.status(400).json({ error: 'Each line needs a valid itemId and a positive quantity' });
+      }
+    }
+    let customerName = null;
+    if (customerId) {
+      const customer = await req.db('customers').where({ id: customerId }).first();
+      if (!customer) return res.status(400).json({ error: 'Customer not found' });
+      customerName = customer.name;
+    }
+    const itemsById = new Map();
+    for (const line of lines) {
+      const item = await req.db('inv_items').where({ id: line.itemId }).first();
+      if (!item) return res.status(400).json({ error: `Item not found: ${line.itemId}` });
+      itemsById.set(line.itemId, item);
+    }
+
+    const batchId = 'retb_' + Date.now();
+    const results = [];
+    for (const line of lines) {
+      const item = itemsById.get(line.itemId);
+      const lotId = await createLot(req.db, {
+        itemId: line.itemId, quantity: Number(line.quantity),
+        unitCost: item.avg_cost || 0,
+        receivedDate: returnDate || new Date(), source: 'customer_return',
+        notes: details || null,
+      });
+      const returnId = 'ret_' + Date.now() + Math.random().toString(36).slice(2, 6);
+      await req.db('inv_stock_returns').insert({
+        id: returnId, batch_id: batchId, item_id: line.itemId, lot_id: lotId, quantity: line.quantity,
+        return_date: returnDate || new Date(), details: details || null,
+        customer_id: customerId || null, customer_name: customerName,
+        created_by: req.user?.userId || null,
+      });
+      await recomputeItemStock(req.db, line.itemId);
+      const saved = await req.db('inv_items').where({ id: line.itemId }).first();
+      req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+      results.push({ returnId, lotId, itemId: line.itemId, item: mapItem(saved) });
+    }
+    res.json({ batchId, results });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // Inward (customer-return) history — same filter shape as /issues (Outward).
 router.get('/returns', async (req, res) => {
   try {
@@ -513,7 +695,7 @@ router.get('/returns', async (req, res) => {
     const items = itemIds.length ? await req.db('inv_items').whereIn('id', itemIds) : [];
     const itemById = new Map(items.map(i => [i.id, i]));
     res.json(rows.map(r => ({
-      id: r.id, itemId: r.item_id, itemName: itemById.get(r.item_id)?.name || null,
+      id: r.id, batchId: r.batch_id, itemId: r.item_id, itemName: itemById.get(r.item_id)?.name || null,
       itemCode: itemById.get(r.item_id)?.item_code || null,
       quantity: Number(r.quantity), returnDate: r.return_date, details: r.details,
       customerId: r.customer_id, customerName: r.customer_name,
