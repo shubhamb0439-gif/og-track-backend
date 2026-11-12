@@ -3493,18 +3493,18 @@ Inward batch, confirm stock rises on every line and they show up in `/returns` s
 `batchId` (a different list from Outward's); confirm the Inventory page's total-value tile
 recalculates correctly after each action.
 
-## 61. CAJO Purchase Order — Vendor list: "Total Value" column replacing Contact, per-line "Total Value" rename, and a currency-conversion button
+## 61. CAJO Purchase Order — Vendor list: "Total Value" column replacing Contact, and per-line "Total Value" rename
 
 **Status: backend built and live (no new DB patch needed — both changes are computed, read-only
-fields added to existing endpoints). Test suite passes (79/79).**
+fields added on top of what already existed). Test suite passes (79/79). The currency-conversion
+button that was originally bundled into this entry has been split out into its own entry (#62) —
+build that one separately, it's unrelated to the two column changes below.**
 
 **The problem this solves:** the Vendors list currently shows a "Contact" column that's just a
 dash for every row (never populated), while the real useful number — how much has actually been
 spent with each vendor — isn't shown anywhere at the list level. Separately, a Purchase History
 line's "Total Lead Time" column was actually showing a MONEY figure (e.g. "INR 58,000" for 100
 units at INR 580), not a lead time at all — a mislabeled column, not a real lead-time total.
-Finally, POs are genuinely placed in a mix of currencies (INR/USD/EUR) today and that's staying —
-but there's no way to view everything converted into one currency at a glance.
 
 ### Vendor list — replace "Contact" with "Total Value"
 
@@ -3534,38 +3534,166 @@ GET /api/:slug/inventory/purchases/:id
 ```
 
 `totalValue` is new on each purchase-item line — `(unitCost × quantityOrdered) + freightCost +
-importCharges`, in that PO's own currency (NOT yet converted — this one field is still in whatever
-currency the PO itself was placed in; the currency-conversion button below is what lets you view it
-in a different one). **Rename the column header from "Total Lead Time" to "Total Value"** and bind
-it to this new field instead of whatever was computed client-side before — `leadTimeDays` is a
-real, separate field (an actual day count) that's unrelated and unaffected by this rename.
+importCharges`, in that PO's own currency (not yet converted — see entry #62 for the separate
+currency-display toggle that lets you view it in a different one). **Rename the column header from
+"Total Lead Time" to "Total Value"** and bind it to this new field instead of whatever was computed
+client-side before — `leadTimeDays` is a real, separate field (an actual day count) that's
+unrelated and unaffected by this rename.
 
-### Currency-conversion button (display-only — never changes stored data)
+**Verification:** load the Vendors list, confirm "Contact" is gone and "Total Value" shows a real
+number for a vendor with purchase history (and 0 for one with none); open a Purchase History entry
+and confirm the column now reads "Total Value" with the same number that used to show under "Total
+Lead Time".
 
-A single new control at the top of the Vendors / Purchase History pages — a dropdown or button
-labeled "Show in: [INR ▾]" with a short list of currencies (at minimum INR/USD/EUR, matching what's
-actually used in this tenant's data). On selection:
+## 62. CAJO — global currency-conversion toolbar button (CAJO-only)
+
+**Status: backend built and live. Test suite passes (79/79). No DB patch needed — this reuses
+`GET /api/:slug/inventory/fx-rates`, which already exists and already works the same way regardless
+of which page calls it. This was originally drafted as part of entry #61 and is now its own
+separate piece of work — unrelated to that entry's Vendor/Purchase-History column changes.**
+
+**The problem this solves:** CAJO genuinely places purchase orders in a mix of currencies
+(INR/USD/EUR) — that's staying as-is — but there's currently no way to glance at everything
+converted into one currency at a time. A currency selector was first built embedded inside the
+Vendors page, then revised per explicit follow-up: it needs to be a **global** control, not a
+per-page one.
+
+**This is NOT a per-page control.** It belongs in the app's main top toolbar (the same bar that
+already has the bug-report button and similar global icons), not embedded inside the Vendors or
+Purchase History pages themselves. Picking a currency there applies to every page in the app that
+shows a money amount — the user shouldn't have to re-pick it per page.
+
+**Scope it to CAJO only.** This toolbar icon/button should render only when the logged-in
+company's slug is `cajo` — hide it completely for every other tenant. (Every other tenant's data
+is plain single-currency INR already, so this control has nothing to do for them; CAJO is
+currently the one real multi-currency case in the whole app.)
+
+**Why one global fetch genuinely covers the whole app, not just Vendors/Purchase History:**
+confirmed directly in the backend — currency as a real, stored concept exists ONLY on
+`inv_vendors`/`inv_purchases` (CAJO's vendor/PO data). Every other money figure anywhere else in
+the app (Sales prices, the Inventory stock-value tile, Manufacturing BOM costs, an item's
+`avgCost`) is already stored in plain INR — there's no second currency hiding anywhere else to
+convert. So the SAME rates from one `/fx-rates` call cover literally every screen: an INR figure
+anywhere just multiplies by `rates['INR']`, same as a vendor's `totalValue` (entry #61) already
+does.
+
+**Implementation — a global currency-selection state** (React context, a small store, or
+equivalent — whatever this app's existing global-state pattern is), set once from the toolbar:
 
 ```
 GET /api/:slug/inventory/fx-rates?to=USD
   -> { to: "USD", rates: { INR: 0.012, EUR: 1.05, USD: 1 }, asOf: "2026-11-11T10:00:00.000Z" }
 ```
 
-`rates` has one entry per currency actually in use across this tenant's vendors/POs (plus the
-target currency itself) — each one is "multiply an amount in that currency by this number to get
-it in `to`." To convert anything on screen: take the amount's OWN currency (a vendor's `currency`
-field for vendor-level figures — remember `totalValue` is always in INR, so always use
-`rates['INR']` for it — or a PO's `currency` field for a purchase-line's `unitCost`/`totalValue`/
-`effectiveUnitCost`), multiply by `rates[thatCurrency]`, and show the result labeled with the
-selected target currency. This is purely a view-time conversion — it never calls any POST/PATCH
-endpoint and never changes what's actually stored; switching the dropdown back to a vendor/PO's
-own original currency should just show the original, un-converted numbers again (no re-fetch
-needed if you cache the last `/fx-rates` response per target currency). If a particular currency
-comes back `null` in `rates` (a real exchange-rate lookup failure), show that row's amount in its
-own original currency rather than guessing a conversion — don't silently display a wrong number.
+(Despite the URL living under `/inventory`, call this from the global toolbar component regardless
+of which page is currently open — it's a cross-module endpoint in practice, just hosted there
+because that's where currency data actually lives.) Persist the selected target currency (e.g. in
+that global store, optionally mirrored to `localStorage` so it survives a refresh) and re-fetch
+`/fx-rates` whenever it changes. `rates` has one entry per currency actually in use (plus the
+target itself) — "multiply an amount in that currency by this number to get it in `to`."
 
-**Verification:** load the Vendors list, confirm "Contact" is gone and "Total Value" shows a real
-number for a vendor with purchase history (and 0 for one with none); open a Purchase History entry
-and confirm the column now reads "Total Value" with the same number that used to show under "Total
-Lead Time"; pick a target currency from the new button and confirm displayed amounts actually
-change by the right factor, then switch back and confirm they return to the original figures.
+**Every page that renders a money figure reads from this same global selected-currency state:**
+- Vendors list `totalValue` and Purchase History's `unitCost`/`totalValue`/`effectiveUnitCost` (see
+  entry #61) — using each amount's own real currency (`totalValue` is always INR; a PO line uses
+  that PO's own `currency`).
+- Inventory's stock-value tile, item `avgCost`, Sales prices, Manufacturing costs — all already
+  plain INR, so always multiply by `rates['INR']`.
+
+This is purely a view-time conversion — never calls any POST/PATCH, never changes what's actually
+stored; switching back to the default (INR, or "off") just shows the original, un-converted
+numbers everywhere again. Cache the last `/fx-rates` response per target currency so switching
+pages doesn't force a re-fetch. If a particular currency comes back `null` in `rates` (a real
+exchange-rate lookup failure), show that figure in its own original currency rather than guessing.
+
+**Verification:** confirm the currency toolbar button is visible when logged into CAJO and
+completely absent for any other tenant. Pick a target currency from the toolbar, then visit
+Vendors, Purchase History, AND the Inventory stock-value tile (or any other page showing a money
+figure) without touching the selector again — confirm all of them show converted amounts using the
+same selection. Switch back to the default and confirm every page returns to its original figures.
+
+## 63. Sitara Drapes — expense/PO receipt attachments, and an Orders export button
+
+**Status: backend built and live-applied to Sitara's real production database (sitara_drapes) —
+patch_27_sitara_attachments.sql has already been run against it, confirmed via direct schema
+checks. Test suite passes (79/79).**
+
+**The problem this solves:** today there's no way to attach a bill/invoice photo to an Expense, or
+a supporting document to a weaver Purchase Order — both just sit as bare numbers with no proof
+attached. Separately, the Orders page has no way to pull a date-ranged list out for someone who
+needs the raw data (accounting, a one-off customer-data request, etc.) — the screenshot showing
+the Expenses page (with no upload affordance at all, and no vendor names shown for any row either —
+that's a separate, pre-existing display gap worth flagging to whoever owns that page, not part of
+this spec) is what prompted this.
+
+### 1. Expenses — attach a bill/invoice (photo or PDF)
+
+In the "+ Add Expense" form (and the Edit form), add an attachment field — a file picker accepting
+images and PDFs. On file select, upload it via the EXISTING generic upload endpoint (already live,
+used elsewhere in the app for logos/profile pictures):
+
+```
+POST /api/:slug/upload   (multipart/form-data, field name: file)
+  -> { url, name, type, size }
+```
+
+Then include the returned `url`/`name` when creating or updating the expense:
+
+```
+POST /api/:slug/sitara/expenses
+  body: { vendorId, category, description?, amount, expenseDate?, attachmentUrl?, attachmentName? }
+
+PATCH /api/:slug/sitara/expenses/:id
+  body: { ...any of the above fields, attachmentUrl?, attachmentName? }
+```
+
+`GET /api/:slug/sitara/expenses` now also returns `attachmentUrl`/`attachmentName` per row (both
+`null` for an expense with nothing attached). In the Expenses table, show a small "View receipt"
+link/icon when `attachmentUrl` is present (opens the file in a new tab — it's a real URL, not
+something that needs special handling) — no icon/column content at all when it's `null`. One
+attachment per expense, not a multi-file gallery; re-uploading replaces the previous one (same
+two-step upload-then-save pattern as everywhere else in the app that already does this).
+
+### 2. Weaver Purchase Orders — attach a supporting document
+
+Identical pattern, one level up (one attachment per PO, not per line item). In the "Add Purchase
+Order" form:
+
+```
+POST /api/:slug/sitara/purchase-orders
+  body: { weaverId, orderDate?, notes?, attachmentUrl?, attachmentName?, items: [...] }
+
+PATCH /api/:slug/sitara/purchase-orders/:id
+  body: { status?, notes?, attachmentUrl?, attachmentName? }
+```
+
+Same `POST /api/:slug/upload` flow as above to get the URL first. `GET /purchase-orders` and
+`GET /purchase-orders/:id` both now include `attachmentUrl`/`attachmentName` on the PO object — show
+the same "View document" link in the PO list/detail view.
+
+### 3. Orders — export button, custom date range, XLSX/CSV
+
+Add an "Export" button on the Orders page, opening a small picker: a date range (From/To) plus
+optionally a format choice (Excel is the sensible default; CSV as a secondary option). On submit:
+
+```
+GET /api/:slug/sitara/orders/export?createdFrom=2026-11-01&createdTo=2026-11-11&format=xlsx
+```
+
+Downloads directly as a file (the response IS the file — `Content-Disposition: attachment`, so a
+plain link/window-location navigation or a hidden-anchor-click pattern works, no need to handle the
+response as JSON). Same filter params as the existing Orders list (`status`, `source`, `search`,
+`productId` all work here too, in case you want "export exactly what's currently filtered/visible"
+as a secondary convenience) — `createdFrom`/`createdTo` are the two that matter for "custom date
+range," using the same date-picker component the Orders page might already have elsewhere.
+
+**Exact columns, one row per product line (not one row per order)** — so quantity/price are precise
+per product, not bundled into a summary string: Order Date, Order Number, Customer Name, Email,
+Phone, Address (full address, one combined column), Product, Quantity, Unit Price, Line Total,
+Order Status, Order Total, Channel. An order with multiple products produces multiple rows (same
+order-level fields repeated on each), matching how a spreadsheet person would actually want to
+pivot/filter this data.
+
+**Verification:** attach a real photo to a new expense, confirm it saves and "View receipt" opens
+the correct image; same for a PO document. Pick a real date range on the Orders export, confirm the
+downloaded file's row count matches that same range filtered on the Orders list page, and that a
+multi-product order appears as multiple rows with the right per-line quantity/price.

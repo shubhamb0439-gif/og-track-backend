@@ -1,5 +1,6 @@
 const express = require('express');
 const crypto = require('crypto');
+const ExcelJS = require('exceljs');
 const config = require('../config');
 const { sendEmail } = require('../utils/email');
 const router = express.Router();
@@ -32,6 +33,7 @@ const mapProduct = (r) => r && ({
 const mapPO = (r) => r && ({
   id: r.id, poNumber: r.po_number, weaverId: r.weaver_id, status: r.status,
   orderDate: r.order_date, notes: r.notes,
+  attachmentUrl: r.attachment_url || null, attachmentName: r.attachment_name || null,
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
@@ -43,6 +45,7 @@ const mapPOItem = (r) => r && ({
 const mapExpense = (r) => r && ({
   id: r.id, vendorId: r.vendor_id, category: r.category, description: r.description,
   amount: Number(r.amount || 0), expenseDate: r.expense_date,
+  attachmentUrl: r.attachment_url || null, attachmentName: r.attachment_name || null,
   createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
@@ -398,13 +401,16 @@ router.get('/purchase-orders/:id', async (req, res) => {
 });
 
 // POST /api/:slug/sitara/purchase-orders
-// Body: { weaverId, orderDate?, notes?, items: [{ productId, quantity, unitPrice }] }
+// Body: { weaverId, orderDate?, notes?, attachmentUrl?, attachmentName?, items: [{ productId, quantity, unitPrice }] }
 // The "manual Add Purchase button" the spec explicitly asks for — every
 // purchase order here is created this way, there's no separate auto-generated
 // path (unlike sitara_orders, which BigCommerce also feeds in Phase 2).
+// attachmentUrl/attachmentName: a supporting document/photo already uploaded
+// via the existing generic POST /api/:slug/upload endpoint — same pattern as
+// expenses' own attachment above.
 router.post('/purchase-orders', async (req, res) => {
   try {
-    const { weaverId, orderDate, notes, items } = req.body;
+    const { weaverId, orderDate, notes, attachmentUrl, attachmentName, items } = req.body;
     if (!weaverId) return res.status(400).json({ error: 'weaverId is required' });
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'At least one item is required' });
     const weaver = await req.db('sitara_weavers').where({ id: weaverId }).first();
@@ -414,7 +420,8 @@ router.post('/purchase-orders', async (req, res) => {
     const poNumber = await nextPoNumber(req.db);
     await req.db('sitara_purchase_orders').insert({
       id, po_number: poNumber, weaver_id: weaverId, order_date: orderDate || new Date(),
-      notes: notes || null, created_by: req.user?.userId || null,
+      notes: notes || null, attachment_url: attachmentUrl || null, attachment_name: attachmentName || null,
+      created_by: req.user?.userId || null,
     });
     for (const item of items) {
       const lineTotal = Number(item.quantity) * Number(item.unitPrice || 0);
@@ -436,6 +443,8 @@ router.patch('/purchase-orders/:id', async (req, res) => {
     const updates = { updated_at: new Date() };
     if (b.status !== undefined) updates.status = b.status;
     if (b.notes !== undefined) updates.notes = b.notes;
+    if (b.attachmentUrl !== undefined) updates.attachment_url = b.attachmentUrl;
+    if (b.attachmentName !== undefined) updates.attachment_name = b.attachmentName;
     await req.db('sitara_purchase_orders').where({ id: req.params.id }).update(updates);
     const saved = await req.db('sitara_purchase_orders').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Purchase order not found' });
@@ -472,10 +481,14 @@ router.get('/expenses', async (req, res) => {
 });
 
 // POST /api/:slug/sitara/expenses
-// Body: { vendorId, category, description?, amount, expenseDate? }
+// Body: { vendorId, category, description?, amount, expenseDate?, attachmentUrl?, attachmentName? }
+// attachmentUrl/attachmentName are a bill/invoice photo or PDF already
+// uploaded via the existing generic POST /api/:slug/upload endpoint (Azure
+// Blob Storage) — this route just stores the resulting URL, same two-step
+// shape as the existing company-logo/profile-picture upload convention.
 router.post('/expenses', async (req, res) => {
   try {
-    const { vendorId, category, description, amount, expenseDate } = req.body;
+    const { vendorId, category, description, amount, expenseDate, attachmentUrl, attachmentName } = req.body;
     if (!vendorId) return res.status(400).json({ error: 'vendorId is required' });
     if (!category) return res.status(400).json({ error: 'category is required' });
     if (amount === undefined || amount === null || isNaN(Number(amount))) {
@@ -488,6 +501,7 @@ router.post('/expenses', async (req, res) => {
     await req.db('sitara_expenses').insert({
       id, vendor_id: vendorId, category, description: description || null,
       amount: Number(amount), expense_date: expenseDate || new Date(),
+      attachment_url: attachmentUrl || null, attachment_name: attachmentName || null,
       created_by: req.user?.userId || null,
     });
     const saved = await req.db('sitara_expenses').where({ id }).first();
@@ -505,6 +519,8 @@ router.patch('/expenses/:id', async (req, res) => {
     if (b.description !== undefined) updates.description = b.description;
     if (b.amount !== undefined) updates.amount = Number(b.amount);
     if (b.expenseDate !== undefined) updates.expense_date = b.expenseDate;
+    if (b.attachmentUrl !== undefined) updates.attachment_url = b.attachmentUrl;
+    if (b.attachmentName !== undefined) updates.attachment_name = b.attachmentName;
     await req.db('sitara_expenses').where({ id: req.params.id }).update(updates);
     const saved = await req.db('sitara_expenses').where({ id: req.params.id }).first();
     if (!saved) return res.status(404).json({ error: 'Expense not found' });
@@ -1806,39 +1822,47 @@ async function nextOrderNumber(db) {
   return 'SORD-' + String(next).padStart(4, '0');
 }
 
+// Shared by GET /orders and GET /orders/export so the export always matches
+// exactly what the Orders list page's own filters would show — one place to
+// keep both in sync instead of two copies drifting apart.
+function applyOrderFilters(req, q) {
+  if (req.query.status) q = q.where({ 'sitara_orders.status': req.query.status });
+  if (req.query.source) q = q.where({ 'sitara_orders.source': req.query.source });
+  if (req.query.search) {
+    const s = `%${req.query.search}%`;
+    q = q.where((qb) => qb.where('sitara_orders.order_number', 'like', s).orWhere('sitara_customers.name', 'like', s));
+  }
+  // Real gap confirmed live: AIDA had no way to answer "how many orders
+  // came in today" at all — neither this endpoint nor sitara_get_dashboard
+  // exposes a created-date filter, so the model was guessing from whatever
+  // numbers it could see (the overall awaiting_fulfillment count, or a
+  // misread 'completed'-status filter) and answering confidently wrong.
+  // createdFrom/createdTo are plain ISO date(-time) strings — the caller
+  // (AIDA's tool call, or the Orders export date-range picker) computes the
+  // actual range, e.g. "today" = today's date through tomorrow's, so this
+  // stays a general date-range filter rather than a single hardcoded
+  // "today" special case.
+  if (req.query.createdFrom) q = q.where('sitara_orders.created_at', '>=', new Date(req.query.createdFrom));
+  if (req.query.createdTo) q = q.where('sitara_orders.created_at', '<', new Date(req.query.createdTo));
+  // "Type of product" filter (Orders page) — an order has no product of
+  // its own, only line items, so this matches any order with at least one
+  // sitara_order_items row for the given product.
+  if (req.query.productId) {
+    const productId = req.query.productId;
+    q = q.whereExists(function () {
+      this.select(req.db.raw(1)).from('sitara_order_items')
+        .whereRaw('sitara_order_items.order_id = sitara_orders.id')
+        .andWhere('sitara_order_items.product_id', productId);
+    });
+  }
+  return q;
+}
+
 // GET /api/:slug/sitara/orders?status=...&source=...&search=... — search
 // matches order number or the linked customer's name.
 router.get('/orders', async (req, res) => {
   try {
-    let q = ordersQuery(req.db);
-    if (req.query.status) q = q.where({ 'sitara_orders.status': req.query.status });
-    if (req.query.source) q = q.where({ 'sitara_orders.source': req.query.source });
-    if (req.query.search) {
-      const s = `%${req.query.search}%`;
-      q = q.where((qb) => qb.where('sitara_orders.order_number', 'like', s).orWhere('sitara_customers.name', 'like', s));
-    }
-    // Real gap confirmed live: AIDA had no way to answer "how many orders
-    // came in today" at all — neither this endpoint nor sitara_get_dashboard
-    // exposes a created-date filter, so the model was guessing from whatever
-    // numbers it could see (the overall awaiting_fulfillment count, or a
-    // misread 'completed'-status filter) and answering confidently wrong.
-    // createdFrom/createdTo are plain ISO date(-time) strings — the caller
-    // (AIDA's tool call) computes the actual range, e.g. "today" = today's
-    // date through tomorrow's, so this stays a general date-range filter
-    // rather than a single hardcoded "today" special case.
-    if (req.query.createdFrom) q = q.where('sitara_orders.created_at', '>=', new Date(req.query.createdFrom));
-    if (req.query.createdTo) q = q.where('sitara_orders.created_at', '<', new Date(req.query.createdTo));
-    // "Type of product" filter (Orders page) — an order has no product of
-    // its own, only line items, so this matches any order with at least one
-    // sitara_order_items row for the given product.
-    if (req.query.productId) {
-      const productId = req.query.productId;
-      q = q.whereExists(function () {
-        this.select(req.db.raw(1)).from('sitara_order_items')
-          .whereRaw('sitara_order_items.order_id = sitara_orders.id')
-          .andWhere('sitara_order_items.product_id', productId);
-      });
-    }
+    const q = applyOrderFilters(req, ordersQuery(req.db));
     const rows = await q.orderBy('sitara_orders.created_at', 'desc');
     const mapped = rows.map(mapOrder);
     // Stale orders float to the top (oldest-unchanged first) so the ones
@@ -1850,6 +1874,99 @@ router.get('/orders', async (req, res) => {
       return 0;
     });
     res.json(mapped);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function csvCell(val) {
+  if (val === null || val === undefined) return '';
+  const s = String(val);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// GET /api/:slug/sitara/orders/export?createdFrom=&createdTo=&status=&source=&search=&productId=&format=xlsx|csv
+// Same filters as GET /orders (date-range included) so "export" always
+// matches whatever the Orders list is currently showing — one row PER ORDER
+// ITEM (not per order) so product/quantity/price are exact figures, not a
+// joined summary string. Registered BEFORE GET /orders/:id so "export"
+// itself is never swallowed as an :id value.
+router.get('/orders/export', async (req, res) => {
+  try {
+    const format = (req.query.format || 'xlsx').toLowerCase() === 'csv' ? 'csv' : 'xlsx';
+    const q = applyOrderFilters(req, ordersQuery(req.db));
+    const orders = await q.orderBy('sitara_orders.created_at', 'desc');
+    const orderIds = orders.map((o) => o.id);
+    const items = orderIds.length
+      ? await req.db('sitara_order_items').whereIn('order_id', orderIds)
+      : [];
+    const itemsByOrder = new Map();
+    for (const it of items) {
+      if (!itemsByOrder.has(it.order_id)) itemsByOrder.set(it.order_id, []);
+      itemsByOrder.get(it.order_id).push(it);
+    }
+
+    const rows = [];
+    for (const o of orders) {
+      const mapped = mapOrder(o);
+      const address = [mapped.customerAddressLine1, mapped.customerAddressLine2, mapped.customerCity,
+        mapped.customerState, mapped.customerPostalCode, mapped.customerCountry].filter(Boolean).join(', ');
+      const orderItems = itemsByOrder.get(o.id) || [];
+      // An order with zero line items still gets one row — real data
+      // (e.g. an order synced before items were ever recorded) shouldn't
+      // just vanish from the export.
+      const lines = orderItems.length ? orderItems : [null];
+      for (const it of lines) {
+        rows.push({
+          orderDate: mapped.createdAt, orderNumber: mapped.orderNumber,
+          customerName: mapped.customerName || '', customerEmail: mapped.customerEmail || '',
+          customerPhone: mapped.customerPhone || '', address,
+          product: it ? it.product_name : '', quantity: it ? Number(it.quantity) : '',
+          unitPrice: it ? Number(it.unit_price || 0) : '', lineTotal: it ? Number(it.line_total || 0) : '',
+          orderStatus: mapped.status, orderTotal: mapped.total, channel: mapped.source,
+        });
+      }
+    }
+
+    const fromLabel = req.query.createdFrom ? new Date(req.query.createdFrom).toISOString().slice(0, 10) : 'all';
+    const toLabel = req.query.createdTo ? new Date(req.query.createdTo).toISOString().slice(0, 10) : 'all';
+    const filenameBase = `Sitara_Orders_${fromLabel}_to_${toLabel}`;
+
+    if (format === 'csv') {
+      const cols = ['orderDate', 'orderNumber', 'customerName', 'customerEmail', 'customerPhone', 'address',
+        'product', 'quantity', 'unitPrice', 'lineTotal', 'orderStatus', 'orderTotal', 'channel'];
+      const headerLabels = ['Order Date', 'Order Number', 'Customer Name', 'Email', 'Phone', 'Address',
+        'Product', 'Quantity', 'Unit Price', 'Line Total', 'Order Status', 'Order Total', 'Channel'];
+      const lines = [headerLabels.join(',')];
+      for (const r of rows) lines.push(cols.map((c) => csvCell(r[c])).join(','));
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}.csv"`);
+      return res.send(lines.join('\n'));
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Orders');
+    sheet.columns = [
+      { header: 'Order Date', key: 'orderDate', width: 14 },
+      { header: 'Order Number', key: 'orderNumber', width: 16 },
+      { header: 'Customer Name', key: 'customerName', width: 24 },
+      { header: 'Email', key: 'customerEmail', width: 28 },
+      { header: 'Phone', key: 'customerPhone', width: 16 },
+      { header: 'Address', key: 'address', width: 40 },
+      { header: 'Product', key: 'product', width: 28 },
+      { header: 'Quantity', key: 'quantity', width: 10 },
+      { header: 'Unit Price', key: 'unitPrice', width: 12 },
+      { header: 'Line Total', key: 'lineTotal', width: 12 },
+      { header: 'Order Status', key: 'orderStatus', width: 18 },
+      { header: 'Order Total', key: 'orderTotal', width: 12 },
+      { header: 'Channel', key: 'channel', width: 16 },
+    ];
+    sheet.getRow(1).font = { bold: true };
+    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDCE6F1' } };
+    rows.forEach((r) => sheet.addRow(r));
+    sheet.autoFilter = { from: 'A1', to: 'M1' };
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}.xlsx"`);
+    res.send(Buffer.from(buffer));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
