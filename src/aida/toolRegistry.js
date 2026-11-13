@@ -58,6 +58,13 @@ function registerTools(list, defaults = {}) {
  * look "always available" and wrongly show up for master admin, where there's no tenant to call.
  */
 function isAvailable(tool, context) {
+  // A context can narrow itself to an explicit, exact set of tool names —
+  // e.g. a WhatsApp number scoped to just one company's read-only query
+  // tools (see routes/whatsapp.js) — overriding every other rule below,
+  // INCLUDING a module-less tenant tool that would otherwise look "always
+  // available" regardless of enabledModules (see hr.js's own comment on
+  // requiredModules: []). Checked first and returns unconditionally.
+  if (context.toolWhitelist) return context.toolWhitelist.includes(tool.name);
   const required = tool.requiredModules || [];
   if (required.includes(UNIVERSAL_SENTINEL_MODULE)) return true;
   const isMasterAdminTool = required.includes(MASTERADMIN_SENTINEL_MODULE);

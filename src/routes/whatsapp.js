@@ -3,8 +3,10 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const config = require('../config');
 const coreDb = require('../db/core');
+const { resolveTenant } = require('../db/tenantConnections');
 const { MASTERADMIN_SENTINEL_MODULE } = require('../aida/contextBuilder');
 const { runTurn } = require('../aida/engine');
+const SITARA_TOOL_NAMES = require('../aida/tools/sitara').map((t) => t.name);
 const sessionMemory = require('../aida/sessionMemory');
 const { buildDirective, safeDirective } = require('../aida/responseDirector');
 const { sendWhatsAppMessage, sendWhatsAppDocument, downloadWhatsAppMedia } = require('../aida/whatsapp');
@@ -98,6 +100,60 @@ async function buildWhatsAppMasterAdminContext(fromNumber) {
   };
 }
 
+// Which tools a tenant-scoped WhatsApp number (config.whatsapp.tenantNumbers)
+// gets for its company — keyed by slug, so a second tenant number for a
+// different company later just adds an entry here. Sitara Drapes is the only
+// one today: its own read-only sitara_* tools, nothing else (no HR/inventory/
+// other-module tool this company might also have enabled, and no write tool —
+// every sitara_* tool is GET-backed already, see tools/sitara.js's own doc).
+const TENANT_NUMBER_TOOL_WHITELIST = {
+  sitara: SITARA_TOOL_NAMES,
+};
+
+function resolveTenantNumberSlug(fromNumber) {
+  const entry = Object.entries(config.whatsapp.tenantNumbers || {})
+    .find(([number]) => last10(number) === last10(fromNumber));
+  return entry ? entry[1] : null;
+}
+
+/**
+ * Builds a narrow, single-company AidaContext for a WhatsApp number mapped in
+ * config.whatsapp.tenantNumbers — e.g. the Sitara Drapes number asking "how
+ * many orders today". Same "mint a short-lived synthetic JWT so the tool's
+ * own HTTP call back into this app passes the normal tenant auth/module
+ * gates" trick buildWhatsAppMasterAdminContext uses above, and the exact
+ * same {role: 'superadmin', slug} shape masteradminCrossTenant.js already
+ * mints for cross-tenant reads from the masteradmin side — just sourced from
+ * a phone number here instead of an admin's own JWT. toolWhitelist (see
+ * toolRegistry.isAvailable) is what actually keeps this number from seeing
+ * anything beyond that one company's listed tools, regardless of whatever
+ * else that company has enabled.
+ */
+async function buildWhatsAppTenantContext(slug, fromNumber) {
+  const { company } = await resolveTenant(slug);
+  const syntheticUserId = `whatsapp_${last10(fromNumber)}`;
+  const token = jwt.sign(
+    { userId: syntheticUserId, role: 'superadmin', slug },
+    config.app.jwtSecret,
+    { expiresIn: '5m' }
+  );
+  return {
+    kind: 'tenant',
+    tenantSlug: slug,
+    companyId: company.id,
+    companyName: company.name,
+    userId: syntheticUserId,
+    role: 'superadmin',
+    enabledModules: company.enabled_modules || [],
+    authHeader: `Bearer ${token}`,
+    currentPage: null,
+    currentModule: null,
+    currentRoute: null,
+    activeEntity: null,
+    toolWhitelist: TENANT_NUMBER_TOOL_WHITELIST[slug] || [],
+  };
+}
+
 // GET /api/whatsapp/webhook — Meta's one-time verification handshake, fired
 // whenever the callback URL/verify token is (re)saved in Meta's app config.
 router.get('/webhook', (req, res) => {
@@ -166,6 +222,38 @@ router.post('/webhook', async (req, res) => {
       .catch((e) => console.error('[whatsapp] Flows trigger check failed:', e.message));
 
     const from = message.from;
+
+    // A tenant-scoped number (config.whatsapp.tenantNumbers) — e.g. Sitara
+    // Drapes asking AIDA about their own orders — is checked BEFORE the
+    // masteradmin allowlist and the known-contact fallback below: it's its
+    // own narrow tier, never escalated to either. Text-only for now; a
+    // document/image from this tier gets a plain reply rather than falling
+    // into the admin-only attachment-handling path further down.
+    const tenantSlug = resolveTenantNumberSlug(from);
+    if (tenantSlug) {
+      if (message.type !== 'text') {
+        await sendWhatsAppMessage(from, "I can only answer text questions right now — try typing your question.");
+        return;
+      }
+      const text = (message.text?.body || '').trim();
+      if (!text) return;
+      const context = await buildWhatsAppTenantContext(tenantSlug, from);
+      if (isGreeting(text)) {
+        const greetingText = pickGreetingText();
+        sessionMemory.appendTurn(context, text, greetingText);
+        await sendWhatsAppMessage(from, greetingText);
+        return;
+      }
+      const history = sessionMemory.getHistory(context);
+      const directive = config.aida.emotionEnabled ? buildDirective(text) : safeDirective(null);
+      const result = await runTurn(context, text, history, directive);
+      if (result.reply && result.reply.trim()) {
+        sessionMemory.appendTurn(context, text, result.reply);
+        await sendWhatsAppMessage(from, result.reply);
+      }
+      return;
+    }
+
     const isAllowed = config.whatsapp.allowedNumbers.some((n) => last10(n) === last10(from));
     if (!isAllowed) {
       // Not an admin number — but might still be a known contact (AIDA

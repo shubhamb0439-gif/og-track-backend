@@ -479,6 +479,21 @@ module.exports = {
       try { adminMap = JSON.parse(process.env.WHATSAPP_ADMIN_MAP); }
       catch (e) { console.error('[config] WHATSAPP_ADMIN_MAP is not valid JSON, ignoring:', e.message); }
     }
+    // Tenant-scoped WhatsApp numbers — e.g. {"6360638447":"sitara"} — maps a
+    // phone number straight to ONE company slug, completely separate from
+    // allowedNumbers (full masteradmin access, every tenant, every tool) and
+    // ai_contacts (tool-free small talk, no data access at all). A message
+    // from one of these numbers gets AIDA's real tools for that ONE company,
+    // narrowed further in routes/whatsapp.js to just that company's own
+    // read-only query tools (e.g. Sitara Drapes' sitara_* tools) — never
+    // masteradmin tools, never another tenant's data. Defaults to the one
+    // number/tenant pair requested so this works with no env var set; set
+    // WHATSAPP_TENANT_NUMBERS explicitly to add more or override it.
+    let tenantNumbers = { '6360638447': 'sitara' };
+    if (process.env.WHATSAPP_TENANT_NUMBERS) {
+      try { tenantNumbers = JSON.parse(process.env.WHATSAPP_TENANT_NUMBERS); }
+      catch (e) { console.error('[config] WHATSAPP_TENANT_NUMBERS is not valid JSON, ignoring:', e.message); }
+    }
     return {
       enabled: !!(accessToken && phoneNumberId),
       // Arbitrary secret YOU pick and enter into Meta's webhook setup form —
@@ -495,6 +510,7 @@ module.exports = {
       allowedNumbers: (process.env.WHATSAPP_ALLOWED_NUMBERS || '')
         .split(',').map((s) => s.trim()).filter(Boolean),
       adminMap,
+      tenantNumbers,
       // Where AIDA sends a bug/feature report's plan-of-action summary for
       // human review (jobKinds/userReportedIssue.js) — the developer/master
       // admin's own number, separate from allowedNumbers (which is about who
