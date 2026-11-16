@@ -244,6 +244,16 @@ app.use('/aida-fillers', express.static(require('path').join(__dirname, '..', 'p
   immutable: true,
 }));
 
+// drugassist-widget.js + logo.png (the embeddable snippet partner websites
+// load) — static, non-tenant, non-sensitive, so no auth/resolveTenant gate,
+// same reasoning as /aida-fillers above. Drop the two files directly into
+// public/widget/ to serve them at https://<backend host>/widget/<file>; a
+// short maxAge (not immutable) since, unlike the fillers, this file can be
+// updated/re-deployed without a filename change.
+app.use('/widget', express.static(require('path').join(__dirname, '..', 'public', 'widget'), {
+  maxAge: '1h',
+}));
+
 // ── Fallback error handler ────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err);
