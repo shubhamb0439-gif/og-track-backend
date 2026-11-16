@@ -101,6 +101,34 @@ router.get('/lookup', async (req, res) => {
   }
 });
 
+// GET /api/ogplus/drugs/list
+// Full active-drug list in one response, for the extension to cache locally
+// and match page text against client-side — no per-word/per-page-visit call
+// to this server, which both keeps it fast and means the content of pages
+// someone visits (which could be a medical site) never has to be sent here
+// at all. `DRUGASSIST_BASE_URL` builds each drug's public page link from its
+// slug; if a row has no slug, `url` comes back null rather than a guessed link.
+router.get('/list', async (req, res) => {
+  try {
+    const allDrugs = await getActiveDrugs(req.db);
+    const baseUrl = config.ogplusDrugsApi.publicSiteBaseUrl;
+    const drugs = allDrugs.map((r) => ({
+      id: String(r.id),
+      name: r.drug,
+      // No alias data exists in the source table today (one name per row) —
+      // this is just the canonical name wrapped in an array so the shape
+      // matches what the extension expects. Real aliases (brand vs generic,
+      // etc.) would need a new column/table to back this properly.
+      aliases: [r.drug],
+      url: r.slug && baseUrl ? `${baseUrl.replace(/\/$/, '')}/${r.slug}` : null,
+      summary: r.direct_answer || r.description || null,
+    }));
+    res.json(drugs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/ogplus/drugs/lookup-batch?names=Lipitor,Crestor,Entresto
 // Same match as /lookup, for a page scan that found several candidate names
 // at once — avoids one round trip per candidate.

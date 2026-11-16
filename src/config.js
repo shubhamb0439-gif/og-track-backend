@@ -832,5 +832,11 @@ module.exports = {
   // from day one, so there's no safe "unconfigured" default.
   ogplusDrugsApi: {
     apiKey: process.env.OGPLUS_DRUGS_API_KEY || null,
+    // Base URL for building each drug's public page link in GET /list's
+    // `url` field (e.g. "https://drugassist.us" + "/" + row's slug). Not
+    // hardcoded since this is OG Plus's own public marketing site, not
+    // something this backend owns — confirm/override via env var if it
+    // ever changes.
+    publicSiteBaseUrl: process.env.OGPLUS_DRUGS_PUBLIC_SITE_BASE_URL || 'https://drugassist.us',
   },
 };
