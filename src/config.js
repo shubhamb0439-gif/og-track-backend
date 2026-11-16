@@ -821,4 +821,16 @@ module.exports = {
   birthdayEmail: {
     checkIntervalMs: parseInt(process.env.BIRTHDAY_EMAIL_CHECK_INTERVAL_MS || '', 10) || 60 * 60 * 1000,
   },
+  // OG Plus drug-lookup API (src/routes/drugs.js) — a public, read-only
+  // endpoint backing a Chrome extension: scans a page the person is viewing
+  // for a drug name, calls this to check whether OG Plus has a patient
+  // assistance plan for it. Gated by a shared API key (not a login — the
+  // caller is an anonymous browser extension, not a signed-in user), same
+  // shared-secret convention as deployNotify above. Deliberately fail-closed
+  // (503) if unset, unlike the webhook secrets elsewhere in this file that
+  // fail open in dev — this endpoint is reachable from the public internet
+  // from day one, so there's no safe "unconfigured" default.
+  ogplusDrugsApi: {
+    apiKey: process.env.OGPLUS_DRUGS_API_KEY || null,
+  },
 };

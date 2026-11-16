@@ -14,7 +14,16 @@ const coreDb = require('./db/core');
 function isAllowedOrigin(origin) {
   if (!origin) return true;
   if (config.security.corsAllowedOrigins.includes(origin)) return true;
-  return config.security.corsAllowedOriginSuffixes.some((suffix) => origin.endsWith(suffix));
+  if (config.security.corsAllowedOriginSuffixes.some((suffix) => origin.endsWith(suffix))) return true;
+  // OG Plus drugs-lookup Chrome extension (src/routes/drugs.js) calls this
+  // API directly from its content-script context, so the response needs a
+  // matching Access-Control-Allow-Origin or the browser blocks it client-side
+  // even on a 200. Safe to allow broadly: `chrome-extension://` is a scheme
+  // only the browser itself assigns to an installed extension's own origin —
+  // no ordinary website can present it, so this doesn't open the API to
+  // arbitrary web pages. The actual gate is the endpoint's own API-key check.
+  if (origin.startsWith('chrome-extension://')) return true;
+  return false;
 }
 
 const resolveTenant = require('./middleware/resolveTenant');
@@ -52,6 +61,8 @@ const tokenRoutes = require('./routes/token');
 const notesRoutes = require('./routes/notes');
 const birthdayRoutes = require('./routes/birthday');
 const sitaraRoutes = require('./routes/sitara');
+const drugsRoutes = require('./routes/drugs');
+const { drugsLookupRateLimit } = require('./middleware/drugsLookupRateLimit');
 
 const app = express();
 const server = http.createServer(app);
@@ -203,6 +214,12 @@ app.use('/api/:slug/birthday', resolveTenant, requireModule('birthday'), birthda
 // Sitara Bespoke module bundle (dashboard, people, stocks, orders) — any of
 // its 4 module keys unlocks the whole route file, same pattern as acc/hr above.
 app.use('/api/:slug/sitara', resolveTenant, requireModule(['sitara_dashboard', 'sitara_people', 'sitara_stocks', 'sitara_orders']), sitaraRoutes);
+// OG Plus drug-lookup API (src/routes/drugs.js) — public, no login, backs a
+// Chrome extension. Still goes through resolveTenant for free 404/403 on an
+// unknown/suspended slug; drugsRoutes itself hard-guards to slug 'ogplus'
+// (the only tenant with a `drugs` table) and gates every request behind its
+// own shared API key, checked inside the router, not requireAuth/JWT.
+app.use('/api/:slug/drugs', resolveTenant, drugsLookupRateLimit, drugsRoutes);
 
 // Serve uploaded files (written by the upload route) as static assets.
 app.use('/uploads', express.static(require('path').join(__dirname, '..', 'public', 'uploads')));
