@@ -944,6 +944,69 @@ router.post('/purchases', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /purchases/:id/items — add one or more brand-new line items to an
+// EXISTING purchase, from the Edit Purchase modal. Distinct from
+// PATCH /purchases/:purchaseId/items/:lineId above, which only edits a line
+// that's already there — until now there was no way to add a new one once
+// the PO itself had already been created. Body: { lines: [{ itemId,
+// quantityOrdered, unitCost?, freightCost?, importCharges?, leadTimeDays?,
+// vendorItemCode? }, ...] } — same line shape POST /purchases itself takes.
+router.post('/purchases/:id/items', async (req, res) => {
+  try {
+    const purchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
+    if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
+    if (purchase.status === 'cancelled') return res.status(400).json({ error: 'Purchase was cancelled.' });
+
+    const { lines } = req.body;
+    if (!Array.isArray(lines) || !lines.length) {
+      return res.status(400).json({ error: 'At least one line item is required' });
+    }
+    for (const line of lines) {
+      if (!line.itemId || line.quantityOrdered == null || Number(line.quantityOrdered) <= 0) {
+        return res.status(400).json({ error: 'Each line needs a valid itemId and a positive quantityOrdered' });
+      }
+    }
+    const itemIds = [...new Set(lines.map(l => l.itemId))];
+    const foundItems = await req.db('inv_items').whereIn('id', itemIds);
+    if (foundItems.length !== itemIds.length) {
+      const foundIds = new Set(foundItems.map(i => i.id));
+      const missing = itemIds.find(id => !foundIds.has(id));
+      return res.status(400).json({ error: `Item not found: ${missing}` });
+    }
+
+    const createdIds = [];
+    for (const line of lines) {
+      const lineId = 'poi_' + Date.now() + Math.random().toString(36).slice(2, 6);
+      await req.db('inv_purchase_items').insert({
+        id: lineId, purchase_id: req.params.id, item_id: line.itemId,
+        vendor_item_code: line.vendorItemCode || null,
+        quantity_ordered: line.quantityOrdered,
+        unit_cost: line.unitCost || 0,
+        freight_cost: line.freightCost || 0,
+        import_charges: line.importCharges || 0,
+        lead_time_days: line.leadTimeDays || null,
+      });
+      createdIds.push(lineId);
+    }
+
+    // A newly-added, not-yet-received line means the purchase as a whole is
+    // no longer fully received (even if it was before) — recompute status
+    // the same way /receive-lines does, so a PO doesn't stay marked
+    // "received" while it actually has real outstanding quantity on it.
+    const refreshedLines = await req.db('inv_purchase_items').where({ purchase_id: req.params.id });
+    const totalOrdered = refreshedLines.reduce((s, l) => s + Number(l.quantity_ordered), 0);
+    const totalReceived = refreshedLines.reduce((s, l) => s + Number(l.quantity_received || 0), 0);
+    const newStatus = totalReceived <= 0 ? 'pending' : (totalReceived >= totalOrdered ? 'received' : 'partial');
+    if (newStatus !== purchase.status) {
+      await req.db('inv_purchases').where({ id: req.params.id }).update({ status: newStatus, updated_at: new Date() });
+    }
+
+    const savedPurchase = await req.db('inv_purchases').where({ id: req.params.id }).first();
+    req.io.to(req.company.slug).emit('inv:purchase_updated', mapPurchase(savedPurchase));
+    res.json({ ...mapPurchase(savedPurchase), items: refreshedLines.map(mapPurchaseItem) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 router.patch('/purchases/:id', async (req, res) => {
   try {
     const b = req.body;

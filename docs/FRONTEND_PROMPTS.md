@@ -3757,3 +3757,37 @@ confirm every item's stock drops back down and both rows disappear together. The
 transaction for item X, submit a later Outward transaction that consumes some of that same returned
 stock, and confirm deleting the original Inward transaction now correctly fails with the message
 above instead of corrupting stock.
+
+---
+
+## 65. Purchase Order — add a new line item to an already-created PO
+
+**Status: backend built and tested (79/79 tests pass).** Today the Edit Purchase modal can only
+edit the quantity/cost/etc. of a line that's already on the PO (`PATCH
+/api/:slug/inventory/purchases/:purchaseId/items/:lineId`) — there was no way to add a brand-new
+item to a PO once it had already been created. This adds that.
+
+```
+POST /api/:slug/inventory/purchases/:id/items
+  body: { lines: [{ itemId, quantityOrdered, unitCost?, freightCost?, importCharges?,
+                     leadTimeDays?, vendorItemCode? }, ...] }
+  -> { ...purchase, items: [...every line on the PO, including the new one(s)] }
+```
+
+Same line shape as the "Make Purchase" form already uses when creating a PO (`POST
+/api/:slug/inventory/purchases`'s own `lines` array) — reuse that same item-row UI (item picker +
+quantity + unit cost, etc.) inside the Edit Purchase modal, behind an "+ Add item" button, so adding
+a line to an existing PO feels the same as adding one while creating it. Accepts one or more lines
+in a single call — if someone adds 2 new items before saving, send both in one `lines` array rather
+than two separate calls. New lines start with `quantityReceived: 0`, same as a freshly-created PO.
+
+**One real side effect worth knowing about:** if the PO was already marked "Received" and someone
+adds a new (unreceived) item to it, the backend automatically moves its status back to "Partial" —
+it's no longer accurate to call it fully received once there's real outstanding quantity on it
+again. Refresh whatever shows the PO's status badge after this call succeeds, same as you already
+do after `/receive-lines`. Adding an item to a cancelled PO is blocked with a 400 ("Purchase was
+cancelled.") — show that inline rather than retrying.
+
+**Verification:** open an existing PO that's already fully "Received," add a new item via the Edit
+Purchase modal, confirm it saves, the new line appears in the PO's item list with 0 received, and
+the PO's status badge now shows "Partial" instead of "Received."
