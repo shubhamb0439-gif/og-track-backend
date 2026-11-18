@@ -944,6 +944,231 @@ router.post('/purchases', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Excel import for Purchases ──────────────────────────────────────────────
+// The frontend reads the spreadsheet itself and sends plain JSON rows here —
+// one row = one item line. Rows sharing the same (trimmed, case-insensitive)
+// PO number are grouped into one purchase, same shape POST /purchases above
+// already creates (status 'pending', no stock/lots/serial units touched —
+// receiving still happens afterward through the normal /receive or
+// /receive-lines flow, completely unchanged by this).
+const IMPORT_MAX_ROWS = 2000;
+const IMPORT_CONSISTENCY_FIELDS = ['vendorCode', 'purchaseDate', 'currency', 'invoiceNumber'];
+
+function normalizePoNumber(v) {
+  return String(v || '').trim().toLowerCase();
+}
+
+function parseImportDate(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// Same SQL Server unique-constraint/unique-index violation signal already
+// used in sitara.js's isUniqueViolation — duplicated locally (a one-line,
+// driver-shape check, not worth cross-file coupling for) rather than
+// imported from there. inv_purchases has no unique index on po_number YET
+// (a separate, still-pending change) — this exists so the code is already
+// correct the day that index does land, at zero cost today; until then the
+// real (narrow) duplicate-race guard is the fresh SELECT re-check done
+// inside the transaction below, immediately before each insert.
+function isImportUniqueViolation(e) {
+  const num = e?.number ?? e?.originalError?.info?.number ?? e?.code;
+  return num === 2601 || num === 2627;
+}
+
+router.post('/purchases/import', async (req, res) => {
+  try {
+    const dryRun = !!req.body.dryRun;
+    const rows = Array.isArray(req.body.rows) ? req.body.rows : null;
+    if (!rows || !rows.length) return res.status(400).json({ error: 'rows is required and must be a non-empty array' });
+    if (rows.length > IMPORT_MAX_ROWS) {
+      return res.status(400).json({ error: `Cannot import more than ${IMPORT_MAX_ROWS} rows in one file.` });
+    }
+
+    const errors = [];
+    const addError = (rowNumber, column, message) => errors.push({ rowNumber, column, message });
+
+    // ── Per-row field validation (collects every error, never stops early) ──
+    for (const row of rows) {
+      const rn = row.rowNumber;
+      if (!row.poNumber || !String(row.poNumber).trim()) addError(rn, 'poNumber', 'PO number is required');
+      if (!row.vendorCode || !String(row.vendorCode).trim()) addError(rn, 'vendorCode', 'Vendor code is required');
+      if (!parseImportDate(row.purchaseDate)) addError(rn, 'purchaseDate', 'A valid purchase date is required');
+      if (row.currency !== undefined && row.currency !== null && String(row.currency).trim() !== ''
+        && !/^[A-Za-z]{3}$/.test(String(row.currency).trim())) {
+        addError(rn, 'currency', 'Currency must be a 3-letter code');
+      }
+      if (!row.itemCode || !String(row.itemCode).trim()) addError(rn, 'itemCode', 'Item code is required');
+      if (row.quantity == null || isNaN(Number(row.quantity)) || Number(row.quantity) <= 0) {
+        addError(rn, 'quantity', 'Quantity is required and must be greater than 0');
+      }
+      if (row.unitCost == null || isNaN(Number(row.unitCost)) || Number(row.unitCost) < 0) {
+        addError(rn, 'unitCost', 'Unit cost is required and must be 0 or more');
+      }
+      if (row.leadTimeDays !== undefined && row.leadTimeDays !== null && row.leadTimeDays !== '') {
+        const lt = Number(row.leadTimeDays);
+        if (isNaN(lt) || lt < 0 || !Number.isInteger(lt)) addError(rn, 'leadTimeDays', 'Lead time days must be a whole number 0 or more');
+      }
+      if (row.freightCharges !== undefined && row.freightCharges !== null && row.freightCharges !== ''
+        && (isNaN(Number(row.freightCharges)) || Number(row.freightCharges) < 0)) {
+        addError(rn, 'freightCharges', 'Freight charges must be 0 or more');
+      }
+      if (row.importCharges !== undefined && row.importCharges !== null && row.importCharges !== ''
+        && (isNaN(Number(row.importCharges)) || Number(row.importCharges) < 0)) {
+        addError(rn, 'importCharges', 'Import charges must be 0 or more');
+      }
+    }
+
+    // ── Group rows sharing the same normalized PO number ─────────────────
+    const groups = new Map(); // normalizedPo -> { poNumber (first raw value), rows: [...] }
+    for (const row of rows) {
+      if (!row.poNumber || !String(row.poNumber).trim()) continue; // already flagged above
+      const key = normalizePoNumber(row.poNumber);
+      if (!groups.has(key)) groups.set(key, { poNumber: String(row.poNumber).trim(), rows: [] });
+      groups.get(key).rows.push(row);
+    }
+
+    // ── Within one PO, vendorCode/purchaseDate/currency/invoiceNumber must
+    // all match across every row ──
+    for (const group of groups.values()) {
+      const [first, ...rest] = group.rows;
+      for (const field of IMPORT_CONSISTENCY_FIELDS) {
+        const baseline = String(first[field] ?? '').trim();
+        for (const row of rest) {
+          if (String(row[field] ?? '').trim() !== baseline) {
+            addError(row.rowNumber, field, `All rows for PO "${group.poNumber}" must have the same ${field}`);
+          }
+        }
+      }
+    }
+
+    // ── Vendor / item lookups — exact code match (case-insensitive), else
+    // a unique case-insensitive name match ──
+    const vendorCache = new Map();
+    async function resolveVendor(code) {
+      const key = String(code).trim().toLowerCase();
+      if (vendorCache.has(key)) return vendorCache.get(key);
+      let vendor = await req.db('inv_vendors').whereRaw('LOWER(vendor_code) = ?', [key]).first();
+      if (!vendor) {
+        const byName = await req.db('inv_vendors').whereRaw('LOWER(name) = ?', [key]);
+        if (byName.length === 1) vendor = byName[0];
+        else if (byName.length > 1) vendor = 'AMBIGUOUS';
+      }
+      const result = vendor || 'NOT_FOUND';
+      vendorCache.set(key, result);
+      return result;
+    }
+    const itemCache = new Map();
+    async function resolveItem(code) {
+      const key = String(code).trim().toLowerCase();
+      if (itemCache.has(key)) return itemCache.get(key);
+      let item = await req.db('inv_items').whereRaw('LOWER(item_code) = ?', [key]).first();
+      if (!item) {
+        const byName = await req.db('inv_items').whereRaw('LOWER(name) = ?', [key]);
+        if (byName.length === 1) item = byName[0];
+        else if (byName.length > 1) item = 'AMBIGUOUS';
+      }
+      const result = item || 'NOT_FOUND';
+      itemCache.set(key, result);
+      return result;
+    }
+
+    const resolvedVendorByRow = new Map(); // rowNumber -> vendor row (only set when resolved cleanly)
+    const resolvedItemByRow = new Map();
+    for (const row of rows) {
+      if (row.vendorCode && String(row.vendorCode).trim()) {
+        const vendor = await resolveVendor(row.vendorCode);
+        if (vendor === 'NOT_FOUND') addError(row.rowNumber, 'vendorCode', `Vendor code ${row.vendorCode} not found`);
+        else if (vendor === 'AMBIGUOUS') addError(row.rowNumber, 'vendorCode', `Vendor name ${row.vendorCode} matches more than one vendor`);
+        else resolvedVendorByRow.set(row.rowNumber, vendor);
+      }
+      if (row.itemCode && String(row.itemCode).trim()) {
+        const item = await resolveItem(row.itemCode);
+        if (item === 'NOT_FOUND') addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found`);
+        else if (item === 'AMBIGUOUS') addError(row.rowNumber, 'itemCode', `Item name ${row.itemCode} matches more than one item`);
+        else resolvedItemByRow.set(row.rowNumber, item);
+      }
+    }
+
+    // ── PO number must not already exist ──────────────────────────────────
+    for (const group of groups.values()) {
+      const existing = await req.db('inv_purchases')
+        .whereRaw('LTRIM(RTRIM(LOWER(po_number))) = ?', [normalizePoNumber(group.poNumber)]).first();
+      if (existing) {
+        for (const row of group.rows) addError(row.rowNumber, 'poNumber', `PO number "${group.poNumber}" already exists`);
+      }
+    }
+
+    errors.sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
+    const summary = { purchases: groups.size, lines: rows.length };
+
+    if (dryRun) {
+      return res.json({ valid: errors.length === 0, summary, errors, created: [] });
+    }
+    if (errors.length > 0) {
+      return res.status(400).json({ valid: false, summary, errors, created: [] });
+    }
+
+    // ── Clean file — create every PO + its lines in ONE transaction, so a
+    // partial-file failure (e.g. a genuine race on a PO number) never leaves
+    // some purchases created and others missing ──
+    const created = [];
+    try {
+      await req.db.transaction(async (trx) => {
+        for (const group of groups.values()) {
+          // Re-check right before inserting — the check above ran before this
+          // transaction opened, so another request could have created the
+          // same PO number in between. isImportUniqueViolation below is the
+          // real atomic backstop once a unique index exists.
+          const existing = await trx('inv_purchases')
+            .whereRaw('LTRIM(RTRIM(LOWER(po_number))) = ?', [normalizePoNumber(group.poNumber)]).first();
+          if (existing) throw Object.assign(new Error(`PO number "${group.poNumber}" already exists`), { isImportDuplicate: true });
+
+          const first = group.rows[0];
+          const vendor = resolvedVendorByRow.get(first.rowNumber);
+          const id = 'po_' + Date.now() + Math.random().toString(36).slice(2, 8);
+          const currency = (first.currency && String(first.currency).trim()) || vendor.currency || 'INR';
+          await trx('inv_purchases').insert({
+            id, po_number: group.poNumber, vendor_id: vendor.id, status: 'pending',
+            order_date: parseImportDate(first.purchaseDate) || new Date(),
+            invoice_number: (first.invoiceNumber && String(first.invoiceNumber).trim()) || null,
+            currency, notes: null, created_by: req.user?.userId || null,
+          });
+          for (const row of group.rows) {
+            const item = resolvedItemByRow.get(row.rowNumber);
+            await trx('inv_purchase_items').insert({
+              id: 'poi_' + Date.now() + Math.random().toString(36).slice(2, 6),
+              purchase_id: id, item_id: item.id,
+              vendor_item_code: row.vendorItemCode || null,
+              quantity_ordered: row.quantity,
+              unit_cost: row.unitCost || 0,
+              freight_cost: row.freightCharges || 0,
+              import_charges: row.importCharges || 0,
+              lead_time_days: row.leadTimeDays || null,
+            });
+          }
+          created.push({ id, poNumber: group.poNumber });
+        }
+      });
+    } catch (e) {
+      if (e.isImportDuplicate || isImportUniqueViolation(e)) {
+        return res.status(400).json({
+          valid: false, summary, created: [],
+          errors: [{ rowNumber: null, column: 'poNumber', message: e.message || 'A duplicate PO number was found during import.' }],
+        });
+      }
+      throw e;
+    }
+
+    for (const c of created) {
+      const saved = await req.db('inv_purchases').where({ id: c.id }).first();
+      req.io.to(req.company.slug).emit('inv:purchase_created', mapPurchase(saved));
+    }
+    res.json({ valid: true, summary, errors: [], created });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /purchases/:id/items — add one or more brand-new line items to an
 // EXISTING purchase, from the Edit Purchase modal. Distinct from
 // PATCH /purchases/:purchaseId/items/:lineId above, which only edits a line
