@@ -1008,33 +1008,63 @@ function boundedLevenshtein(a, b, max) {
   return prev[b.length];
 }
 
-// Up to `limit` existing items closest to `raw` (comparing normalized item
-// code, name and display name), one entry per item, formatted for an error
-// message: the item code, plus the name in brackets when the name was closer.
-function closestItemLabels(raw, allItems, limit = 3) {
+// Closeness score (0..1) of one normalized ERP value to the normalized Excel
+// key. Two tiers so ranking and score always agree:
+//  - the ERP value STARTS WITH the Excel value: 0.9..1.0 (1.0 = identical;
+//    the more of the ERP value the Excel value covers, the higher)
+//  - anything else: 0..0.89, from edit distance (1 - distance / longer length)
+// `minScore` lets far-off values bail out of the edit-distance step early.
+const PREFIX_TIER = 0.9;
+const OTHER_TIER_MAX = 0.89;
+function matchScore(key, norm, minScore = 0) {
+  if (!key || !norm) return 0;
+  if (norm.startsWith(key)) return PREFIX_TIER + (1 - PREFIX_TIER) * (key.length / norm.length);
+  if (minScore >= OTHER_TIER_MAX) return 0;
+  const longer = Math.max(key.length, norm.length);
+  // score >= minScore  <=>  distance <= longer * (1 - minScore / OTHER_TIER_MAX)
+  const maxDist = Math.floor(longer * (1 - minScore / OTHER_TIER_MAX));
+  const d = boundedLevenshtein(key, norm, maxDist);
+  if (d > maxDist) return 0;
+  return OTHER_TIER_MAX * (1 - d / longer);
+}
+
+// Up to `limit` existing records closest to `raw`, best first, comparing the
+// normalized values of `fields` (e.g. code, name, display name). Each result:
+// { id, code, name, score, matchedValue } — score rounded to 2 decimals.
+function closestRecords(raw, records, { codeColumn, fields }, limit = 3) {
   const key = normalizeForMatch(raw);
-  const best = []; // { dist, label }, sorted ascending, length <= limit
-  for (const it of allItems) {
-    let itemBest = null;
-    for (const value of [it.item_code, it.name, it.display_name]) {
+  const best = []; // sorted by score descending, length <= limit
+  for (const rec of records) {
+    let recBest = null;
+    for (const f of fields) {
+      const value = rec[f];
       if (!value) continue;
-      const norm = normalizeForMatch(value);
-      let cap = best.length < limit ? Math.max(key.length, norm.length) : best[best.length - 1].dist - 1;
-      if (itemBest) cap = Math.min(cap, itemBest.dist - 1);
-      if (cap < 0) continue;
-      const d = boundedLevenshtein(key, norm, cap);
-      if (d <= cap) itemBest = { dist: d, value };
+      const floor = Math.max(best.length < limit ? 0 : best[best.length - 1].score, recBest ? recBest.score : 0);
+      const score = matchScore(key, normalizeForMatch(value), floor);
+      if (score > 0 && score > floor) recBest = { score, value };
     }
-    if (!itemBest) continue;
-    const label = it.item_code && itemBest.value !== it.item_code
-      ? `${it.item_code} (${itemBest.value})`
-      : itemBest.value;
-    best.push({ dist: itemBest.dist, label });
-    best.sort((x, y) => x.dist - y.dist);
+    if (!recBest) continue;
+    best.push({ rec, score: recBest.score, matchedValue: recBest.value });
+    best.sort((x, y) => y.score - x.score);
     if (best.length > limit) best.pop();
   }
-  return best.map((b) => b.label);
+  return best.map((b) => ({
+    id: b.rec.id,
+    code: b.rec[codeColumn] || null,
+    name: b.rec.name || null,
+    score: Math.round(b.score * 100) / 100,
+    matchedValue: b.matchedValue,
+  }));
 }
+
+// "Did you mean" label used in the error message text: the code, plus the
+// matched name in brackets when the name (not the code) was the closer match.
+function suggestionLabel(s) {
+  return s.code && s.matchedValue !== s.code ? `${s.code} (${s.matchedValue})` : s.matchedValue;
+}
+
+// Structured form returned on the error object (no internal fields).
+const publicSuggestion = ({ id, code, name, score }) => ({ id, code, name, score });
 
 // Same SQL Server unique-constraint/unique-index violation signal already
 // used in sitara.js's isUniqueViolation — duplicated locally (a one-line,
@@ -1059,7 +1089,7 @@ router.post('/purchases/import', async (req, res) => {
     }
 
     const errors = [];
-    const addError = (rowNumber, column, message) => errors.push({ rowNumber, column, message });
+    const addError = (rowNumber, column, message, extra) => errors.push({ rowNumber, column, message, ...extra });
     const warnings = [];
     const addWarning = (rowNumber, column, message) => warnings.push({ rowNumber, column, message });
 
@@ -1132,6 +1162,20 @@ router.post('/purchases/import', async (req, res) => {
       const result = vendor || 'NOT_FOUND';
       vendorCache.set(key, result);
       return result;
+    }
+    // Closest existing vendors for a "not found" vendorCode (vendor list
+    // loaded once per import, only if needed; results cached per value).
+    let allVendorsForSuggestions = null;
+    const vendorSuggestionCache = new Map();
+    async function suggestVendors(code) {
+      const raw = String(code).trim();
+      if (vendorSuggestionCache.has(raw)) return vendorSuggestionCache.get(raw);
+      if (!allVendorsForSuggestions) {
+        allVendorsForSuggestions = await req.db('inv_vendors').select('id', 'vendor_code', 'name');
+      }
+      const s = closestRecords(raw, allVendorsForSuggestions, { codeColumn: 'vendor_code', fields: ['vendor_code', 'name'] });
+      vendorSuggestionCache.set(raw, s);
+      return s;
     }
     // Item-code lookup, in order: 1) exact item code, 2) exact item name,
     // 3) normalized item code, 4) normalized item name/display name
@@ -1206,7 +1250,8 @@ router.post('/purchases/import', async (req, res) => {
       // easy to spot.
       const final = result || {
         notFound: true,
-        suggestions: closestItemLabels(raw, await getAllItemsForSpacingFallback()),
+        suggestions: closestRecords(raw, await getAllItemsForSpacingFallback(),
+          { codeColumn: 'item_code', fields: ['item_code', 'name', 'display_name'] }),
       };
       itemCache.set(key, final);
       return final;
@@ -1217,15 +1262,20 @@ router.post('/purchases/import', async (req, res) => {
     for (const row of rows) {
       if (row.vendorCode && String(row.vendorCode).trim()) {
         const vendor = await resolveVendor(row.vendorCode);
-        if (vendor === 'NOT_FOUND') addError(row.rowNumber, 'vendorCode', `Vendor code ${row.vendorCode} not found`);
+        if (vendor === 'NOT_FOUND') {
+          const suggestions = await suggestVendors(row.vendorCode);
+          addError(row.rowNumber, 'vendorCode', `Vendor code ${row.vendorCode} not found`,
+            { value: row.vendorCode, suggestions: suggestions.map(publicSuggestion) });
+        }
         else if (vendor === 'AMBIGUOUS') addError(row.rowNumber, 'vendorCode', `Vendor name ${row.vendorCode} matches more than one vendor`);
         else resolvedVendorByRow.set(row.rowNumber, vendor);
       }
       if (row.itemCode && String(row.itemCode).trim()) {
         const resolved = await resolveItem(row.itemCode);
         if (resolved.notFound) {
-          const hint = resolved.suggestions.length ? ` Did you mean: ${resolved.suggestions.join(', ')}?` : '';
-          addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found.${hint}`);
+          const hint = resolved.suggestions.length ? ` Did you mean: ${resolved.suggestions.map(suggestionLabel).join(', ')}?` : '';
+          addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found.${hint}`,
+            { value: row.itemCode, suggestions: resolved.suggestions.map(publicSuggestion) });
         } else if (resolved.ambiguous) {
           const names = resolved.candidates.map((c) => c.item_code || c.name).join(', ');
           addError(row.rowNumber, 'itemCode', `Matches more than one item: ${names}`);
