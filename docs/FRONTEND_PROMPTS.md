@@ -3697,3 +3697,63 @@ pivot/filter this data.
 the correct image; same for a PO document. Pick a real date range on the Orders export, confirm the
 downloaded file's row count matches that same range filtered on the Orders list page, and that a
 multi-product order appears as multiple rows with the right per-line quantity/price.
+
+---
+
+## 64. Inventory → "Inward Outward" — delete a transaction (with stock reversal + confirmation)
+
+**Status: backend built and tested (79/79 tests pass).** Adds the missing Delete option on both
+the Outward History and Inward History lists built in #60 above — today a submitted Inward/Outward
+transaction can never be removed. Deleting correctly reverses the stock change it made (an Outward
+delete adds the quantity back, an Inward delete deducts it again), atomically — either the whole
+transaction's stock is reversed and every row removed, or (if the backend's safety check below
+blocks it) nothing happens at all.
+
+**Two endpoints per direction** — #60's history rows group a multi-item submission under one
+`batchId`; which one to call depends on whether the row being deleted has a `batchId` or not:
+
+```
+DELETE /api/:slug/inventory/issues/:id            -- a single-line Outward row (no batchId, or
+                                                       deleting just one line out of a batch)
+DELETE /api/:slug/inventory/issues/batch/:batchId  -- a whole multi-item Outward transaction at once
+
+DELETE /api/:slug/inventory/returns/:id            -- a single-line Inward row
+DELETE /api/:slug/inventory/returns/batch/:batchId  -- a whole multi-item Inward transaction at once
+
+  -> { success: true }   on success
+  -> { error: "..." }    (400) if the backend's safety check refuses the delete (see below) — show
+                          this message to the user as-is, it already explains why in plain English
+```
+
+**Since #60's history table already groups a batch under one entry** (an expandable row listing
+each item, or one row with a child item list — whichever you built), put ONE Delete button on that
+whole grouped entry: if the entry has a real `batchId`, call the `/batch/:batchId` endpoint; if
+`batchId` is `null` (an older/legacy single-item row, or a submission that only ever had one line),
+call the plain `/:id` endpoint with that row's own `id` instead. Either way it's one button per
+history entry, not one per line inside it.
+
+**Confirmation popup (required, per the original request) — before either call fires:**
+"Are you sure you want to delete this transaction? This will reverse the stock change it made."
+Only call the DELETE endpoint after the user confirms; cancel does nothing.
+
+**After a successful delete:** remove that entry from the history list immediately and re-fetch
+`GET /api/:slug/inventory/items/summary` (the total-stock-value tile from #60) plus whichever stock
+figures are currently on screen for the affected item(s) — same refresh you already trigger after
+any other stock-changing action in this module. Show a success toast/message. On a 400 error, show
+that message in place of a generic failure (see below for what it actually means).
+
+**Real safety check you'll see surfaced as a 400 — not a bug, explain it rather than retrying:**
+an Inward (customer-return) transaction can't always be deleted — if some of the stock it added was
+already sent back out via a *later* Outward transaction, reversing it would drive that stock
+negative, so the backend refuses with: *"Some of this returned stock has already been issued back
+out and cannot be safely reversed. Reverse or edit the later Outward transaction(s) first."* Outward
+deletes don't have this limitation (reversing an Outward issue is always safe, regardless of what's
+happened since) — only Inward deletes can hit this message.
+
+**Verification:** submit a single-item Outward transaction, delete it from history, confirm the
+item's stock and the total-stock-value tile both go back up to what they were before, and the row
+disappears. Submit a multi-item Inward batch (2+ items), delete the whole batch via one button,
+confirm every item's stock drops back down and both rows disappear together. Then: submit an Inward
+transaction for item X, submit a later Outward transaction that consumes some of that same returned
+stock, and confirm deleting the original Inward transaction now correctly fails with the message
+above instead of corrupting stock.

@@ -102,6 +102,81 @@ async function createSerialUnitsForLot(db, { itemId, lotId, purchaseItemId, quan
   }
 }
 
+// Below this tolerance a remaining quantity is treated as zero — same
+// rationale/value as stockLots.js's own QTY_EPSILON (DECIMAL(14,2) columns
+// can carry fractional units, so an exact-equality check would misfire on
+// floating-point noise).
+const QTY_EPSILON = 1e-6;
+
+// Reverses one or more Outward issues (inv_stock_issues) together in a
+// single DB transaction — adds each issue's consumed quantity back onto the
+// EXACT lot(s) it was drawn from (recorded in inv_stock_issue_lots at the
+// time of consumption), then removes the issue and its lot rows. This is
+// always safe to just add back, regardless of what else has happened to
+// that lot since (another, later issue drawing further from it doesn't
+// change the math — it's pure additive bookkeeping) — unlike reversing an
+// Inward return below, which can't safely subtract if the lot was already
+// drawn down by a later issue. Refuses the WHOLE operation (nothing
+// partially reversed) if any referenced lot no longer exists at all (e.g.
+// the purchase that created it was since deleted) rather than silently
+// under-restoring stock — mirrors the safety check DELETE /purchases/:id
+// already uses for exactly this kind of "can we cleanly undo this" question.
+async function reverseIssues(db, issues) {
+  const touchedItemIds = new Set();
+  await db.transaction(async (trx) => {
+    for (const issue of issues) {
+      const issueLots = await trx('inv_stock_issue_lots').where({ issue_id: issue.id });
+      for (const il of issueLots) {
+        const lot = await trx('inv_stock_lots').where({ id: il.lot_id }).first();
+        if (!lot) {
+          throw new Error('Cannot delete this transaction — one of the stock lots it drew from no longer exists.');
+        }
+        await trx('inv_stock_lots').where({ id: il.lot_id }).update({
+          quantity_remaining: Number(lot.quantity_remaining) + Number(il.quantity),
+        });
+      }
+      await trx('inv_stock_issue_lots').where({ issue_id: issue.id }).delete();
+      await trx('inv_stock_issues').where({ id: issue.id }).delete();
+      touchedItemIds.add(issue.item_id);
+    }
+    for (const itemId of touchedItemIds) await recomputeItemStock(trx, itemId);
+  });
+  return [...touchedItemIds];
+}
+
+// Reverses one or more Inward (customer-return) transactions
+// (inv_stock_returns) together in a single DB transaction — each return
+// created exactly one new stock lot (lot_id, stored directly on the return
+// row), so reversing means deducting that same quantity back out of that
+// lot. Unlike reverseIssues above, this direction genuinely CAN be unsafe:
+// if a later Outward issue already drew some of this returned stock back
+// out via FIFO, quantity_remaining may now be less than what we'd need to
+// remove — refuse the whole operation rather than driving it negative or
+// silently under-reversing.
+async function reverseReturns(db, returns) {
+  const touchedItemIds = new Set();
+  await db.transaction(async (trx) => {
+    for (const ret of returns) {
+      const lot = await trx('inv_stock_lots').where({ id: ret.lot_id }).first();
+      if (!lot) {
+        throw new Error('Cannot delete this transaction — its stock lot no longer exists.');
+      }
+      const remaining = Number(lot.quantity_remaining);
+      const originalQty = Number(ret.quantity);
+      if (remaining < originalQty - QTY_EPSILON) {
+        throw new Error('Some of this returned stock has already been issued back out and cannot be safely reversed. Reverse or edit the later Outward transaction(s) first.');
+      }
+      await trx('inv_stock_lots').where({ id: ret.lot_id }).update({
+        quantity_remaining: remaining - originalQty,
+      });
+      await trx('inv_stock_returns').where({ id: ret.id }).delete();
+      touchedItemIds.add(ret.item_id);
+    }
+    for (const itemId of touchedItemIds) await recomputeItemStock(trx, itemId);
+  });
+  return [...touchedItemIds];
+}
+
 // ── Vendors ───────────────────────────────────────────────────────────────────
 
 // Vendor list, each gaining a real `totalValue` — the sum, across every PO
@@ -702,6 +777,72 @@ router.get('/returns', async (req, res) => {
       createdBy: r.created_by, createdAt: r.created_at,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE a single Outward transaction line (one inv_stock_issues row — a
+// standalone single-item issue, or one line within a multi-item batch).
+// For deleting a WHOLE multi-item batch together, use the /issues/batch/:id
+// route below instead — this one only ever touches the one row named.
+router.delete('/issues/:id', async (req, res) => {
+  try {
+    const issue = await req.db('inv_stock_issues').where({ id: req.params.id }).first();
+    if (!issue) return res.status(404).json({ error: 'Transaction not found' });
+    await reverseIssues(req.db, [issue]);
+    const saved = await req.db('inv_items').where({ id: issue.item_id }).first();
+    req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+    req.io.to(req.company.slug).emit('inv:issue_deleted', { id: issue.id, batchId: issue.batch_id });
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// DELETE a whole multi-item Outward transaction (every inv_stock_issues row
+// sharing one batch_id from a single issue-batch submission) — all lines
+// reversed together in one DB transaction, per requirement 6 (no partial
+// updates): either every line's stock is restored and every row removed,
+// or (on any single line failing its safety check) nothing is.
+router.delete('/issues/batch/:batchId', async (req, res) => {
+  try {
+    const issues = await req.db('inv_stock_issues').where({ batch_id: req.params.batchId });
+    if (!issues.length) return res.status(404).json({ error: 'Transaction not found' });
+    const touchedItemIds = await reverseIssues(req.db, issues);
+    for (const itemId of touchedItemIds) {
+      const saved = await req.db('inv_items').where({ id: itemId }).first();
+      req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+    }
+    req.io.to(req.company.slug).emit('inv:issue_deleted', { batchId: req.params.batchId });
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// DELETE a single Inward transaction line (one inv_stock_returns row).
+// See /returns/batch/:id below for deleting a whole multi-item batch.
+router.delete('/returns/:id', async (req, res) => {
+  try {
+    const ret = await req.db('inv_stock_returns').where({ id: req.params.id }).first();
+    if (!ret) return res.status(404).json({ error: 'Transaction not found' });
+    await reverseReturns(req.db, [ret]);
+    const saved = await req.db('inv_items').where({ id: ret.item_id }).first();
+    req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+    req.io.to(req.company.slug).emit('inv:return_deleted', { id: ret.id, batchId: ret.batch_id });
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// DELETE a whole multi-item Inward transaction (every inv_stock_returns row
+// sharing one batch_id) — same all-or-nothing guarantee as the Outward
+// batch delete above.
+router.delete('/returns/batch/:batchId', async (req, res) => {
+  try {
+    const returns = await req.db('inv_stock_returns').where({ batch_id: req.params.batchId });
+    if (!returns.length) return res.status(404).json({ error: 'Transaction not found' });
+    const touchedItemIds = await reverseReturns(req.db, returns);
+    for (const itemId of touchedItemIds) {
+      const saved = await req.db('inv_items').where({ id: itemId }).first();
+      req.io.to(req.company.slug).emit('inv:item_updated', mapItem(saved));
+    }
+    req.io.to(req.company.slug).emit('inv:return_deleted', { batchId: req.params.batchId });
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ── Purchases ─────────────────────────────────────────────────────────────────
