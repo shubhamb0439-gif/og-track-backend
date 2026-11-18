@@ -964,6 +964,14 @@ function parseImportDate(v) {
   return isNaN(d.getTime()) ? null : d;
 }
 
+// Strips ALL whitespace (regular spaces, tabs, non-breaking spaces, etc. —
+// \s already covers   in JS, but it's spelled out explicitly here since
+// that's the exact case this was written for) for a spacing-insensitive
+// comparison. Lookup/comparison only — never written back to the DB.
+function normalizeNoSpace(v) {
+  return String(v || '').replace(/[\s ]/g, '').toLowerCase();
+}
+
 // Same SQL Server unique-constraint/unique-index violation signal already
 // used in sitara.js's isUniqueViolation — duplicated locally (a one-line,
 // driver-shape check, not worth cross-file coupling for) rather than
@@ -988,6 +996,8 @@ router.post('/purchases/import', async (req, res) => {
 
     const errors = [];
     const addError = (rowNumber, column, message) => errors.push({ rowNumber, column, message });
+    const warnings = [];
+    const addWarning = (rowNumber, column, message) => warnings.push({ rowNumber, column, message });
 
     // ── Per-row field validation (collects every error, never stops early) ──
     for (const row of rows) {
@@ -1059,19 +1069,76 @@ router.post('/purchases/import', async (req, res) => {
       vendorCache.set(key, result);
       return result;
     }
+    // Item-code lookup, in order: 1) exact item code, 2) exact item name,
+    // 3) item code ignoring all spacing, 4) item name/display name ignoring
+    // all spacing. Stops at the first step that finds anything (a unique hit
+    // resolves it, more than one hit is reported as ambiguous and never
+    // guessed) — later steps never run once an earlier one matched. Steps 3/4
+    // exist because Excel's spacing around item names/codes often doesn't
+    // exactly match what's saved in the ERP (e.g. "Model R - X" vs
+    // "Model R- X") — this is a read-only comparison; nothing is ever written
+    // back to inv_items.
+    let allItemsForSpacingFallback = null;
+    async function getAllItemsForSpacingFallback() {
+      if (!allItemsForSpacingFallback) {
+        allItemsForSpacingFallback = await req.db('inv_items').select('id', 'item_code', 'name', 'display_name');
+      }
+      return allItemsForSpacingFallback;
+    }
     const itemCache = new Map();
     async function resolveItem(code) {
-      const key = String(code).trim().toLowerCase();
+      const raw = String(code).trim();
+      const key = raw.toLowerCase();
       if (itemCache.has(key)) return itemCache.get(key);
-      let item = await req.db('inv_items').whereRaw('LOWER(item_code) = ?', [key]).first();
-      if (!item) {
-        const byName = await req.db('inv_items').whereRaw('LOWER(name) = ?', [key]);
-        if (byName.length === 1) item = byName[0];
-        else if (byName.length > 1) item = 'AMBIGUOUS';
+
+      let result = null;
+
+      // Step 1: exact item code (case-insensitive)
+      let rows = await req.db('inv_items').whereRaw('LOWER(item_code) = ?', [key]);
+      if (rows.length === 1) result = { item: rows[0] };
+      else if (rows.length > 1) result = { ambiguous: true, candidates: rows };
+
+      // Step 2: exact item name (case-insensitive)
+      if (!result) {
+        rows = await req.db('inv_items').whereRaw('LOWER(name) = ?', [key]);
+        if (rows.length === 1) result = { item: rows[0] };
+        else if (rows.length > 1) result = { ambiguous: true, candidates: rows };
       }
-      const result = item || 'NOT_FOUND';
-      itemCache.set(key, result);
-      return result;
+
+      // Steps 3 & 4: ignoring spacing — compared in memory against every item
+      // (cached once per import, not refetched per row)
+      if (!result) {
+        const noSpaceKey = normalizeNoSpace(raw);
+        const allItems = await getAllItemsForSpacingFallback();
+
+        // Step 3: item code, ignoring spacing
+        let candidates = allItems.filter((it) => it.item_code && normalizeNoSpace(it.item_code) === noSpaceKey);
+        if (candidates.length === 1) {
+          result = { item: candidates[0], matchedBySpacing: true, matchedValue: candidates[0].item_code };
+        } else if (candidates.length > 1) {
+          result = { ambiguous: true, candidates };
+        }
+
+        // Step 4: item name OR display name, ignoring spacing (one combined step)
+        if (!result) {
+          candidates = allItems.filter((it) =>
+            (it.name && normalizeNoSpace(it.name) === noSpaceKey) ||
+            (it.display_name && normalizeNoSpace(it.display_name) === noSpaceKey));
+          if (candidates.length === 1) {
+            const matched = candidates[0];
+            const matchedValue = (matched.name && normalizeNoSpace(matched.name) === noSpaceKey)
+              ? matched.name
+              : matched.display_name;
+            result = { item: matched, matchedBySpacing: true, matchedValue };
+          } else if (candidates.length > 1) {
+            result = { ambiguous: true, candidates };
+          }
+        }
+      }
+
+      const final = result || { notFound: true };
+      itemCache.set(key, final);
+      return final;
     }
 
     const resolvedVendorByRow = new Map(); // rowNumber -> vendor row (only set when resolved cleanly)
@@ -1084,10 +1151,18 @@ router.post('/purchases/import', async (req, res) => {
         else resolvedVendorByRow.set(row.rowNumber, vendor);
       }
       if (row.itemCode && String(row.itemCode).trim()) {
-        const item = await resolveItem(row.itemCode);
-        if (item === 'NOT_FOUND') addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found`);
-        else if (item === 'AMBIGUOUS') addError(row.rowNumber, 'itemCode', `Item name ${row.itemCode} matches more than one item`);
-        else resolvedItemByRow.set(row.rowNumber, item);
+        const resolved = await resolveItem(row.itemCode);
+        if (resolved.notFound) {
+          addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found`);
+        } else if (resolved.ambiguous) {
+          const names = resolved.candidates.map((c) => c.item_code || c.name).join(', ');
+          addError(row.rowNumber, 'itemCode', `Matches more than one item: ${names}`);
+        } else {
+          resolvedItemByRow.set(row.rowNumber, resolved.item);
+          if (resolved.matchedBySpacing) {
+            addWarning(row.rowNumber, 'itemCode', `Matched '${row.itemCode}' to existing item '${resolved.matchedValue}'`);
+          }
+        }
       }
     }
 
@@ -1101,13 +1176,14 @@ router.post('/purchases/import', async (req, res) => {
     }
 
     errors.sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
+    warnings.sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
     const summary = { purchases: groups.size, lines: rows.length };
 
     if (dryRun) {
-      return res.json({ valid: errors.length === 0, summary, errors, created: [] });
+      return res.json({ valid: errors.length === 0, summary, errors, warnings, created: [] });
     }
     if (errors.length > 0) {
-      return res.status(400).json({ valid: false, summary, errors, created: [] });
+      return res.status(400).json({ valid: false, summary, errors, warnings, created: [] });
     }
 
     // ── Clean file — create every PO + its lines in ONE transaction, so a
@@ -1154,7 +1230,7 @@ router.post('/purchases/import', async (req, res) => {
     } catch (e) {
       if (e.isImportDuplicate || isImportUniqueViolation(e)) {
         return res.status(400).json({
-          valid: false, summary, created: [],
+          valid: false, summary, created: [], warnings,
           errors: [{ rowNumber: null, column: 'poNumber', message: e.message || 'A duplicate PO number was found during import.' }],
         });
       }
@@ -1165,7 +1241,7 @@ router.post('/purchases/import', async (req, res) => {
       const saved = await req.db('inv_purchases').where({ id: c.id }).first();
       req.io.to(req.company.slug).emit('inv:purchase_created', mapPurchase(saved));
     }
-    res.json({ valid: true, summary, errors: [], created });
+    res.json({ valid: true, summary, errors: [], warnings, created });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
