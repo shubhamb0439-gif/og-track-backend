@@ -964,12 +964,76 @@ function parseImportDate(v) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-// Strips ALL whitespace (regular spaces, tabs, non-breaking spaces, etc. —
-// \s already covers   in JS, but it's spelled out explicitly here since
-// that's the exact case this was written for) for a spacing-insensitive
-// comparison. Lookup/comparison only — never written back to the DB.
-function normalizeNoSpace(v) {
-  return String(v || '').replace(/[\s ]/g, '').toLowerCase();
+// Loose comparison key for item matching. Lookup/comparison only — never
+// written back to the DB. In order:
+//  1. Unicode NFC (so "Ö" typed as O + combining umlaut equals the single "Ö")
+//  2. strip accents: decompose (NFD) and drop combining marks ("Ö" -> "O"),
+//     plus a small map for letters that don't decompose (Ø, Ł, ß, Æ, Œ, ...)
+//  3. drop the ®, ™ and © symbols
+//  4. drop ALL whitespace, incl. non-breaking, narrow and zero-width spaces
+//  5. lowercase
+// e.g. "ÖLFLEX® UNIPLUS 1X1.5 BK" -> "olflexuniplus1x1.5bk"
+const MATCH_CHAR_MAP = {
+  'Ø': 'O', 'ø': 'o', 'Ł': 'L', 'ł': 'l', 'Đ': 'D', 'đ': 'd', 'Ð': 'D', 'ð': 'd',
+  'Þ': 'Th', 'þ': 'th', 'ß': 'ss', 'ẞ': 'SS', 'Æ': 'AE', 'æ': 'ae', 'Œ': 'OE', 'œ': 'oe', 'ı': 'i',
+};
+function normalizeForMatch(v) {
+  return String(v ?? '')
+    .normalize('NFC')
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .replace(/[ØøŁłĐđÐðÞþßẞÆæŒœı]/g, (ch) => MATCH_CHAR_MAP[ch])
+    .replace(/[®™©]/g, '')
+    .replace(/[\s\u00A0\u1680\u2000-\u200D\u2028\u2029\u202F\u205F\u2060\u3000\uFEFF]/g, '')
+    .toLowerCase();
+}
+
+// Levenshtein distance that gives up early (returns max + 1) once a whole
+// row exceeds `max` — only used to rank "Did you mean" suggestions, so far-off
+// items are skipped cheaply.
+function boundedLevenshtein(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// Up to `limit` existing items closest to `raw` (comparing normalized item
+// code, name and display name), one entry per item, formatted for an error
+// message: the item code, plus the name in brackets when the name was closer.
+function closestItemLabels(raw, allItems, limit = 3) {
+  const key = normalizeForMatch(raw);
+  const best = []; // { dist, label }, sorted ascending, length <= limit
+  for (const it of allItems) {
+    let itemBest = null;
+    for (const value of [it.item_code, it.name, it.display_name]) {
+      if (!value) continue;
+      const norm = normalizeForMatch(value);
+      let cap = best.length < limit ? Math.max(key.length, norm.length) : best[best.length - 1].dist - 1;
+      if (itemBest) cap = Math.min(cap, itemBest.dist - 1);
+      if (cap < 0) continue;
+      const d = boundedLevenshtein(key, norm, cap);
+      if (d <= cap) itemBest = { dist: d, value };
+    }
+    if (!itemBest) continue;
+    const label = it.item_code && itemBest.value !== it.item_code
+      ? `${it.item_code} (${itemBest.value})`
+      : itemBest.value;
+    best.push({ dist: itemBest.dist, label });
+    best.sort((x, y) => x.dist - y.dist);
+    if (best.length > limit) best.pop();
+  }
+  return best.map((b) => b.label);
 }
 
 // Same SQL Server unique-constraint/unique-index violation signal already
@@ -1070,13 +1134,15 @@ router.post('/purchases/import', async (req, res) => {
       return result;
     }
     // Item-code lookup, in order: 1) exact item code, 2) exact item name,
-    // 3) item code ignoring all spacing, 4) item name/display name ignoring
-    // all spacing. Stops at the first step that finds anything (a unique hit
+    // 3) normalized item code, 4) normalized item name/display name
+    // (normalizeForMatch: NFC, accents stripped so "Ö" = "O", ®/™/© dropped,
+    // all whitespace incl. non-breaking spaces dropped, case-insensitive).
+    // Stops at the first step that finds anything (a unique hit
     // resolves it, more than one hit is reported as ambiguous and never
     // guessed) — later steps never run once an earlier one matched. Steps 3/4
-    // exist because Excel's spacing around item names/codes often doesn't
-    // exactly match what's saved in the ERP (e.g. "Model R - X" vs
-    // "Model R- X") — this is a read-only comparison; nothing is ever written
+    // exist because Excel's spacing/symbols around item names/codes often
+    // don't exactly match what's saved in the ERP (e.g. "Model R - X" vs
+    // "Model R- X", or "ÖLFLEX® UNIPLUS" vs "OLFLEX UNIPLUS") — this is a read-only comparison; nothing is ever written
     // back to inv_items.
     let allItemsForSpacingFallback = null;
     async function getAllItemsForSpacingFallback() {
@@ -1105,28 +1171,28 @@ router.post('/purchases/import', async (req, res) => {
         else if (rows.length > 1) result = { ambiguous: true, candidates: rows };
       }
 
-      // Steps 3 & 4: ignoring spacing — compared in memory against every item
+      // Steps 3 & 4: normalized comparison — compared in memory against every item
       // (cached once per import, not refetched per row)
       if (!result) {
-        const noSpaceKey = normalizeNoSpace(raw);
+        const noSpaceKey = normalizeForMatch(raw);
         const allItems = await getAllItemsForSpacingFallback();
 
-        // Step 3: item code, ignoring spacing
-        let candidates = allItems.filter((it) => it.item_code && normalizeNoSpace(it.item_code) === noSpaceKey);
+        // Step 3: item code, normalized
+        let candidates = allItems.filter((it) => it.item_code && normalizeForMatch(it.item_code) === noSpaceKey);
         if (candidates.length === 1) {
           result = { item: candidates[0], matchedBySpacing: true, matchedValue: candidates[0].item_code };
         } else if (candidates.length > 1) {
           result = { ambiguous: true, candidates };
         }
 
-        // Step 4: item name OR display name, ignoring spacing (one combined step)
+        // Step 4: item name OR display name, normalized (one combined step)
         if (!result) {
           candidates = allItems.filter((it) =>
-            (it.name && normalizeNoSpace(it.name) === noSpaceKey) ||
-            (it.display_name && normalizeNoSpace(it.display_name) === noSpaceKey));
+            (it.name && normalizeForMatch(it.name) === noSpaceKey) ||
+            (it.display_name && normalizeForMatch(it.display_name) === noSpaceKey));
           if (candidates.length === 1) {
             const matched = candidates[0];
-            const matchedValue = (matched.name && normalizeNoSpace(matched.name) === noSpaceKey)
+            const matchedValue = (matched.name && normalizeForMatch(matched.name) === noSpaceKey)
               ? matched.name
               : matched.display_name;
             result = { item: matched, matchedBySpacing: true, matchedValue };
@@ -1136,7 +1202,12 @@ router.post('/purchases/import', async (req, res) => {
         }
       }
 
-      const final = result || { notFound: true };
+      // Not found: suggest the closest existing items so the difference is
+      // easy to spot.
+      const final = result || {
+        notFound: true,
+        suggestions: closestItemLabels(raw, await getAllItemsForSpacingFallback()),
+      };
       itemCache.set(key, final);
       return final;
     }
@@ -1153,7 +1224,8 @@ router.post('/purchases/import', async (req, res) => {
       if (row.itemCode && String(row.itemCode).trim()) {
         const resolved = await resolveItem(row.itemCode);
         if (resolved.notFound) {
-          addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found`);
+          const hint = resolved.suggestions.length ? ` Did you mean: ${resolved.suggestions.join(', ')}?` : '';
+          addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found.${hint}`);
         } else if (resolved.ambiguous) {
           const names = resolved.candidates.map((c) => c.item_code || c.name).join(', ');
           addError(row.rowNumber, 'itemCode', `Matches more than one item: ${names}`);
