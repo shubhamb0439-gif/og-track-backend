@@ -1317,6 +1317,227 @@ router.post('/purchases/import', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Excel import for Vendors and Items ─────────────────────────────────────
+// Same contract as POST /purchases/import above: the frontend parses the
+// sheet and sends { dryRun, rows: [{ rowNumber, ...fields }] }; the response
+// is { valid, summary: { toCreate, skipped }, errors, warnings, created }.
+// Rows whose code (or, with no code, whose name) already exists in the ERP
+// are never created or updated — they get a warning and are skipped. Codes
+// and names are compared with normalizeForMatch (NFC, accents stripped,
+// ®/™/© and all whitespace dropped, case-insensitive); the values saved are
+// the Excel text, only trimmed. All new rows go in ONE transaction.
+
+const importText = (v) => (v === undefined || v === null ? '' : String(v).trim());
+const isBlank = (v) => importText(v) === '';
+const IMPORT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Yes/No/True/False/Y/N/1/0 (any case) or a real boolean -> true/false;
+// anything else -> undefined (reported as an error by the caller).
+function parseImportBool(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v === 1 ? true : v === 0 ? false : undefined;
+  const s = importText(v).toLowerCase();
+  if (['yes', 'y', 'true', '1'].includes(s)) return true;
+  if (['no', 'n', 'false', '0'].includes(s)) return false;
+  return undefined;
+}
+
+// Shared validate -> skip -> insert flow for the vendor and item imports.
+// cfg: { table, idPrefix, codeField, codeColumn, label, textFields: [[field, column, maxLen]],
+//        validateRow(row, addError) -> extra insert columns, event, mapper }
+async function runMasterImport(req, res, cfg) {
+  const dryRun = !!req.body.dryRun;
+  const rows = Array.isArray(req.body.rows) ? req.body.rows : null;
+  if (!rows || !rows.length) return res.status(400).json({ error: 'rows is required and must be a non-empty array' });
+  if (rows.length > IMPORT_MAX_ROWS) {
+    return res.status(400).json({ error: `Cannot import more than ${IMPORT_MAX_ROWS} rows in one file.` });
+  }
+
+  const errors = [];
+  const addError = (rowNumber, column, message) => errors.push({ rowNumber, column, message });
+  const warnings = [];
+  const addWarning = (rowNumber, column, message) => warnings.push({ rowNumber, column, message });
+
+  // Existing records, loaded once, keyed by normalized code / name.
+  const existing = await req.db(cfg.table).select('id', cfg.codeColumn, 'name');
+  const existingCodes = new Set();
+  const existingNames = new Set();
+  for (const r of existing) {
+    if (!isBlank(r[cfg.codeColumn])) existingCodes.add(normalizeForMatch(r[cfg.codeColumn]));
+    if (!isBlank(r.name)) existingNames.add(normalizeForMatch(r.name));
+  }
+
+  // ── Decide which rows are skipped (already in the ERP) ──
+  const entries = rows.map((row, i) => ({
+    row,
+    rn: row && row.rowNumber != null ? row.rowNumber : i + 2,
+    code: importText(row && row[cfg.codeField]),
+    name: importText(row && row.name),
+  }));
+  const toCreate = [];
+  let skipped = 0;
+  for (const e of entries) {
+    if (e.code && existingCodes.has(normalizeForMatch(e.code))) {
+      addWarning(e.rn, cfg.codeField, `${cfg.label} code ${e.code} already exists, it will be skipped`);
+      skipped++;
+    } else if (!e.code && e.name && existingNames.has(normalizeForMatch(e.name))) {
+      addWarning(e.rn, 'name', `${cfg.label} ${e.name} already exists, it will be skipped`);
+      skipped++;
+    } else {
+      toCreate.push(e);
+    }
+  }
+
+  // ── Validate every row that would be created (all errors collected) ──
+  for (const e of toCreate) {
+    const { row, rn } = e;
+    if (!e.name) addError(rn, 'name', 'Name is required');
+    for (const [field, , maxLen] of cfg.textFields) {
+      const t = importText(row[field]);
+      if (t.length > maxLen) addError(rn, field, `${field} must be at most ${maxLen} characters`);
+    }
+    e.extra = cfg.validateRow(row, (column, message) => addError(rn, column, message));
+  }
+
+  // ── Duplicate codes inside the file (among rows that would be created) ──
+  const byCode = new Map();
+  for (const e of toCreate) {
+    if (!e.code) continue;
+    const key = normalizeForMatch(e.code);
+    if (!byCode.has(key)) byCode.set(key, []);
+    byCode.get(key).push(e);
+  }
+  for (const group of byCode.values()) {
+    if (group.length < 2) continue;
+    const rowList = group.map((g) => g.rn).join(', ');
+    for (const g of group) {
+      addError(g.rn, cfg.codeField, `${cfg.label} code ${g.code} appears more than once in this file (rows ${rowList})`);
+    }
+  }
+
+  errors.sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
+  warnings.sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
+  const summary = { toCreate: toCreate.length, skipped };
+
+  if (dryRun) return res.json({ valid: errors.length === 0, summary, errors, warnings, created: [] });
+  if (errors.length > 0) return res.status(400).json({ valid: false, summary, errors, warnings, created: [] });
+
+  // ── Clean file — insert every new row in ONE transaction ──
+  const stamp = Date.now();
+  const records = toCreate.map((e, i) => {
+    const rec = {
+      id: `${cfg.idPrefix}${stamp}${i}${Math.random().toString(36).slice(2, 6)}`,
+      [cfg.codeColumn]: e.code || null,
+      name: e.name,
+      created_by: req.user?.userId || null,
+    };
+    for (const [field, column] of cfg.textFields) {
+      if (column === cfg.codeColumn || column === 'name') continue;
+      rec[column] = importText(e.row[field]) || null;
+    }
+    return Object.assign(rec, e.extra);
+  });
+
+  try {
+    await req.db.transaction(async (trx) => {
+      // 100 rows per INSERT keeps well under SQL Server's 2100-parameter limit.
+      for (let i = 0; i < records.length; i += 100) {
+        await trx(cfg.table).insert(records.slice(i, i + 100));
+      }
+    });
+  } catch (e) {
+    // Unique index on the code column: someone created the same code between
+    // validation and this insert. Nothing was saved (transaction rolled back).
+    if (isImportUniqueViolation(e)) {
+      return res.status(400).json({
+        valid: false, summary, warnings, created: [],
+        errors: [{ rowNumber: null, column: cfg.codeField, message: `A ${cfg.label.toLowerCase()} code in this file was created by someone else while importing. Nothing was saved — please run the import again.` }],
+      });
+    }
+    throw e;
+  }
+
+  const created = records.map((r) => ({ id: r.id, code: r[cfg.codeColumn], name: r.name }));
+  const ids = records.map((r) => r.id);
+  for (let i = 0; i < ids.length; i += 500) {
+    const saved = await req.db(cfg.table).whereIn('id', ids.slice(i, i + 500));
+    for (const s of saved) req.io.to(req.company.slug).emit(cfg.event, cfg.mapper(s));
+  }
+  res.json({ valid: true, summary, errors: [], warnings, created });
+}
+
+// Number validator for imports: blank -> fallback; otherwise must be a number
+// within [min, max].
+function importNumber(value, column, { min, max, fallback, label }, addError) {
+  if (isBlank(value)) return fallback;
+  const n = Number(typeof value === 'string' ? value.trim() : value);
+  if (!Number.isFinite(n) || n < min || (max != null && n > max)) {
+    addError(column, max != null ? `${label} must be a number from ${min} to ${max}` : `${label} must be a number ${min} or more`);
+    return fallback;
+  }
+  return n;
+}
+
+// POST /vendors/import
+router.post('/vendors/import', async (req, res) => {
+  try {
+    await runMasterImport(req, res, {
+      table: 'inv_vendors', idPrefix: 'ven_', codeField: 'vendorCode', codeColumn: 'vendor_code', label: 'Vendor',
+      event: 'inv:vendor_created', mapper: mapVendor,
+      textFields: [
+        ['vendorCode', 'vendor_code', 50], ['name', 'name', 200], ['legalName', 'legal_name', 200],
+        ['vendorGroup', 'vendor_group', 100], ['contactName', 'contact_name', 200], ['email', 'email', 200],
+        ['phone', 'phone', 50], ['address', 'address', 500], ['notes', 'notes', Infinity],
+      ],
+      validateRow(row, addError) {
+        const email = importText(row.email);
+        if (email && !IMPORT_EMAIL_RE.test(email)) addError('email', 'Email does not look valid');
+        let currency = importText(row.currency);
+        if (currency && !/^[A-Za-z]{3}$/.test(currency)) addError('currency', 'Currency must be a 3-letter code');
+        currency = currency ? currency.toUpperCase() : 'INR';
+        const rating = (field, label) => importNumber(row[field], field, { min: 0, max: 5, fallback: null, label }, addError);
+        return {
+          currency,
+          rating_price: rating('priceRating', 'Price rating'),
+          rating_quality: rating('qualityRating', 'Quality rating'),
+          rating_lead_time: rating('leadTimeRating', 'Lead time rating'),
+        };
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /items/import — creates item master records only; no stock, stock
+// lots or serial units (imported items start with zero stock).
+router.post('/items/import', async (req, res) => {
+  try {
+    await runMasterImport(req, res, {
+      table: 'inv_items', idPrefix: 'item_', codeField: 'itemCode', codeColumn: 'item_code', label: 'Item',
+      event: 'inv:item_created', mapper: mapItem,
+      textFields: [
+        ['itemCode', 'item_code', 50], ['name', 'name', 200], ['displayName', 'display_name', 200],
+        ['itemGroup', 'item_group', 100], ['itemClass', 'item_class', 100], ['notes', 'notes', Infinity],
+        ['unit', 'unit', 20],
+      ],
+      validateRow(row, addError) {
+        const num = (field, label) => importNumber(row[field], field, { min: 0, fallback: 0, label }, addError);
+        let serial = false;
+        if (!isBlank(row.serialTracked)) {
+          serial = parseImportBool(row.serialTracked);
+          if (serial === undefined) { addError('serialTracked', 'Serial tracked must be Yes/No, True/False or 1/0'); serial = false; }
+        }
+        return {
+          unit: importText(row.unit) || 'pcs',
+          stock_min: num('minStock', 'Min stock'),
+          stock_max: num('maxStock', 'Max stock'),
+          stock_reorder: num('reorderLevel', 'Reorder level'),
+          serial_tracked: serial ? 1 : 0,
+        };
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /purchases/:id/items — add one or more brand-new line items to an
 // EXISTING purchase, from the Edit Purchase modal. Distinct from
 // PATCH /purchases/:purchaseId/items/:lineId above, which only edits a line
