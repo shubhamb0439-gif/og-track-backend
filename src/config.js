@@ -814,12 +814,20 @@ module.exports = {
   // Daily birthday-announcement email (src/birthdayEmailNotifier.js) — for
   // every active company, whenever a user's dbo.users.date_of_birth matches
   // today, every active user in that SAME company (not cross-tenant) gets an
-  // email announcing it. Checked hourly; the real once-a-year guard is each
-  // matched user's own last_birthday_email_year column (patch_23), not this
-  // interval — same "poll often, act rarely" shape as every other reconciliation
-  // poller in this file.
+  // email announcing it. The real once-a-year guard is each matched user's
+  // own last_birthday_email_year column (patch_23), not this interval.
+  // Unlike the Sitara weekly/monthly reconciliation pollers, checkAndRun()
+  // here queries every active tenant's OWN database directly on every tick
+  // (no cheap OGCore-only "is it due" gate first) — so this interval, not
+  // just those, is a direct hit against every tenant DB. Found 2026-11-20:
+  // left at the old hourly default, this query — landing almost exactly on
+  // each serverless tenant DB's 60-minute auto-pause window — was enough to
+  // keep every tenant database "Online" around the clock instead of pausing
+  // between real use (same class of bug already fixed for OGCore itself,
+  // see jobRunner.js's POLL_INTERVAL_MS comment). A birthday only needs
+  // checking once a day, so once a day is what this now does.
   birthdayEmail: {
-    checkIntervalMs: parseInt(process.env.BIRTHDAY_EMAIL_CHECK_INTERVAL_MS || '', 10) || 60 * 60 * 1000,
+    checkIntervalMs: parseInt(process.env.BIRTHDAY_EMAIL_CHECK_INTERVAL_MS || '', 10) || 24 * 60 * 60 * 1000,
   },
   // OG Plus drug-lookup API (src/routes/drugs.js) — a public, read-only
   // endpoint backing a Chrome extension: scans a page the person is viewing
