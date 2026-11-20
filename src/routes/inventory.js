@@ -964,13 +964,107 @@ function parseImportDate(v) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-// Strips ALL whitespace (regular spaces, tabs, non-breaking spaces, etc. —
-// \s already covers   in JS, but it's spelled out explicitly here since
-// that's the exact case this was written for) for a spacing-insensitive
-// comparison. Lookup/comparison only — never written back to the DB.
-function normalizeNoSpace(v) {
-  return String(v || '').replace(/[\s ]/g, '').toLowerCase();
+// Loose comparison key for item matching. Lookup/comparison only — never
+// written back to the DB. In order:
+//  1. Unicode NFC (so "Ö" typed as O + combining umlaut equals the single "Ö")
+//  2. strip accents: decompose (NFD) and drop combining marks ("Ö" -> "O"),
+//     plus a small map for letters that don't decompose (Ø, Ł, ß, Æ, Œ, ...)
+//  3. drop the ®, ™ and © symbols
+//  4. drop ALL whitespace, incl. non-breaking, narrow and zero-width spaces
+//  5. lowercase
+// e.g. "ÖLFLEX® UNIPLUS 1X1.5 BK" -> "olflexuniplus1x1.5bk"
+const MATCH_CHAR_MAP = {
+  'Ø': 'O', 'ø': 'o', 'Ł': 'L', 'ł': 'l', 'Đ': 'D', 'đ': 'd', 'Ð': 'D', 'ð': 'd',
+  'Þ': 'Th', 'þ': 'th', 'ß': 'ss', 'ẞ': 'SS', 'Æ': 'AE', 'æ': 'ae', 'Œ': 'OE', 'œ': 'oe', 'ı': 'i',
+};
+function normalizeForMatch(v) {
+  return String(v ?? '')
+    .normalize('NFC')
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .replace(/[ØøŁłĐđÐðÞþßẞÆæŒœı]/g, (ch) => MATCH_CHAR_MAP[ch])
+    .replace(/[®™©]/g, '')
+    .replace(/[\s\u00A0\u1680\u2000-\u200D\u2028\u2029\u202F\u205F\u2060\u3000\uFEFF]/g, '')
+    .toLowerCase();
 }
+
+// Levenshtein distance that gives up early (returns max + 1) once a whole
+// row exceeds `max` — only used to rank "Did you mean" suggestions, so far-off
+// items are skipped cheaply.
+function boundedLevenshtein(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// Closeness score (0..1) of one normalized ERP value to the normalized Excel
+// key. Two tiers so ranking and score always agree:
+//  - the ERP value STARTS WITH the Excel value: 0.9..1.0 (1.0 = identical;
+//    the more of the ERP value the Excel value covers, the higher)
+//  - anything else: 0..0.89, from edit distance (1 - distance / longer length)
+// `minScore` lets far-off values bail out of the edit-distance step early.
+const PREFIX_TIER = 0.9;
+const OTHER_TIER_MAX = 0.89;
+function matchScore(key, norm, minScore = 0) {
+  if (!key || !norm) return 0;
+  if (norm.startsWith(key)) return PREFIX_TIER + (1 - PREFIX_TIER) * (key.length / norm.length);
+  if (minScore >= OTHER_TIER_MAX) return 0;
+  const longer = Math.max(key.length, norm.length);
+  // score >= minScore  <=>  distance <= longer * (1 - minScore / OTHER_TIER_MAX)
+  const maxDist = Math.floor(longer * (1 - minScore / OTHER_TIER_MAX));
+  const d = boundedLevenshtein(key, norm, maxDist);
+  if (d > maxDist) return 0;
+  return OTHER_TIER_MAX * (1 - d / longer);
+}
+
+// Up to `limit` existing records closest to `raw`, best first, comparing the
+// normalized values of `fields` (e.g. code, name, display name). Each result:
+// { id, code, name, score, matchedValue } — score rounded to 2 decimals.
+function closestRecords(raw, records, { codeColumn, fields }, limit = 3) {
+  const key = normalizeForMatch(raw);
+  const best = []; // sorted by score descending, length <= limit
+  for (const rec of records) {
+    let recBest = null;
+    for (const f of fields) {
+      const value = rec[f];
+      if (!value) continue;
+      const floor = Math.max(best.length < limit ? 0 : best[best.length - 1].score, recBest ? recBest.score : 0);
+      const score = matchScore(key, normalizeForMatch(value), floor);
+      if (score > 0 && score > floor) recBest = { score, value };
+    }
+    if (!recBest) continue;
+    best.push({ rec, score: recBest.score, matchedValue: recBest.value });
+    best.sort((x, y) => y.score - x.score);
+    if (best.length > limit) best.pop();
+  }
+  return best.map((b) => ({
+    id: b.rec.id,
+    code: b.rec[codeColumn] || null,
+    name: b.rec.name || null,
+    score: Math.round(b.score * 100) / 100,
+    matchedValue: b.matchedValue,
+  }));
+}
+
+// "Did you mean" label used in the error message text: the code, plus the
+// matched name in brackets when the name (not the code) was the closer match.
+function suggestionLabel(s) {
+  return s.code && s.matchedValue !== s.code ? `${s.code} (${s.matchedValue})` : s.matchedValue;
+}
+
+// Structured form returned on the error object (no internal fields).
+const publicSuggestion = ({ id, code, name, score }) => ({ id, code, name, score });
 
 // Same SQL Server unique-constraint/unique-index violation signal already
 // used in sitara.js's isUniqueViolation — duplicated locally (a one-line,
@@ -995,7 +1089,7 @@ router.post('/purchases/import', async (req, res) => {
     }
 
     const errors = [];
-    const addError = (rowNumber, column, message) => errors.push({ rowNumber, column, message });
+    const addError = (rowNumber, column, message, extra) => errors.push({ rowNumber, column, message, ...extra });
     const warnings = [];
     const addWarning = (rowNumber, column, message) => warnings.push({ rowNumber, column, message });
 
@@ -1069,14 +1163,30 @@ router.post('/purchases/import', async (req, res) => {
       vendorCache.set(key, result);
       return result;
     }
+    // Closest existing vendors for a "not found" vendorCode (vendor list
+    // loaded once per import, only if needed; results cached per value).
+    let allVendorsForSuggestions = null;
+    const vendorSuggestionCache = new Map();
+    async function suggestVendors(code) {
+      const raw = String(code).trim();
+      if (vendorSuggestionCache.has(raw)) return vendorSuggestionCache.get(raw);
+      if (!allVendorsForSuggestions) {
+        allVendorsForSuggestions = await req.db('inv_vendors').select('id', 'vendor_code', 'name');
+      }
+      const s = closestRecords(raw, allVendorsForSuggestions, { codeColumn: 'vendor_code', fields: ['vendor_code', 'name'] });
+      vendorSuggestionCache.set(raw, s);
+      return s;
+    }
     // Item-code lookup, in order: 1) exact item code, 2) exact item name,
-    // 3) item code ignoring all spacing, 4) item name/display name ignoring
-    // all spacing. Stops at the first step that finds anything (a unique hit
+    // 3) normalized item code, 4) normalized item name/display name
+    // (normalizeForMatch: NFC, accents stripped so "Ö" = "O", ®/™/© dropped,
+    // all whitespace incl. non-breaking spaces dropped, case-insensitive).
+    // Stops at the first step that finds anything (a unique hit
     // resolves it, more than one hit is reported as ambiguous and never
     // guessed) — later steps never run once an earlier one matched. Steps 3/4
-    // exist because Excel's spacing around item names/codes often doesn't
-    // exactly match what's saved in the ERP (e.g. "Model R - X" vs
-    // "Model R- X") — this is a read-only comparison; nothing is ever written
+    // exist because Excel's spacing/symbols around item names/codes often
+    // don't exactly match what's saved in the ERP (e.g. "Model R - X" vs
+    // "Model R- X", or "ÖLFLEX® UNIPLUS" vs "OLFLEX UNIPLUS") — this is a read-only comparison; nothing is ever written
     // back to inv_items.
     let allItemsForSpacingFallback = null;
     async function getAllItemsForSpacingFallback() {
@@ -1105,28 +1215,28 @@ router.post('/purchases/import', async (req, res) => {
         else if (rows.length > 1) result = { ambiguous: true, candidates: rows };
       }
 
-      // Steps 3 & 4: ignoring spacing — compared in memory against every item
+      // Steps 3 & 4: normalized comparison — compared in memory against every item
       // (cached once per import, not refetched per row)
       if (!result) {
-        const noSpaceKey = normalizeNoSpace(raw);
+        const noSpaceKey = normalizeForMatch(raw);
         const allItems = await getAllItemsForSpacingFallback();
 
-        // Step 3: item code, ignoring spacing
-        let candidates = allItems.filter((it) => it.item_code && normalizeNoSpace(it.item_code) === noSpaceKey);
+        // Step 3: item code, normalized
+        let candidates = allItems.filter((it) => it.item_code && normalizeForMatch(it.item_code) === noSpaceKey);
         if (candidates.length === 1) {
           result = { item: candidates[0], matchedBySpacing: true, matchedValue: candidates[0].item_code };
         } else if (candidates.length > 1) {
           result = { ambiguous: true, candidates };
         }
 
-        // Step 4: item name OR display name, ignoring spacing (one combined step)
+        // Step 4: item name OR display name, normalized (one combined step)
         if (!result) {
           candidates = allItems.filter((it) =>
-            (it.name && normalizeNoSpace(it.name) === noSpaceKey) ||
-            (it.display_name && normalizeNoSpace(it.display_name) === noSpaceKey));
+            (it.name && normalizeForMatch(it.name) === noSpaceKey) ||
+            (it.display_name && normalizeForMatch(it.display_name) === noSpaceKey));
           if (candidates.length === 1) {
             const matched = candidates[0];
-            const matchedValue = (matched.name && normalizeNoSpace(matched.name) === noSpaceKey)
+            const matchedValue = (matched.name && normalizeForMatch(matched.name) === noSpaceKey)
               ? matched.name
               : matched.display_name;
             result = { item: matched, matchedBySpacing: true, matchedValue };
@@ -1136,7 +1246,13 @@ router.post('/purchases/import', async (req, res) => {
         }
       }
 
-      const final = result || { notFound: true };
+      // Not found: suggest the closest existing items so the difference is
+      // easy to spot.
+      const final = result || {
+        notFound: true,
+        suggestions: closestRecords(raw, await getAllItemsForSpacingFallback(),
+          { codeColumn: 'item_code', fields: ['item_code', 'name', 'display_name'] }),
+      };
       itemCache.set(key, final);
       return final;
     }
@@ -1146,14 +1262,20 @@ router.post('/purchases/import', async (req, res) => {
     for (const row of rows) {
       if (row.vendorCode && String(row.vendorCode).trim()) {
         const vendor = await resolveVendor(row.vendorCode);
-        if (vendor === 'NOT_FOUND') addError(row.rowNumber, 'vendorCode', `Vendor code ${row.vendorCode} not found`);
+        if (vendor === 'NOT_FOUND') {
+          const suggestions = await suggestVendors(row.vendorCode);
+          addError(row.rowNumber, 'vendorCode', `Vendor code ${row.vendorCode} not found`,
+            { value: row.vendorCode, suggestions: suggestions.map(publicSuggestion) });
+        }
         else if (vendor === 'AMBIGUOUS') addError(row.rowNumber, 'vendorCode', `Vendor name ${row.vendorCode} matches more than one vendor`);
         else resolvedVendorByRow.set(row.rowNumber, vendor);
       }
       if (row.itemCode && String(row.itemCode).trim()) {
         const resolved = await resolveItem(row.itemCode);
         if (resolved.notFound) {
-          addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found`);
+          const hint = resolved.suggestions.length ? ` Did you mean: ${resolved.suggestions.map(suggestionLabel).join(', ')}?` : '';
+          addError(row.rowNumber, 'itemCode', `Item code ${row.itemCode} not found.${hint}`,
+            { value: row.itemCode, suggestions: resolved.suggestions.map(publicSuggestion) });
         } else if (resolved.ambiguous) {
           const names = resolved.candidates.map((c) => c.item_code || c.name).join(', ');
           addError(row.rowNumber, 'itemCode', `Matches more than one item: ${names}`);
@@ -1242,6 +1364,227 @@ router.post('/purchases/import', async (req, res) => {
       req.io.to(req.company.slug).emit('inv:purchase_created', mapPurchase(saved));
     }
     res.json({ valid: true, summary, errors: [], warnings, created });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Excel import for Vendors and Items ─────────────────────────────────────
+// Same contract as POST /purchases/import above: the frontend parses the
+// sheet and sends { dryRun, rows: [{ rowNumber, ...fields }] }; the response
+// is { valid, summary: { toCreate, skipped }, errors, warnings, created }.
+// Rows whose code (or, with no code, whose name) already exists in the ERP
+// are never created or updated — they get a warning and are skipped. Codes
+// and names are compared with normalizeForMatch (NFC, accents stripped,
+// ®/™/© and all whitespace dropped, case-insensitive); the values saved are
+// the Excel text, only trimmed. All new rows go in ONE transaction.
+
+const importText = (v) => (v === undefined || v === null ? '' : String(v).trim());
+const isBlank = (v) => importText(v) === '';
+const IMPORT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Yes/No/True/False/Y/N/1/0 (any case) or a real boolean -> true/false;
+// anything else -> undefined (reported as an error by the caller).
+function parseImportBool(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v === 1 ? true : v === 0 ? false : undefined;
+  const s = importText(v).toLowerCase();
+  if (['yes', 'y', 'true', '1'].includes(s)) return true;
+  if (['no', 'n', 'false', '0'].includes(s)) return false;
+  return undefined;
+}
+
+// Shared validate -> skip -> insert flow for the vendor and item imports.
+// cfg: { table, idPrefix, codeField, codeColumn, label, textFields: [[field, column, maxLen]],
+//        validateRow(row, addError) -> extra insert columns, event, mapper }
+async function runMasterImport(req, res, cfg) {
+  const dryRun = !!req.body.dryRun;
+  const rows = Array.isArray(req.body.rows) ? req.body.rows : null;
+  if (!rows || !rows.length) return res.status(400).json({ error: 'rows is required and must be a non-empty array' });
+  if (rows.length > IMPORT_MAX_ROWS) {
+    return res.status(400).json({ error: `Cannot import more than ${IMPORT_MAX_ROWS} rows in one file.` });
+  }
+
+  const errors = [];
+  const addError = (rowNumber, column, message) => errors.push({ rowNumber, column, message });
+  const warnings = [];
+  const addWarning = (rowNumber, column, message) => warnings.push({ rowNumber, column, message });
+
+  // Existing records, loaded once, keyed by normalized code / name.
+  const existing = await req.db(cfg.table).select('id', cfg.codeColumn, 'name');
+  const existingCodes = new Set();
+  const existingNames = new Set();
+  for (const r of existing) {
+    if (!isBlank(r[cfg.codeColumn])) existingCodes.add(normalizeForMatch(r[cfg.codeColumn]));
+    if (!isBlank(r.name)) existingNames.add(normalizeForMatch(r.name));
+  }
+
+  // ── Decide which rows are skipped (already in the ERP) ──
+  const entries = rows.map((row, i) => ({
+    row,
+    rn: row && row.rowNumber != null ? row.rowNumber : i + 2,
+    code: importText(row && row[cfg.codeField]),
+    name: importText(row && row.name),
+  }));
+  const toCreate = [];
+  let skipped = 0;
+  for (const e of entries) {
+    if (e.code && existingCodes.has(normalizeForMatch(e.code))) {
+      addWarning(e.rn, cfg.codeField, `${cfg.label} code ${e.code} already exists, it will be skipped`);
+      skipped++;
+    } else if (!e.code && e.name && existingNames.has(normalizeForMatch(e.name))) {
+      addWarning(e.rn, 'name', `${cfg.label} ${e.name} already exists, it will be skipped`);
+      skipped++;
+    } else {
+      toCreate.push(e);
+    }
+  }
+
+  // ── Validate every row that would be created (all errors collected) ──
+  for (const e of toCreate) {
+    const { row, rn } = e;
+    if (!e.name) addError(rn, 'name', 'Name is required');
+    for (const [field, , maxLen] of cfg.textFields) {
+      const t = importText(row[field]);
+      if (t.length > maxLen) addError(rn, field, `${field} must be at most ${maxLen} characters`);
+    }
+    e.extra = cfg.validateRow(row, (column, message) => addError(rn, column, message));
+  }
+
+  // ── Duplicate codes inside the file (among rows that would be created) ──
+  const byCode = new Map();
+  for (const e of toCreate) {
+    if (!e.code) continue;
+    const key = normalizeForMatch(e.code);
+    if (!byCode.has(key)) byCode.set(key, []);
+    byCode.get(key).push(e);
+  }
+  for (const group of byCode.values()) {
+    if (group.length < 2) continue;
+    const rowList = group.map((g) => g.rn).join(', ');
+    for (const g of group) {
+      addError(g.rn, cfg.codeField, `${cfg.label} code ${g.code} appears more than once in this file (rows ${rowList})`);
+    }
+  }
+
+  errors.sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
+  warnings.sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
+  const summary = { toCreate: toCreate.length, skipped };
+
+  if (dryRun) return res.json({ valid: errors.length === 0, summary, errors, warnings, created: [] });
+  if (errors.length > 0) return res.status(400).json({ valid: false, summary, errors, warnings, created: [] });
+
+  // ── Clean file — insert every new row in ONE transaction ──
+  const stamp = Date.now();
+  const records = toCreate.map((e, i) => {
+    const rec = {
+      id: `${cfg.idPrefix}${stamp}${i}${Math.random().toString(36).slice(2, 6)}`,
+      [cfg.codeColumn]: e.code || null,
+      name: e.name,
+      created_by: req.user?.userId || null,
+    };
+    for (const [field, column] of cfg.textFields) {
+      if (column === cfg.codeColumn || column === 'name') continue;
+      rec[column] = importText(e.row[field]) || null;
+    }
+    return Object.assign(rec, e.extra);
+  });
+
+  try {
+    await req.db.transaction(async (trx) => {
+      // 100 rows per INSERT keeps well under SQL Server's 2100-parameter limit.
+      for (let i = 0; i < records.length; i += 100) {
+        await trx(cfg.table).insert(records.slice(i, i + 100));
+      }
+    });
+  } catch (e) {
+    // Unique index on the code column: someone created the same code between
+    // validation and this insert. Nothing was saved (transaction rolled back).
+    if (isImportUniqueViolation(e)) {
+      return res.status(400).json({
+        valid: false, summary, warnings, created: [],
+        errors: [{ rowNumber: null, column: cfg.codeField, message: `A ${cfg.label.toLowerCase()} code in this file was created by someone else while importing. Nothing was saved — please run the import again.` }],
+      });
+    }
+    throw e;
+  }
+
+  const created = records.map((r) => ({ id: r.id, code: r[cfg.codeColumn], name: r.name }));
+  const ids = records.map((r) => r.id);
+  for (let i = 0; i < ids.length; i += 500) {
+    const saved = await req.db(cfg.table).whereIn('id', ids.slice(i, i + 500));
+    for (const s of saved) req.io.to(req.company.slug).emit(cfg.event, cfg.mapper(s));
+  }
+  res.json({ valid: true, summary, errors: [], warnings, created });
+}
+
+// Number validator for imports: blank -> fallback; otherwise must be a number
+// within [min, max].
+function importNumber(value, column, { min, max, fallback, label }, addError) {
+  if (isBlank(value)) return fallback;
+  const n = Number(typeof value === 'string' ? value.trim() : value);
+  if (!Number.isFinite(n) || n < min || (max != null && n > max)) {
+    addError(column, max != null ? `${label} must be a number from ${min} to ${max}` : `${label} must be a number ${min} or more`);
+    return fallback;
+  }
+  return n;
+}
+
+// POST /vendors/import
+router.post('/vendors/import', async (req, res) => {
+  try {
+    await runMasterImport(req, res, {
+      table: 'inv_vendors', idPrefix: 'ven_', codeField: 'vendorCode', codeColumn: 'vendor_code', label: 'Vendor',
+      event: 'inv:vendor_created', mapper: mapVendor,
+      textFields: [
+        ['vendorCode', 'vendor_code', 50], ['name', 'name', 200], ['legalName', 'legal_name', 200],
+        ['vendorGroup', 'vendor_group', 100], ['contactName', 'contact_name', 200], ['email', 'email', 200],
+        ['phone', 'phone', 50], ['address', 'address', 500], ['notes', 'notes', Infinity],
+      ],
+      validateRow(row, addError) {
+        const email = importText(row.email);
+        if (email && !IMPORT_EMAIL_RE.test(email)) addError('email', 'Email does not look valid');
+        let currency = importText(row.currency);
+        if (currency && !/^[A-Za-z]{3}$/.test(currency)) addError('currency', 'Currency must be a 3-letter code');
+        currency = currency ? currency.toUpperCase() : 'INR';
+        const rating = (field, label) => importNumber(row[field], field, { min: 0, max: 5, fallback: null, label }, addError);
+        return {
+          currency,
+          rating_price: rating('priceRating', 'Price rating'),
+          rating_quality: rating('qualityRating', 'Quality rating'),
+          rating_lead_time: rating('leadTimeRating', 'Lead time rating'),
+        };
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /items/import — creates item master records only; no stock, stock
+// lots or serial units (imported items start with zero stock).
+router.post('/items/import', async (req, res) => {
+  try {
+    await runMasterImport(req, res, {
+      table: 'inv_items', idPrefix: 'item_', codeField: 'itemCode', codeColumn: 'item_code', label: 'Item',
+      event: 'inv:item_created', mapper: mapItem,
+      textFields: [
+        ['itemCode', 'item_code', 50], ['name', 'name', 200], ['displayName', 'display_name', 200],
+        ['itemGroup', 'item_group', 100], ['itemClass', 'item_class', 100], ['notes', 'notes', Infinity],
+        ['unit', 'unit', 20],
+      ],
+      validateRow(row, addError) {
+        const num = (field, label) => importNumber(row[field], field, { min: 0, fallback: 0, label }, addError);
+        let serial = false;
+        if (!isBlank(row.serialTracked)) {
+          serial = parseImportBool(row.serialTracked);
+          if (serial === undefined) { addError('serialTracked', 'Serial tracked must be Yes/No, True/False or 1/0'); serial = false; }
+        }
+        return {
+          unit: importText(row.unit) || 'pcs',
+          stock_min: num('minStock', 'Min stock'),
+          stock_max: num('maxStock', 'Max stock'),
+          stock_reorder: num('reorderLevel', 'Reorder level'),
+          serial_tracked: serial ? 1 : 0,
+        };
+      },
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
