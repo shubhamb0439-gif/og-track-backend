@@ -102,6 +102,57 @@ async function createSerialUnitsForLot(db, { itemId, lotId, purchaseItemId, quan
   }
 }
 
+// ── Natural "by code" sort for the list endpoints ────────────────────────────
+// Ascending by the user-facing code (vendor_code / item_code / po_number):
+//  - case, spaces, accents and punctuation are ignored, so "PO-00019",
+//    "po 00019" and "PO00019" are treated the same;
+//  - digit runs compare as numbers (leading zeros ignored), so
+//    EP0009 < EP0016 < EP0100;
+//  - records without a code come last, sorted by name (A to Z);
+//  - ties are broken by created_at (oldest first), then id — always stable.
+// Sorting only; nothing is written back.
+function naturalSortTokens(v) {
+  const s = String(v ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  return s.match(/\d+|\D+/g) || [];
+}
+function compareNaturalTokens(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const x = a[i], y = b[i];
+    const xNum = /^\d/.test(x), yNum = /^\d/.test(y);
+    if (xNum && yNum) {
+      const xs = x.replace(/^0+/, ''), ys = y.replace(/^0+/, '');
+      if (xs.length !== ys.length) return xs.length - ys.length; // any length, no float precision loss
+      if (xs !== ys) return xs < ys ? -1 : 1;
+    } else if (xNum !== yNum) {
+      return xNum ? -1 : 1; // numbers before letters at the same position
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return a.length - b.length;
+}
+function sortByCode(rows, codeColumn) {
+  const keyed = rows.map((r) => {
+    const code = naturalSortTokens(r[codeColumn]);
+    return {
+      r,
+      code,
+      hasCode: code.length > 0,
+      name: naturalSortTokens(r.name),
+      created: r.created_at ? new Date(r.created_at).getTime() : Infinity,
+      id: String(r.id ?? ''),
+    };
+  });
+  keyed.sort((a, b) => {
+    if (a.hasCode !== b.hasCode) return a.hasCode ? -1 : 1;
+    const c = a.hasCode ? compareNaturalTokens(a.code, b.code) : compareNaturalTokens(a.name, b.name);
+    if (c) return c;
+    if (a.created !== b.created) return a.created < b.created ? -1 : 1;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return keyed.map((k) => k.r);
+}
+
 // Below this tolerance a remaining quantity is treated as zero — same
 // rationale/value as stockLots.js's own QTY_EPSILON (DECIMAL(14,2) columns
 // can carry fractional units, so an exact-equality check would misfire on
@@ -190,7 +241,7 @@ async function reverseReturns(db, returns) {
 // (rather than guessed) and doesn't block the rest of the list from loading.
 router.get('/vendors', async (req, res) => {
   try {
-    const rows = await req.db('inv_vendors').orderBy('name', 'asc');
+    const rows = sortByCode(await req.db('inv_vendors'), 'vendor_code');
     const vendors = rows.map(mapVendor);
 
     const purchases = await req.db('inv_purchases');
@@ -346,7 +397,7 @@ router.get('/items', async (req, res) => {
       // Only return items that are below min or at reorder level
       q = q.whereRaw('(stock_min > 0 AND stock < stock_min) OR (stock_reorder > 0 AND stock <= stock_reorder)');
     }
-    const rows = await q.orderBy('name', 'asc');
+    const rows = sortByCode(await q, 'item_code');
     res.json(rows.map(mapItem));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -852,7 +903,7 @@ router.get('/purchases', async (req, res) => {
     let q = req.db('inv_purchases');
     if (req.query.status) q = q.where({ status: req.query.status });
     if (req.query.vendorId) q = q.where({ vendor_id: req.query.vendorId });
-    const rows = await q.orderBy('order_date', 'desc');
+    const rows = sortByCode(await q, 'po_number');
     res.json(rows.map(mapPurchase));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
