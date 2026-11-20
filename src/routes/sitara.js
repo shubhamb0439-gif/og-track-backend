@@ -1904,12 +1904,25 @@ router.get('/orders/export', async (req, res) => {
       itemsByOrder.get(it.order_id).push(it);
     }
 
+    // An order can (rarely) have more than one matched Razorpay payment —
+    // joined and comma-separated so the export never silently drops one.
+    const razorpayPayments = orderIds.length
+      ? await req.db('sitara_razorpay_payments').whereIn('order_id', orderIds).select('order_id', 'razorpay_payment_id')
+      : [];
+    const razorpayIdByOrder = new Map();
+    for (const p of razorpayPayments) {
+      if (!p.razorpay_payment_id) continue;
+      const existing = razorpayIdByOrder.get(p.order_id);
+      razorpayIdByOrder.set(p.order_id, existing ? `${existing}, ${p.razorpay_payment_id}` : p.razorpay_payment_id);
+    }
+
     const rows = [];
     for (const o of orders) {
       const mapped = mapOrder(o);
       const address = [mapped.customerAddressLine1, mapped.customerAddressLine2, mapped.customerCity,
         mapped.customerState, mapped.customerPostalCode, mapped.customerCountry].filter(Boolean).join(', ');
       const orderItems = itemsByOrder.get(o.id) || [];
+      const razorpayId = razorpayIdByOrder.get(o.id) || '';
       // An order with zero line items still gets one row — real data
       // (e.g. an order synced before items were ever recorded) shouldn't
       // just vanish from the export.
@@ -1922,6 +1935,7 @@ router.get('/orders/export', async (req, res) => {
           product: it ? it.product_name : '', quantity: it ? Number(it.quantity) : '',
           unitPrice: it ? Number(it.unit_price || 0) : '', lineTotal: it ? Number(it.line_total || 0) : '',
           orderStatus: mapped.status, orderTotal: mapped.total, channel: mapped.source,
+          razorpayId,
         });
       }
     }
@@ -1932,9 +1946,9 @@ router.get('/orders/export', async (req, res) => {
 
     if (format === 'csv') {
       const cols = ['orderDate', 'orderNumber', 'customerName', 'customerEmail', 'customerPhone', 'address',
-        'product', 'quantity', 'unitPrice', 'lineTotal', 'orderStatus', 'orderTotal', 'channel'];
+        'product', 'quantity', 'unitPrice', 'lineTotal', 'orderStatus', 'orderTotal', 'channel', 'razorpayId'];
       const headerLabels = ['Order Date', 'Order Number', 'Customer Name', 'Email', 'Phone', 'Address',
-        'Product', 'Quantity', 'Unit Price', 'Line Total', 'Order Status', 'Order Total', 'Channel'];
+        'Product', 'Quantity', 'Unit Price', 'Line Total', 'Order Status', 'Order Total', 'Channel', 'Razorpay ID'];
       const lines = [headerLabels.join(',')];
       for (const r of rows) lines.push(cols.map((c) => csvCell(r[c])).join(','));
       res.setHeader('Content-Type', 'text/csv');
@@ -1958,11 +1972,12 @@ router.get('/orders/export', async (req, res) => {
       { header: 'Order Status', key: 'orderStatus', width: 18 },
       { header: 'Order Total', key: 'orderTotal', width: 12 },
       { header: 'Channel', key: 'channel', width: 16 },
+      { header: 'Razorpay ID', key: 'razorpayId', width: 24 },
     ];
     sheet.getRow(1).font = { bold: true };
     sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDCE6F1' } };
     rows.forEach((r) => sheet.addRow(r));
-    sheet.autoFilter = { from: 'A1', to: 'M1' };
+    sheet.autoFilter = { from: 'A1', to: 'N1' };
     const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}.xlsx"`);
