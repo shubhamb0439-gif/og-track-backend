@@ -236,10 +236,14 @@ function signQrBucket(slug, bucket) {
 // GET /api/:slug/attendance/qr-token — for the display screen to show/refresh
 router.get('/qr-token', async (req, res) => {
   try {
-    const bucket = Math.floor(Date.now() / 1000 / QR_BUCKET_SECONDS);
+    const nowSeconds = Date.now() / 1000;
+    const bucket = Math.floor(nowSeconds / QR_BUCKET_SECONDS);
     const sig = signQrBucket(req.company.slug, bucket);
     const token = Buffer.from(`${req.company.slug}.${bucket}.${sig}`).toString('base64');
-    res.json({ token, expiresInSeconds: QR_BUCKET_SECONDS });
+    // Seconds left until this bucket ends, rounded up so it's always 1..30.
+    const bucketEndSeconds = (bucket + 1) * QR_BUCKET_SECONDS;
+    const expiresInSeconds = Math.min(QR_BUCKET_SECONDS, Math.max(1, Math.ceil(bucketEndSeconds - nowSeconds)));
+    res.json({ token, expiresInSeconds, bucket });
   } catch (e) { console.error('GET /qr-token failed:', e); res.status(500).json({ error: 'Could not generate QR code. Please try again.' }); }
 });
 
