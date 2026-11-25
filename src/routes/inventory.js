@@ -131,7 +131,10 @@ function compareNaturalTokens(a, b) {
   }
   return a.length - b.length;
 }
-function sortByCode(rows, codeColumn) {
+// { descending: true } flips the code order and the tie-breaks (newest
+// created first, then id descending); records without a code still go last.
+function sortByCode(rows, codeColumn, { descending = false } = {}) {
+  const dir = descending ? -1 : 1;
   const keyed = rows.map((r) => {
     const code = naturalSortTokens(r[codeColumn]);
     return {
@@ -145,10 +148,10 @@ function sortByCode(rows, codeColumn) {
   });
   keyed.sort((a, b) => {
     if (a.hasCode !== b.hasCode) return a.hasCode ? -1 : 1;
-    const c = a.hasCode ? compareNaturalTokens(a.code, b.code) : compareNaturalTokens(a.name, b.name);
+    const c = a.hasCode ? compareNaturalTokens(a.code, b.code) * dir : compareNaturalTokens(a.name, b.name);
     if (c) return c;
-    if (a.created !== b.created) return a.created < b.created ? -1 : 1;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    if (a.created !== b.created) return (a.created < b.created ? -1 : 1) * dir;
+    return (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) * dir;
   });
   return keyed.map((k) => k.r);
 }
@@ -903,7 +906,8 @@ router.get('/purchases', async (req, res) => {
     let q = req.db('inv_purchases');
     if (req.query.status) q = q.where({ status: req.query.status });
     if (req.query.vendorId) q = q.where({ vendor_id: req.query.vendorId });
-    const rows = sortByCode(await q, 'po_number');
+    // Latest PO at the top: descending by PO number (natural sort).
+    const rows = sortByCode(await q, 'po_number', { descending: true });
     res.json(rows.map(mapPurchase));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
